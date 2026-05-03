@@ -45,7 +45,7 @@ class SerruchoDefinitiveWidget:
     def __init__(self, root):
         self.root = root
         self.root.title("Serrucho Monitor")
-        self.width, self.height = 300, 180
+        self.width, self.height = 300, 200 # Compactado
         self.root.geometry(f"{self.width}x{self.height}+80+80")
         
         # Estética iOS
@@ -83,11 +83,13 @@ class SerruchoDefinitiveWidget:
         self.glow_layers = [self.canvas.create_oval(40-r, 75-r, 40+r, 75+r, fill=self.colors["bg"], outline="") for r in range(12, 5, -2)]
         self.status_dot = self.canvas.create_oval(34, 69, 46, 81, fill=self.colors["red"], outline="")
         self.status_label = self.canvas.create_text(60, 75, text="Iniciando...", anchor="w", fill=self.colors["subtext"], font=("Inter", 9))
-        self.sync_label = self.canvas.create_text(self.width/2, 105, text="Verificando nube...", fill=self.colors["subtext"], font=("Inter", 8))
+        self.sync_label = self.canvas.create_text(self.width/2, 100, text="Verificando nube...", fill=self.colors["subtext"], font=("Inter", 8))
+        self.rate_label = self.canvas.create_text(self.width/2, 120, text="BCV: --.-- | Binance: --.--", fill=self.colors["text"], font=("Inter", 9, "bold"))
+        self.diff_label = self.canvas.create_text(self.width/2, 140, text="Brecha: --.--%", fill=self.colors["yellow"], font=("Inter", 8, "bold"))
 
         # Botones
-        self.draw_rounded_rect(50, 130, 250, 160, 15, self.colors["btn"], tags="btn")
-        self.btn_text = self.canvas.create_text(150, 145, text="Sincronizar Ahora", fill=self.colors["green"], font=("Inter", 9, "bold"))
+        self.draw_rounded_rect(50, 160, 250, 190, 15, self.colors["btn"], tags="btn")
+        self.btn_text = self.canvas.create_text(150, 175, text="Sincronizar Ahora", fill=self.colors["green"], font=("Inter", 9, "bold"))
         self.close_btn = self.canvas.create_text(275, 25, text="✕", fill=self.colors["subtext"], font=("Inter", 10, "bold"))
 
         # Eventos
@@ -146,9 +148,33 @@ class SerruchoDefinitiveWidget:
                     if res:
                         dt = datetime.fromisoformat(res[0]['actualizado_en'].replace('Z', '+00:00'))
                         self.last_cloud_ts = dt.timestamp()
-                        self.root.after(0, lambda: self.canvas.itemconfig(self.sync_label, text=f"Nube: {dt.astimezone().strftime('%d/%m %H:%M:%S')}"))
+                        # Mostrar siempre la fecha y hora exacta
+                        status_text = f"Nube: {dt.astimezone().strftime('%d/%m %H:%M:%S')}"
+                        self.root.after(0, lambda: self.canvas.itemconfig(self.sync_label, text=status_text))
                         self.is_online = True
             except: self.is_online = False
+
+            # NUEVO: Obtener últimas tasas
+            try:
+                rate_url = f"{SUPABASE_REST_URL}/rest/v1/tazas?order=created_at.desc&limit=1"
+                rate_req = urllib.request.Request(rate_url, headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"})
+                with urllib.request.urlopen(rate_req, timeout=5) as r_resp:
+                    r_res = json.loads(r_resp.read().decode())
+                    if r_res:
+                        bcv = float(r_res[0].get('bcv_usd', 0))
+                        binance = float(r_res[0].get('binance_p2p', 0))
+                        
+                        self.root.after(0, lambda: self.canvas.itemconfig(self.rate_label, text=f"BCV: {bcv:,.2f} | BNB: {binance:,.2f}"))
+                        
+                        if bcv > 0:
+                            diff = ((binance / bcv) - 1) * 100
+                            # Color según la brecha (amarillo si es > 5%, rojo si es > 10%)
+                            color = self.colors["yellow"] if diff < 10 else self.colors["red"]
+                            if diff < 3: color = self.colors["subtext"]
+                            
+                            self.root.after(0, lambda d=diff, c=color: self.canvas.itemconfig(self.diff_label, text=f"Brecha: +{d:.2f}%", fill=c))
+            except Exception as e:
+                print(f"[WIDGET] Error obteniendo tasas: {e}")
 
             has_changes = False
             for path in HYBRID_PATHS:
@@ -165,9 +191,9 @@ class SerruchoDefinitiveWidget:
             # Solo disparar sync automatico si hay cambios, estamos online y NO estamos ya sincronizando
             if self.needs_sync and self.is_online and not self.is_syncing:
                 print(f"[WIDGET] Detectados cambios en HybridLite. Disparando sync automatico...")
-                self.trigger_sync(auto=True)
+                self.root.after(0, lambda: self.trigger_sync(auto=True))
             
-            self.root.after(10000, self.check_loop) # Revisar cada 10 seg
+            self.root.after(2000, self.check_loop) # Revisar cada 2 seg (Modo Instantáneo)
             
         threading.Thread(target=task, daemon=True).start()
 
@@ -199,6 +225,8 @@ class SerruchoDefinitiveWidget:
             
             self.is_syncing = False
             self.root.after(0, lambda: (self.canvas.itemconfig(self.btn_text, text="Sincronizar Ahora"), self.update_ui()))
+            # Forzar un chequeo inmediato para limpiar el estado de "Cambios Detectados"
+            self.root.after(500, self.check_loop) 
         
         threading.Thread(target=run, daemon=True).start()
 

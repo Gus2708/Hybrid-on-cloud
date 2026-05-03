@@ -30,6 +30,7 @@ from config import (
     RUTA_PRECIOS,
     RUTA_EXISTENCIA
 )
+from rates_service import RatesService
 
 app = Flask(__name__)
 
@@ -144,7 +145,8 @@ def _load_inventory_if_needed():
 
 def _enrich(item: Dict) -> Dict:
     """Agrega precio_bs calculado con la tasa actual."""
-    tasa = TASA_BS_DEFAULT
+    import config
+    tasa = config.TASA_BS_DEFAULT
     precio_bs = round(item["precio_venta"] * tasa, 2)
     return {**item, "precio_bs": precio_bs, "tasa_bs": tasa}
 
@@ -291,7 +293,82 @@ def trigger_sync():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
+@app.route("/api/v1/tazas/update", methods=["POST", "GET"])
+def update_tazas():
+    """Consulta las tasas externas (BCV, Binance) y las guarda en la DB."""
+    try:
+        service = RatesService()
+        rates = service.get_all_rates()
+        success = service.save_to_db(rates)
+        
+        if success:
+            # Actualizar la tasa global del app (usamos BCV USD como referencia)
+            global TASA_BS_DEFAULT
+            if rates["bcv_usd"] > 0:
+                # Actualizamos la tasa por defecto para el cálculo de precios en Bs
+                # Nota: Esto solo dura mientras el proceso esté vivo.
+                # Para persistencia total, se debería leer de la DB al iniciar.
+                import config
+                config.TASA_BS_DEFAULT = rates["bcv_usd"]
+            
+            return jsonify({
+                "status": "success",
+                "rates": rates,
+                "tasa_app_actualizada": config.TASA_BS_DEFAULT
+            }), 200
+        else:
+            return jsonify({"status": "error", "message": "No se pudo guardar en la DB"}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/v1/tazas/actual", methods=["GET"])
+def get_tazas_actuales():
+    """Obtiene la última tasa guardada en la DB."""
+    try:
+        from supabase_rest import REST_URL, ANON_KEY
+        import requests
+        url = f"{REST_URL.rstrip('/')}/rest/v1/tazas?order=created_at.desc&limit=1"
+        headers = {
+            "apikey": ANON_KEY,
+            "Authorization": f"Bearer {ANON_KEY}"
+        }
+        resp = requests.get(url, headers=headers)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data:
+                return jsonify(data[0]), 200
+            return jsonify({"error": "No hay datos en la tabla tazas"}), 404
+        return jsonify({"error": f"DB error: {resp.status_code}"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _init_tasa():
+    """Carga la última tasa de la DB al iniciar."""
+    try:
+        from supabase_rest import REST_URL, ANON_KEY
+        import requests
+        import config
+        url = f"{REST_URL.rstrip('/')}/rest/v1/tazas?order=created_at.desc&limit=1"
+        headers = {
+            "apikey": ANON_KEY,
+            "Authorization": f"Bearer {ANON_KEY}"
+        }
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and data[0].get("bcv_usd"):
+                config.TASA_BS_DEFAULT = float(data[0]["bcv_usd"])
+                print(f"[APP] Tasa inicial cargada de DB: {config.TASA_BS_DEFAULT}")
+    except Exception as e:
+        print(f"[APP] No se pudo cargar tasa inicial de DB: {e}")
+
+
+# ─── Main ───────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
+    _init_tasa()
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG", "0") == "1"
     app.run(host="0.0.0.0", port=port, debug=debug)

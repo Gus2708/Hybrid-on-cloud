@@ -137,15 +137,17 @@ def get_row_count_rest(table: str = "productos") -> int:
     
     # Usamos Prefer: count=exact para obtener el total en el header 'Content-Range' o similar
     # Pero más fácil: SELECT count(*) vía RPC o query simple
-    url = f"{REST_URL.rstrip('/')}/rest/v1/{table}?select=count"
+    # Metodo estandar de PostgREST para obtener conteo total sin filas
+    url = f"{REST_URL.rstrip('/')}/rest/v1/{table}?select=*"
     headers = _build_headers()
-    headers["Range"] = "0-0" # No queremos filas, solo el conteo
+    headers["Range"] = "0-0" 
     headers["Prefer"] = "count=exact"
     
     try:
         req = urllib.request.Request(url, headers=headers, method="GET")
         with urllib.request.urlopen(req, timeout=10) as resp:
             content_range = resp.getheader("Content-Range")
+            # El header es '0-0/total'
             if content_range and "/" in content_range:
                 return int(content_range.split("/")[-1])
             return -1
