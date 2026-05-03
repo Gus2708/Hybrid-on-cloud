@@ -74,7 +74,7 @@ class SerruchoWidget:
                 self.dot.config(fg="#ff4444")
                 self.status_text.config(text="Desconectado")
             
-            self.root.after(5000, self.update_status) # Re-check cada 5 segundos
+            self.root.after(2000, self.update_status) # Re-check cada 2 segundos (Modo Instantáneo)
 
         threading.Thread(target=check, daemon=True).start()
 

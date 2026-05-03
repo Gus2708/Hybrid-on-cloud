@@ -20,6 +20,7 @@ except ImportError:
     SUPABASE_ANON_KEY = ""
 
 from supabase_rest import upsert_batch_rest, get_row_count_rest, delete_orphans_rest
+from rates_service import RatesService
 
 # Rutas críticas
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -52,7 +53,7 @@ def run_hybrid_exporter():
 def get_row_hash(row: Dict) -> str:
     """Genera un hash único basado en los datos críticos del producto."""
     # Usamos valores redondeados para el hash
-    relevant_data = f"{row['descripcion']}|{row['costo']:.2f}|{row['precio_venta']:.2f}|{row['existencia']:.2f}|{row['codigo_barras']}|{row['unidad']}"
+    relevant_data = f"{row['codigo_interno']}|{row['descripcion']}|{row['costo']:.2f}|{row['precio_venta']:.2f}|{row['existencia']:.2f}|{row['codigo_barras']}|{row['unidad']}"
     return hashlib.md5(relevant_data.encode('utf-8')).hexdigest()
 
 def _load_csv(csv_path: str) -> List[Dict]:
@@ -100,6 +101,18 @@ def sync_incremental(force=False):
 
     print(f"[SYNC] Iniciando sincronizacion {'COMPLETA' if force else 'INCREMENTAL'}...")
     
+    # NUEVO: Actualizar Tasas de Cambio (Tazas)
+    try:
+        print("[SYNC] -> Actualizando tasas de cambio (BCV/Binance)...")
+        service = RatesService()
+        rates = service.get_all_rates()
+        if service.save_to_db(rates):
+            print(f"[SYNC] [OK] Tasas actualizadas: BCV USD {rates['bcv_usd']}")
+        else:
+            print("[SYNC] ! No se pudieron actualizar las tasas.")
+    except Exception as e:
+        print(f"[SYNC] ! Error actualizando tasas: {e}")
+
     # PASO 2: Cargar caché
     cache = {}
     if not force and os.path.exists(CACHE_FILE):
@@ -145,19 +158,21 @@ def sync_incremental(force=False):
         with open(CACHE_FILE, 'w') as f:
             json.dump(new_cache, f)
         _save_metadata()
-        print("[SYNC] [OK] Exitoso! Base de datos actualizada.")
+        print(f"[SYNC] [OK] Exitoso! {len(to_upsert)} productos actualizados.")
         verify_sync(len(rows))
+    else:
+        print("[SYNC] ! Fallo al subir datos a Supabase.")
 
 def verify_sync(csv_count: int):
     """Comprueba que el conteo en Supabase coincida con el CSV."""
     print("[SYNC] Verificando integridad de la nube...")
     cloud_count = get_row_count_rest()
     if cloud_count == -1:
-        print("[SYNC] ! Advertencia: No se pudo verificar el conteo en la nube.")
+        print("[SYNC] ! Advertencia: No se pudo verificar el conteo en la nube (Error de red o API).")
     elif cloud_count == csv_count:
-        print(f"[SYNC] [OK] Verificacion exitosa: CSV({csv_count}) == Nube({cloud_count})")
+        print(f"[SYNC] [OK] Integridad verificada: CSV({csv_count}) == Nube({cloud_count})")
     else:
-        print(f"[SYNC] ! DISCREPANCIA DETECTADA: CSV({csv_count}) vs Nube({cloud_count})")
+        print(f"[SYNC] ! DISCREPANCIA: CSV({csv_count}) vs Nube({cloud_count}). Corrigiendo...")
         # Si hay discrepancia, intentamos corregir eliminando huerfanos
         ids = [r['codigo_interno'] for r in _load_csv(CSV_SOURCE_PATH)]
         if delete_orphans_rest(ids):

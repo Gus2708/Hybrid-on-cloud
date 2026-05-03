@@ -10,4 +10,8 @@ WshShell.Run "pythonw app.py", 0, False
 ' 3. Iniciar el Widget de Escritorio (Visible y con Icono en Tray)
 WshShell.Run "pythonw widget.pyw", 0, False
 
+' 4. Iniciar el Monitor de archivos (Real-time Sync)
+WshShell.Run "pythonw monitor.py", 0, False
+
 Set WshShell = Nothing
+
