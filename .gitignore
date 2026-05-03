@@ -1,0 +1,12 @@
+venv/
+*.pyc
+__pycache__/
+.env
+*.csv
+*.dat
+*.Dat
+*.json
+*.log
+.agents/
+.gemini/
+tests/.pytest_cache/

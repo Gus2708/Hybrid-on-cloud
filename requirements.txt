@@ -1,0 +1,9 @@
+Flask>=2.3.0
+requests
+python-dotenv
+pytest
+pytest-flask
+pytest-mock
+responses
+Pillow
+pystray
