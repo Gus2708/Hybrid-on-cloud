@@ -24,9 +24,6 @@ def esperar_salida():
     sys.exit()
 
 def obtener_nombres_archivos():
-    ahora = datetime.now()
-    fecha_str = ahora.strftime("%Y-%m-%d_%H-%M")
-    
     if not os.path.exists(CARPETA_SALIDA):
         try:
             os.makedirs(CARPETA_SALIDA)
@@ -34,10 +31,8 @@ def obtener_nombres_archivos():
             print(f"❌ Error: No puedo crear la carpeta {CARPETA_SALIDA}")
             esperar_salida()
 
-    ruta_con_fecha = os.path.join(CARPETA_SALIDA, f"MAESTRO_SERRUCHO_{fecha_str}.csv")
     ruta_fija = os.path.join(CARPETA_SALIDA, "MAESTRO_ACTUAL.csv")
-    
-    return ruta_con_fecha, ruta_fija
+    return ruta_fija
 
 def limpiar_texto(texto):
     # Usamos raw string (r'') para evitar el SyntaxWarning de la barrita \
@@ -132,8 +127,8 @@ def leer_existencias_maestras(ruta, codigos_validos):
     return stock_final
 
 def fusionar():
-    ruta_fecha, ruta_fija = obtener_nombres_archivos()
-    print(f"\n--- GENERANDO ARCHIVOS EN:\n    {CARPETA_SALIDA}")
+    ruta_fija = obtener_nombres_archivos()
+    print(f"\n--- GENERANDO ARCHIVO EN:\n    {ruta_fija}")
     
     db_prods = leer_inventario_maestro(RUTA_INVENTARIO)
     if not db_prods: esperar_salida()
@@ -161,12 +156,11 @@ def fusionar():
     
     try:
         fieldnames = ['CODIGO_INTERNO', 'DESCRIPCION', 'UNIDAD', 'CODIGO_BARRAS', 'COSTO', 'PRECIO_VENTA', 'EXISTENCIA']
-        for ruta in [ruta_fecha, ruta_fija]:
-            with open(ruta, 'w', newline='', encoding='utf-8-sig') as f:
-                # Delimitador coma (,) y comillas para las descripciones
-                escritor = csv.DictWriter(f, fieldnames=fieldnames, delimiter=',', quoting=csv.QUOTE_MINIMAL)
-                escritor.writeheader()
-                escritor.writerows(filas_out)
+        with open(ruta_fija, 'w', newline='', encoding='utf-8-sig') as f:
+            # Delimitador coma (,) y comillas para las descripciones
+            escritor = csv.DictWriter(f, fieldnames=fieldnames, delimiter=',', quoting=csv.QUOTE_MINIMAL)
+            escritor.writeheader()
+            escritor.writerows(filas_out)
             
         print("\n" + "="*40)
         print(f"--- EXITO! Sistema Actualizado.")
@@ -178,4 +172,3 @@ def fusionar():
 
 if __name__ == "__main__":
     fusionar()
-    # esperar_salida()

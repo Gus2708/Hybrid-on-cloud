@@ -135,65 +135,72 @@ class SerruchoDefinitiveWidget:
         return self.canvas.create_polygon(p, smooth=True, fill=color, tags=tags)
 
     def check_loop(self):
+        # Evitar múltiples hilos de chequeo simultáneos
+        if hasattr(self, "_checking") and self._checking:
+            return
+        self._checking = True
+
         if self.is_syncing:
+            self._checking = False
             self.root.after(5000, self.check_loop)
             return
 
         def task():
             try:
-                url = f"{SUPABASE_REST_URL}/rest/v1/productos?select=actualizado_en&order=actualizado_en.desc&limit=1"
-                req = urllib.request.Request(url, headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    res = json.loads(resp.read().decode())
-                    if res:
-                        dt = datetime.fromisoformat(res[0]['actualizado_en'].replace('Z', '+00:00'))
-                        self.last_cloud_ts = dt.timestamp()
-                        # Mostrar siempre la fecha y hora exacta
-                        status_text = f"Nube: {dt.astimezone().strftime('%d/%m %H:%M:%S')}"
-                        self.root.after(0, lambda: self.canvas.itemconfig(self.sync_label, text=status_text))
-                        self.is_online = True
-            except: self.is_online = False
+                # 1. Chequeo de la Nube
+                try:
+                    url = f"{SUPABASE_REST_URL}/rest/v1/productos?select=actualizado_en&order=actualizado_en.desc&limit=1"
+                    req = urllib.request.Request(url, headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"})
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        res = json.loads(resp.read().decode())
+                        if res:
+                            dt = datetime.fromisoformat(res[0]['actualizado_en'].replace('Z', '+00:00'))
+                            self.last_cloud_ts = dt.timestamp()
+                            local_time = datetime.now().strftime('%H:%M:%S')
+                            status_text = f"Nube: {dt.astimezone().strftime('%d/%m %H:%M')} | {local_time}"
+                            self.root.after(0, lambda: self.canvas.itemconfig(self.sync_label, text=status_text))
+                            self.is_online = True
+                except: 
+                    self.is_online = False
 
-            # NUEVO: Obtener últimas tasas
-            try:
-                rate_url = f"{SUPABASE_REST_URL}/rest/v1/tazas?order=created_at.desc&limit=1"
-                rate_req = urllib.request.Request(rate_url, headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"})
-                with urllib.request.urlopen(rate_req, timeout=5) as r_resp:
-                    r_res = json.loads(r_resp.read().decode())
-                    if r_res:
-                        bcv = float(r_res[0].get('bcv_usd', 0))
-                        binance = float(r_res[0].get('binance_p2p', 0))
-                        
-                        self.root.after(0, lambda: self.canvas.itemconfig(self.rate_label, text=f"BCV: {bcv:,.2f} | BNB: {binance:,.2f}"))
-                        
-                        if bcv > 0:
-                            diff = ((binance / bcv) - 1) * 100
-                            # Color según la brecha (amarillo si es > 5%, rojo si es > 10%)
-                            color = self.colors["yellow"] if diff < 10 else self.colors["red"]
-                            if diff < 3: color = self.colors["subtext"]
-                            
-                            self.root.after(0, lambda d=diff, c=color: self.canvas.itemconfig(self.diff_label, text=f"Brecha: +{d:.2f}%", fill=c))
+                # 2. Obtener Tasas
+                try:
+                    rate_url = f"{SUPABASE_REST_URL}/rest/v1/tazas?order=created_at.desc&limit=1"
+                    rate_req = urllib.request.Request(rate_url, headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"})
+                    with urllib.request.urlopen(rate_req, timeout=5) as r_resp:
+                        r_res = json.loads(r_resp.read().decode())
+                        if r_res:
+                            bcv = float(r_res[0].get('bcv_usd', 0))
+                            binance = float(r_res[0].get('binance_p2p', 0))
+                            self.root.after(0, lambda: self.canvas.itemconfig(self.rate_label, text=f"BCV: {bcv:,.2f} | BNB: {binance:,.2f}"))
+                            if bcv > 0:
+                                diff = ((binance / bcv) - 1) * 100
+                                color = self.colors["yellow"] if diff < 10 else self.colors["red"]
+                                if diff < 3: color = self.colors["subtext"]
+                                self.root.after(0, lambda d=diff, c=color: self.canvas.itemconfig(self.diff_label, text=f"Brecha: +{d:.2f}%", fill=c))
+                except: pass
+
+                # 3. Lógica de detección de cambios locales
+                has_changes = False
+                for path in HYBRID_PATHS:
+                    if os.path.exists(path):
+                        mtime = os.path.getmtime(path)
+                        if mtime > (self.last_cloud_ts + 5):
+                            has_changes = True
+                            break
+                
+                self.needs_sync = has_changes
+                self.root.after(0, self.update_ui)
+                
+                if self.needs_sync and self.is_online and not self.is_syncing:
+                    self.root.after(0, lambda: self.trigger_sync(auto=True))
+
             except Exception as e:
-                print(f"[WIDGET] Error obteniendo tasas: {e}")
-
-            has_changes = False
-            for path in HYBRID_PATHS:
-                if os.path.exists(path):
-                    mtime = os.path.getmtime(path)
-                    # Comparamos con un margen de 5 segundos para mayor sensibilidad
-                    if mtime > (self.last_cloud_ts + 5):
-                        has_changes = True
-                        break
-            
-            self.needs_sync = has_changes
-            self.root.after(0, self.update_ui)
-            
-            # Solo disparar sync automatico si hay cambios, estamos online y NO estamos ya sincronizando
-            if self.needs_sync and self.is_online and not self.is_syncing:
-                print(f"[WIDGET] Detectados cambios en HybridLite. Disparando sync automatico...")
-                self.root.after(0, lambda: self.trigger_sync(auto=True))
-            
-            self.root.after(2000, self.check_loop) # Revisar cada 2 seg (Modo Instantáneo)
+                print(f"[WIDGET] Error en hilo de chequeo: {e}")
+            finally:
+                self._checking = False
+                # Re-programar siempre el bucle
+                self.root.after(3000, self.check_loop) 
             
         threading.Thread(target=task, daemon=True).start()
 
