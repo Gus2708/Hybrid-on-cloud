@@ -191,6 +191,16 @@ def _save_metadata():
     except: pass
 
 if __name__ == "__main__":
+    from lock_util import acquire_lock
+    
     mode = sys.argv[1] if len(sys.argv) > 1 else "once"
-    if mode == "force": sync_incremental(force=True)
-    else: sync_incremental()
+    try:
+        with acquire_lock(timeout=120):
+            if mode == "force": sync_incremental(force=True)
+            else: sync_incremental()
+    except TimeoutError as e:
+        print(f"[SYNC] ! Error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[SYNC] ! Fallo inesperado: {e}")
+        sys.exit(1)

@@ -10,7 +10,7 @@ import socket
 import time
 from datetime import datetime, timezone
 
-# --- Librerías de Terceros (Pillow y Pystray) ---
+# --- Librerías de Terceros ---
 try:
     from PIL import Image, ImageTk
     HAS_PIL = True
@@ -31,83 +31,113 @@ SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS
 HYBRID_PATHS = [
     r'H:\HybridLite\HybridEmpresa\HybridDataBase\TInventario.dat',
     r'H:\HybridLite\HybridEmpresa\HybridDataBase\TCostoPrecioInv.Dat',
-    r'H:\HybridLite\HybridEmpresa\HybridDataBase\TExistenciaInv.Dat'
+    r'H:\HybridLite\HybridEmpresa\HybridDataBase\TExistenciaInv.Dat',
+    r'H:\HybridLite\HybridEmpresa\HybridDataBase\TTransaccionvta.dat',
+    r'H:\HybridLite\HybridEmpresa\HybridDataBase\TDetalleVta.dat',
+    r'H:\HybridLite\HybridEmpresa\HybridDataBase\TClientes.dat'
 ]
 
 # --- Protección de Instancia Única ---
 try:
     lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    lock_socket.bind(('127.0.0.1', 5005)) # Puerto nuevo para evitar bloqueos
+    lock_socket.bind(('127.0.0.1', 5006)) 
 except:
     sys.exit(0)
 
-class SerruchoDefinitiveWidget:
+class SerruchoPremiumWidget:
     def __init__(self, root):
         self.root = root
         self.root.title("Serrucho Monitor")
-        self.width, self.height = 300, 200 # Compactado
-        self.root.geometry(f"{self.width}x{self.height}+80+80")
+        self.width, self.height = 300, 220
         
-        # Estética iOS
+        # Estética iOS 17 (Dark Mode)
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-transparentcolor", "#010101")
         self.root.config(bg="#010101")
         
+        screen_w = self.root.winfo_screenwidth()
+        self.root.geometry(f"{self.width}x{self.height}+{screen_w - self.width - 20}+20")
+        
         self.colors = {
             "bg": "#1C1C1E",
-            "green": "#34C759", "green_glow": "#1A3D23",
-            "red": "#FF3B30", "red_glow": "#3D1A1A",
-            "yellow": "#FFCC00", "yellow_glow": "#423A00",
-            "text": "#FFFFFF", "subtext": "#8E8E93", "btn": "#2C2C2E"
+            "card": "#2C2C2E",
+            "green": "#32D74B", "green_glow": "#1A3D23",
+            "blue": "#0A84FF",
+            "yellow": "#FFD60A",
+            "red": "#FF453A",
+            "text": "#FFFFFF", "subtext": "#8E8E93"
         }
         
         self.canvas = tk.Canvas(root, width=self.width, height=self.height, bg="#010101", highlightthickness=0, bd=0)
         self.canvas.pack()
-        self.draw_rounded_rect(0, 0, self.width, self.height, 25, self.colors["bg"], tags="bg")
         
-        # Logo y Título
+        # Fondo Redondeado
+        self.draw_rounded_rect(0, 0, self.width, self.height, 28, self.colors["bg"], tags="bg")
+        
+        # Cabecera
+        self.canvas.create_text(25, 25, text="El Serrucho", fill=self.colors["text"], font=("Inter", 12, "bold"), anchor="w", tags="title")
+        self.status_dot = self.canvas.create_oval(250, 20, 260, 30, fill=self.colors["green"], outline="")
+        
+        # Línea de estado principal
+        self.status_label = self.canvas.create_text(25, 55, text="Sistema Activo", fill=self.colors["text"], font=("Inter", 10, "bold"), anchor="w")
+        self.detail_label = self.canvas.create_text(25, 75, text="Monitoreando archivos...", fill=self.colors["subtext"], font=("Inter", 8), anchor="w")
+        
+        # Logo
         self.logo_img = None
         base_dir = os.path.dirname(os.path.abspath(__file__))
         logo_path = os.path.join(base_dir, "assets", "logo.png")
         if os.path.exists(logo_path) and HAS_PIL:
             try:
-                pil_img = Image.open(logo_path).resize((30, 30), Image.Resampling.LANCZOS)
+                pil_img = Image.open(logo_path).resize((25, 25), Image.Resampling.LANCZOS)
                 self.logo_img = ImageTk.PhotoImage(pil_img)
-                self.canvas.create_image(35, 30, image=self.logo_img)
+                self.canvas.create_image(20, 25, image=self.logo_img, anchor="w")
+                # Mover título si hay logo
+                self.canvas.move(self.canvas.find_withtag("title"), 35, 0)
             except: pass
-        
-        self.canvas.create_text(60, 30, text="Backend El Serrucho", fill=self.colors["text"], font=("Inter", 10, "bold"), anchor="w")
-        
-        # Glow y Status
-        self.glow_layers = [self.canvas.create_oval(40-r, 75-r, 40+r, 75+r, fill=self.colors["bg"], outline="") for r in range(12, 5, -2)]
-        self.status_dot = self.canvas.create_oval(34, 69, 46, 81, fill=self.colors["red"], outline="")
-        self.status_label = self.canvas.create_text(60, 75, text="Iniciando...", anchor="w", fill=self.colors["subtext"], font=("Inter", 9))
-        self.sync_label = self.canvas.create_text(self.width/2, 100, text="Verificando nube...", fill=self.colors["subtext"], font=("Inter", 8))
-        self.rate_label = self.canvas.create_text(self.width/2, 120, text="BCV: --.-- | Binance: --.--", fill=self.colors["text"], font=("Inter", 9, "bold"))
-        self.diff_label = self.canvas.create_text(self.width/2, 140, text="Brecha: --.--%", fill=self.colors["yellow"], font=("Inter", 8, "bold"))
 
-        # Botones
-        self.draw_rounded_rect(50, 160, 250, 190, 15, self.colors["btn"], tags="btn")
-        self.btn_text = self.canvas.create_text(150, 175, text="Sincronizar Ahora", fill=self.colors["green"], font=("Inter", 9, "bold"))
-        self.close_btn = self.canvas.create_text(275, 25, text="✕", fill=self.colors["subtext"], font=("Inter", 10, "bold"))
+        # Botón de Cerrar (X)
+        self.close_btn = self.canvas.create_text(280, 25, text="✕", fill=self.colors["subtext"], font=("Inter", 10, "bold"))
+        self.canvas.tag_bind(self.close_btn, "<Button-1>", lambda e: self.hide_to_tray())
 
+        # Área de Tasas (Card)
+        self.draw_rounded_rect(20, 100, 280, 155, 15, self.colors["card"])
+        self.rate_label = self.canvas.create_text(150, 120, text="BCV: --.-- | BNB: --.--", fill=self.colors["text"], font=("Inter", 10, "bold"))
+        self.diff_label = self.canvas.create_text(150, 140, text="Brecha: --.--%", fill=self.colors["yellow"], font=("Inter", 8, "bold"))
+        
+        # Botón de Sincronización
+        self.btn_bg = self.draw_rounded_rect(20, 165, 280, 205, 12, self.colors["blue"], tags="btn")
+        self.btn_text = self.canvas.create_text(150, 185, text="Sincronizar Ahora", fill="#FFFFFF", font=("Inter", 9, "bold"), tags="btn")
+        
         # Eventos
         self.canvas.tag_bind("bg", "<ButtonPress-1>", self.start_move)
         self.canvas.tag_bind("bg", "<B1-Motion>", self.do_move)
-        self.canvas.tag_bind("btn", "<Button-1>", lambda e: self.trigger_sync())
-        self.canvas.tag_bind(self.btn_text, "<Button-1>", lambda e: self.trigger_sync())
-        self.canvas.tag_bind(self.close_btn, "<Button-1>", lambda e: self.hide_to_tray())
+        self.canvas.tag_bind("btn", "<Button-1>", lambda e: self.trigger_sync_flow())
+        
+        # Clic derecho para cerrar
+        self.root.bind("<Button-3>", lambda e: self.quit_app())
 
-        # Control
-        self.anim_frame, self.is_online, self.needs_sync, self.is_syncing = 0, False, False, False
-        self.last_cloud_ts = 0
+        # Estado
+        self.is_syncing = False
+        self.anim_f = 0
+        self.last_synced_at = time.time()  # Arrancar "al día" para no disparar sync inmediata
         
         self.animate()
+        self.update_loop()
         self.check_loop()
         
         if HAS_TRAY:
             threading.Thread(target=self.setup_tray, daemon=True).start()
+
+    def setup_tray(self):
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            logo_path = os.path.join(base_dir, "assets", "logo.png")
+            icon_img = Image.open(logo_path) if os.path.exists(logo_path) else Image.new('RGB', (64, 64), (52, 199, 89))
+            menu = (item('Mostrar Monitor', self.show_from_tray, default=True), item('Salir', self.quit_app))
+            self.tray_icon = pystray.Icon("Serrucho", icon_img, "El Serrucho", menu)
+            self.tray_icon.run()
+        except: pass
 
     def hide_to_tray(self):
         self.root.withdraw()
@@ -116,146 +146,104 @@ class SerruchoDefinitiveWidget:
         self.root.deiconify()
         self.root.attributes("-topmost", True)
 
-    def setup_tray(self):
-        try:
-            logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo.png")
-            icon_img = Image.open(logo_path) if os.path.exists(logo_path) else Image.new('RGB', (64, 64), (52, 199, 89))
-            menu = (item('Mostrar Monitor', self.show_from_tray, default=True), item('Salir', self.quit_app))
-            self.tray_icon = pystray.Icon("Serrucho", icon_img, "El Serrucho", menu)
-            self.tray_icon.run()
-        except: pass
-
-    def quit_app(self):
-        if HAS_TRAY: self.tray_icon.stop()
-        self.root.quit()
-        sys.exit()
+    def check_loop(self):
+        def task():
+            try:
+                # Comparar archivos locales contra nuestra última sincronización
+                has_changes = False
+                for path in HYBRID_PATHS:
+                    if os.path.exists(path):
+                        mtime = os.path.getmtime(path)
+                        if mtime > (self.last_synced_at + 5):
+                            has_changes = True
+                            break
+                
+                if has_changes and not self.is_syncing:
+                    self.root.after(0, self.trigger_sync_flow)
+            except Exception as e:
+                print(f"Error en check_loop: {e}")
+            self.root.after(5000, self.check_loop)
+        
+        threading.Thread(target=task, daemon=True).start()
 
     def draw_rounded_rect(self, x1, y1, x2, y2, r, color, tags=""):
         p = [x1+r, y1, x1+r, y1, x2-r, y1, x2-r, y1, x2, y1, x2, y1+r, x2, y1+r, x2, y2-r, x2, y2-r, x2, y2, x2-r, y2, x2-r, y2, x1+r, y2, x1+r, y2, x1, y2, x1, y2-r, x1, y2-r, x1, y1+r, x1, y1+r, x1, y1]
         return self.canvas.create_polygon(p, smooth=True, fill=color, tags=tags)
 
-    def check_loop(self):
-        # Evitar múltiples hilos de chequeo simultáneos
-        if hasattr(self, "_checking") and self._checking:
-            return
-        self._checking = True
-
-        if self.is_syncing:
-            self._checking = False
-            self.root.after(5000, self.check_loop)
-            return
-
-        def task():
-            try:
-                # 1. Chequeo de la Nube
-                try:
-                    url = f"{SUPABASE_REST_URL}/rest/v1/productos?select=actualizado_en&order=actualizado_en.desc&limit=1"
-                    req = urllib.request.Request(url, headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"})
-                    with urllib.request.urlopen(req, timeout=5) as resp:
-                        res = json.loads(resp.read().decode())
-                        if res:
-                            dt = datetime.fromisoformat(res[0]['actualizado_en'].replace('Z', '+00:00'))
-                            self.last_cloud_ts = dt.timestamp()
-                            local_time = datetime.now().strftime('%H:%M:%S')
-                            status_text = f"Nube: {dt.astimezone().strftime('%d/%m %H:%M')} | {local_time}"
-                            self.root.after(0, lambda: self.canvas.itemconfig(self.sync_label, text=status_text))
-                            self.is_online = True
-                except: 
-                    self.is_online = False
-
-                # 2. Obtener Tasas
-                try:
-                    rate_url = f"{SUPABASE_REST_URL}/rest/v1/tazas?order=created_at.desc&limit=1"
-                    rate_req = urllib.request.Request(rate_url, headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"})
-                    with urllib.request.urlopen(rate_req, timeout=5) as r_resp:
-                        r_res = json.loads(r_resp.read().decode())
-                        if r_res:
-                            bcv = float(r_res[0].get('bcv_usd', 0))
-                            binance = float(r_res[0].get('binance_p2p', 0))
-                            self.root.after(0, lambda: self.canvas.itemconfig(self.rate_label, text=f"BCV: {bcv:,.2f} | BNB: {binance:,.2f}"))
-                            if bcv > 0:
-                                diff = ((binance / bcv) - 1) * 100
-                                color = self.colors["yellow"] if diff < 10 else self.colors["red"]
-                                if diff < 3: color = self.colors["subtext"]
-                                self.root.after(0, lambda d=diff, c=color: self.canvas.itemconfig(self.diff_label, text=f"Brecha: +{d:.2f}%", fill=c))
-                except: pass
-
-                # 3. Lógica de detección de cambios locales
-                has_changes = False
-                for path in HYBRID_PATHS:
-                    if os.path.exists(path):
-                        mtime = os.path.getmtime(path)
-                        if mtime > (self.last_cloud_ts + 5):
-                            has_changes = True
-                            break
-                
-                self.needs_sync = has_changes
-                self.root.after(0, self.update_ui)
-                
-                if self.needs_sync and self.is_online and not self.is_syncing:
-                    self.root.after(0, lambda: self.trigger_sync(auto=True))
-
-            except Exception as e:
-                print(f"[WIDGET] Error en hilo de chequeo: {e}")
-            finally:
-                self._checking = False
-                # Re-programar siempre el bucle
-                self.root.after(3000, self.check_loop) 
-            
-        threading.Thread(target=task, daemon=True).start()
-
-    def update_ui(self):
-        if self.is_syncing:
-            self.canvas.itemconfig(self.status_label, text="Sincronizando...", fill=self.colors["yellow"])
-        elif not self.is_online:
-            self.canvas.itemconfig(self.status_label, text="Sin Conexión", fill=self.colors["red"])
-        elif self.needs_sync:
-            self.canvas.itemconfig(self.status_label, text="Cambios Detectados", fill=self.colors["yellow"])
-        else:
-            self.canvas.itemconfig(self.status_label, text="Inventario al Día", fill=self.colors["green"])
-
-    def trigger_sync(self, *args):
+    def trigger_sync_flow(self):
         if self.is_syncing: return
         self.is_syncing = True
+        self.canvas.itemconfig(self.btn_bg, fill=self.colors["card"])
         self.canvas.itemconfig(self.btn_text, text="Procesando...")
-        self.update_ui()
         
         def run():
-            try:
-                # Intentar llamar al endpoint de la API local
-                # Usamos POST para mayor seguridad
-                req = urllib.request.Request("http://localhost:5000/api/v1/sync/run", method="POST")
-                with urllib.request.urlopen(req, timeout=120) as resp:
-                    pass
-            except Exception as e:
-                print(f"[WIDGET] Error en trigger_sync: {e}")
+            steps = [
+                ("Sincronizando Inventario...", "http://localhost:5000/api/v1/sync/inventory"),
+                ("Sincronizando Ventas...", "http://localhost:5000/api/v1/sync/sales")
+            ]
             
+            for msg, url in steps:
+                self.root.after(0, lambda m=msg: self.canvas.itemconfig(self.detail_label, text=m))
+                try:
+                    req = urllib.request.Request(url, method="POST")
+                    with urllib.request.urlopen(req, timeout=120) as resp:
+                        pass
+                except Exception as e:
+                    print(f"Error en {msg}: {e}")
+            
+            # CLAVE: Marcar el momento en que terminamos de sincronizar
+            self.last_synced_at = time.time()
             self.is_syncing = False
-            self.root.after(0, lambda: (self.canvas.itemconfig(self.btn_text, text="Sincronizar Ahora"), self.update_ui()))
-            # Forzar un chequeo inmediato para limpiar el estado de "Cambios Detectados"
-            self.root.after(500, self.check_loop) 
-        
+            self.root.after(0, self.reset_ui)
+
         threading.Thread(target=run, daemon=True).start()
 
+    def reset_ui(self):
+        self.canvas.itemconfig(self.btn_bg, fill=self.colors["blue"])
+        self.canvas.itemconfig(self.btn_text, text="Sincronizar Ahora")
+        self.canvas.itemconfig(self.detail_label, text="Sincronización Completada ✓")
+        self.root.after(3000, lambda: self.canvas.itemconfig(self.detail_label, text="Monitoreando archivos..."))
+
+    def update_loop(self):
+        def task():
+            try:
+                # Actualizar Tasas
+                url = f"{SUPABASE_REST_URL}/rest/v1/tazas?nombre=eq.actual&limit=1"
+                headers = {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"}
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode())
+                    if data:
+                        bcv = data[0].get("bcv_usd", 0)
+                        bnb = data[0].get("binance_p2p", 0)
+                        self.root.after(0, lambda: self.canvas.itemconfig(self.rate_label, text=f"BCV: {bcv:,.2f} | BNB: {bnb:,.2f}"))
+                        
+                        if bcv > 0:
+                            diff = ((bnb / bcv) - 1) * 100
+                            self.root.after(0, lambda: self.canvas.itemconfig(self.diff_label, text=f"Brecha: +{diff:.2f}%"))
+            except: pass
+            self.root.after(10000, self.update_loop)
+        
+        threading.Thread(target=task, daemon=True).start()
+
     def animate(self):
-        self.anim_frame += 0.08
-        f = (math.sin(self.anim_frame) + 1) / 2
-        status = "green" if self.is_online and not self.needs_sync and not self.is_syncing else ("yellow" if (self.needs_sync or self.is_syncing) else "red")
-        base_color = self.colors[status]
-        glow_color = self.colors[status + "_glow"]
-        self.canvas.itemconfig(self.status_dot, fill=base_color)
-        for i, layer in enumerate(self.glow_layers):
-            r1, g1, b1 = tuple(int(self.colors["bg"].lstrip('#')[j:j+2], 16) for j in (0, 2, 4))
-            r2, g2, b2 = tuple(int(glow_color.lstrip('#')[j:j+2], 16) for j in (0, 2, 4))
-            it = (1-(i/len(self.glow_layers)))*f
-            self.canvas.itemconfig(layer, fill=f'#{int(r1+(r2-r1)*it):02x}{int(g1+(g2-g1)*it):02x}{int(b1+(b2-b1)*it):02x}')
-        self.root.after(16, self.animate)
+        self.anim_f += 0.1
+        alpha = (math.sin(self.anim_f) + 1) / 2
+        color = self.colors["yellow"] if self.is_syncing else self.colors["green"]
+        self.canvas.itemconfig(self.status_dot, fill=color)
+        self.root.after(50, self.animate)
 
     def start_move(self, event): self.x, self.y = event.x, event.y
     def do_move(self, event):
         self.root.geometry(f"+{self.root.winfo_x()+(event.x-self.x)}+{self.root.winfo_y()+(event.y-self.y)}")
 
+    def quit_app(self):
+        if HAS_TRAY and hasattr(self, "tray_icon"):
+            self.tray_icon.stop()
+        self.root.quit()
+        sys.exit()
+
 if __name__ == "__main__":
     root = tk.Tk()
-    app = SerruchoDefinitiveWidget(root)
+    app = SerruchoPremiumWidget(root)
     root.mainloop()
