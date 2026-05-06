@@ -108,13 +108,70 @@ def sync_sales():
 
 @app.route("/api/v1/sync/run", methods=["POST", "GET"])
 def trigger_sync_all():
-    # Helper para el widget antiguo
     def run_all():
         subprocess.run([sys.executable, "sync.py", "once"])
         subprocess.run([sys.executable, "sync_ventas.py", "once"])
     
     threading.Thread(target=run_all).start()
     return jsonify({"status": "success", "message": "Sincronización completa iniciada"})
+
+@app.route("/api/v1/sync/status", methods=["GET"])
+def sync_status():
+    """Verifica integridad: compara conteos locales vs nube."""
+    import csv
+    import urllib.request
+    import urllib.error
+    
+    try:
+        from config import SUPABASE_REST_URL, SUPABASE_ANON_KEY
+    except ImportError:
+        return jsonify({"status": "error", "message": "Config no disponible"}), 500
+    
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Prefer": "count=exact"
+    }
+    
+    def count_csv(path):
+        full = os.path.join(BASE_DIR, path)
+        if not os.path.exists(full):
+            return 0
+        try:
+            with open(full, 'r', encoding='utf-8-sig') as f:
+                return sum(1 for _ in csv.DictReader(f))
+        except:
+            return 0
+    
+    def count_supabase(table):
+        try:
+            url = SUPABASE_REST_URL.rstrip('/') + "/rest/v1/" + table + "?select=count"
+            req = urllib.request.Request(url, headers=headers, method="HEAD")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                cr = resp.headers.get("content-range", "*/0")
+                return int(cr.split("/")[-1])
+        except Exception as e:
+            print(f"[STATUS] Error contando {table}: {e}")
+            return -1
+    
+    entities = {
+        "productos": {"csv": "MAESTRO_ACTUAL.csv", "table": "productos"},
+        "ventas": {"csv": "VENTAS_CABECERA.csv", "table": "ventas"},
+        "detalle": {"csv": "VENTAS_DETALLE.csv", "table": "ventas_detalle"},
+        "clientes": {"csv": "MAESTRO_CLIENTES.csv", "table": "clientes"},
+    }
+    
+    result = {}
+    all_ok = True
+    for key, cfg in entities.items():
+        local = count_csv(cfg["csv"])
+        cloud = count_supabase(cfg["table"])
+        ok = (local == cloud) if cloud >= 0 else False
+        if not ok:
+            all_ok = False
+        result[key] = {"local": local, "cloud": cloud, "ok": ok}
+    
+    return jsonify({"status": "ok" if all_ok else "mismatch", "entities": result})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=False)

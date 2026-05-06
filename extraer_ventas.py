@@ -12,10 +12,9 @@ def extract_table_to_csv(dat_filename, csv_filename, target_columns):
         return
 
     print(f"Extrayendo {dat_filename} a {csv_filename}...")
+    tmp_filename = csv_filename + ".tmp"
     try:
         db = pydbisam.PyDBISAM(filepath)
-        
-        # Encontrar los indices de las columnas objetivo
         col_indices = []
         for target in target_columns:
             found = False
@@ -25,29 +24,27 @@ def extract_table_to_csv(dat_filename, csv_filename, target_columns):
                     found = True
                     break
             if not found:
-                print(f"Advertencia: Columna {target} no encontrada en {dat_filename}")
                 col_indices.append(-1)
                 
-        with open(csv_filename, 'w', newline='', encoding='utf-8-sig') as f:
+        with open(tmp_filename, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
             writer.writerow(target_columns)
-            
             for row in db.rows():
-                # Filtrar solo las columnas objetivo
                 out_row = []
                 for idx in col_indices:
                     if idx != -1:
                         val = row[idx]
-                        if isinstance(val, date):
-                            val = val.strftime('%Y-%m-%d')
-                        elif val == 'Fail':
-                            val = ''
+                        if isinstance(val, date): val = val.strftime('%Y-%m-%d')
+                        elif val == 'Fail': val = ''
                         out_row.append(val)
-                    else:
-                        out_row.append('')
+                    else: out_row.append('')
                 writer.writerow(out_row)
+        
+        # Reemplazo atómico: El archivo original nunca está vacío
+        os.replace(tmp_filename, csv_filename)
         print(f"  -> Guardado {db._total_rows} registros en {csv_filename}")
     except Exception as e:
+        if os.path.exists(tmp_filename): os.remove(tmp_filename)
         print(f"Error procesando {dat_filename}: {e}")
 
 if __name__ == '__main__':

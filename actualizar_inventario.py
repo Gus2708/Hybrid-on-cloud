@@ -89,30 +89,25 @@ def process_inventory():
 
     # 4. Generar CSV
     print(f"  -> Generando {ARCHIVO_SALIDA}...")
+    tmp_salida = ARCHIVO_SALIDA + ".tmp"
     try:
-        with open(ARCHIVO_SALIDA, 'w', newline='', encoding='utf-8-sig') as f:
+        with open(tmp_salida, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
             writer.writerow(['CODIGO_INTERNO', 'DESCRIPCION', 'UNIDAD', 'CODIGO_BARRAS', 'COSTO', 'PRECIO_VENTA', 'EXISTENCIA'])
             
             count = 0
             for code in sorted(productos.keys()):
                 p = productos[code]
-                # Filtro básico de seguridad: no exportar basura
-                if len(p['codigo']) < 2 or p['desc'] == 'SIN DESCRIPCION':
-                    continue
+                if len(p['codigo']) < 2 or p['desc'] == 'SIN DESCRIPCION': continue
                 
-                writer.writerow([
-                    p['codigo'],
-                    p['desc'],
-                    p['und'],
-                    p['bar'],
-                    p['costo'],
-                    p['precio'],
-                    p['existencia']
-                ])
+                writer.writerow([p['codigo'], p['desc'], p['und'], p['bar'], p['costo'], p['precio'], p['existencia']])
                 count += 1
+        
+        # Reemplazo atómico
+        os.replace(tmp_salida, ARCHIVO_SALIDA)
         print(f"--- ÉXITO: {count} productos exportados correctamente ---")
     except Exception as e:
+        if os.path.exists(tmp_salida): os.remove(tmp_salida)
         print(f"  ! Error guardando CSV: {e}")
 
 if __name__ == "__main__":
