@@ -47,8 +47,10 @@ client.newCall(request).enqueue(object : Callback {
 | :--- | :--- | :--- |
 | `/api/v1/sync/status` | `GET` | Devuelve los contadores de productos y ventas (Local vs Nube). |
 | `/api/v1/productos?q=MARTILLO` | `GET` | Busca un producto en el inventario local de la PC. |
-| `/api/v1/sync/inventory` | `POST` | Sincroniza **solo** el inventario. |
-| `/api/v1/sync/sales` | `POST` | Sincroniza **solo** las ventas. |
+| `/api/v1/sync/run` | `POST` | Dispara la sincronización completa (Inventario + Ventas). |
+| `/api/v1/sync/inventory` | `POST` | Sincroniza **solo** el inventario de productos. |
+| `/api/v1/sync/sales` | `POST` | Sincroniza **solo** las ventas históricas y del día. |
+| `/api/v1/tasa` | `GET` | Retorna la tasa actual BCV y Binance. |
 
 ## ⚠️ Requisitos para la Conexión
 

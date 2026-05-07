@@ -1,5 +1,8 @@
 # 🔧 Corrección de Precios — Backend El Serrucho
 
+> [!NOTE]
+> Los cambios detallados en este documento (corrección de IVA 16%) han sido integrados en la lógica central de `actualizar_inventario.py` y se reflejan en la documentación principal.
+
 **Fecha:** 7 de Mayo, 2026  
 **Archivo modificado:** `actualizar_inventario.py`  
 **Estado:** ✅ Resuelto y sincronizado
