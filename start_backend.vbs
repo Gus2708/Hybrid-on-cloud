@@ -13,5 +13,8 @@ WshShell.Run "pythonw widget.pyw", 0, False
 ' 4. Iniciar el Monitor de archivos (Real-time Sync)
 WshShell.Run "pythonw monitor.py", 0, False
 
+' 5. Iniciar el Escuchador de Comandos Remotos (Cloud Listener)
+WshShell.Run "pythonw remote_listener.py", 0, False
+
 Set WshShell = Nothing
 

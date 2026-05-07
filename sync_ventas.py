@@ -65,6 +65,9 @@ def get_hash(data_dict):
     s = "|".join(str(v) for v in data_dict.values())
     return hashlib.md5(s.encode('utf-8')).hexdigest()
 
+# Tasa de cambio promedio para el periodo de Mayo (ajustado según reporte Hybrid)
+FACTOR_USD = 489.55
+
 def to_float(val):
     try: return float(val) if val else 0.0
     except: return 0.0
@@ -92,6 +95,9 @@ def sync_incremental(force=False):
             with open(PROD_CACHE_FILE, 'r') as f: productos_cache = json.load(f)
         except: pass
 
+    # Caché temporal de tasas para los detalles (doc -> tasa)
+    ventas_rates = {}
+
     # Mapeos
     def map_cliente(row):
         return {"codigo_cliente": row["CLT_CODIGO"], "nombre": row["CLT_DESCRIPCION"], "rif": row["CLT_RIF"], 
@@ -99,28 +105,47 @@ def sync_incremental(force=False):
 
     def map_venta(row):
         rif = row.get("THT_RIFCLIENTE", "").strip()
-        # Validar FK contra el catálogo de clientes (cache contiene los códigos de cliente)
-        # Si no existe, usamos None para evitar error 409
         if rif and rif not in cache.get("clientes", {}):
             rif = None
             
+        # Usar la tasa dinámica de la factura (Factor Referencial)
+        # Si no existe o es <= 1.0 (para ventas en Bs sin tasa), usamos la de TMonedas como fallback
+        tasa_doc = to_float(row.get("THT_FACTORREFERENCIAL", 0))
+        if tasa_doc <= 1.0: tasa_doc = FACTOR_USD
+        
+        # Guardamos la tasa para el detalle que viene después
+        doc_num = row["THT_DOCUMENTO"].strip()
+        ventas_rates[doc_num] = tasa_doc
+
+        neto_usd = to_float(row["THT_TOTALNETO"]) / tasa_doc
+        impuesto_usd = to_float(row.get("THT_TOTALIMPUESTO", 0)) / tasa_doc
+        bruto_usd = to_float(row.get("THT_TOTALBRUTO", 0)) / tasa_doc if row.get("THT_TOTALBRUTO") else (neto_usd - impuesto_usd)
+
         return {"id": int(row["THT_AUTOINCREMENT"]), "documento": row["THT_DOCUMENTO"], 
                 "fecha_emision": row["THT_FECHAEMISION"] if row["THT_FECHAEMISION"] else None,
                 "rif_cliente": rif if rif else None, 
-                "total_neto": to_float(row["THT_TOTALNETO"]),
-                "total_impuesto": to_float(row.get("THT_TOTALIMPUESTO", 0)), "status": to_int(row["THT_STATUS"]),
+                "total_neto": round(neto_usd, 2),
+                "total_impuesto": round(impuesto_usd, 2),
+                "total_bruto": round(bruto_usd, 2),
+                "status": to_int(row["THT_STATUS"]),
                 "numero_control": row["THT_NUMEROCONTROL"]}
 
     def map_detalle(row):
         try:
+            doc_num = row["TBT_DOCUMENTO"].strip()
             prod = row.get("TBT_CODIGO", "").strip()
-            # Validar FK contra el catálogo de productos
             if prod and prod not in productos_cache:
                 prod = None
                 
+            # Buscar la tasa que usó la cabecera de esta factura
+            # Si no la tenemos (porque es incremental y la cabecera no se procesó), usamos fallback
+            tasa_doc = ventas_rates.get(doc_num, FACTOR_USD)
+            precio_usd = to_float(row["TBT_PRECIODEVENTA"]) / tasa_doc
+
             return {"id": int(row["TBT_AUTOINCREMENT"]), "documento": row["TBT_DOCUMENTO"], 
                     "codigo_producto": prod if prod else None,
-                    "cantidad": to_float(row["TBT_CANTIDAD"]), "precio_venta": to_float(row["TBT_PRECIODEVENTA"]),
+                    "cantidad": to_float(row["TBT_CANTIDAD"]), 
+                    "precio_venta": round(precio_usd, 2),
                     "costo_str": row.get("TBT_CTOCOSTOSTR", ""), 
                     "venta_id": int(row["TBT_OPERACION_AUTOINCREMENT"]) if row.get("TBT_OPERACION_AUTOINCREMENT") else None}
         except: return None

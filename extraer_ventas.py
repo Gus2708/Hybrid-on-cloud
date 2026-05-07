@@ -59,17 +59,62 @@ if __name__ == '__main__':
     tasks = [
         ("TClientes.dat", "MAESTRO_CLIENTES.csv", 
          ["CLT_CODIGO", "CLT_DESCRIPCION", "CLT_RIF", "CLT_TELEFONO", "CLT_DIRECCION1"]),
+        
         ("TTransaccionvta.dat", "VENTAS_CABECERA.csv", 
-         ["THT_AUTOINCREMENT", "THT_DOCUMENTO", "THT_FECHAEMISION", "THT_RIFCLIENTE", "THT_TOTALNETO", "THT_STATUS", "THT_NUMEROCONTROL", "THT_TOTALIMPUESTO"]),
+         ["THT_AUTOINCREMENT", "THT_DOCUMENTO", "THT_FECHAEMISION", "THT_RIFCLIENTE", "THT_TOTALNETO", 
+          "THT_STATUS", "THT_NUMEROCONTROL", "THT_TOTALIMPUESTO", "THT_TIPO", "THT_TOTALBRUTO", "THT_FACTORREFERENCIAL"]),
+        
         ("TDetalleVta.dat", "VENTAS_DETALLE.csv", 
-         ["TBT_AUTOINCREMENT", "TBT_DOCUMENTO", "TBT_CODIGO", "TBT_CANTIDAD", "TBT_PRECIODEVENTA", "TBT_CTOCOSTOSTR", "TBT_OPERACION_AUTOINCREMENT"])
+         ["TBT_AUTOINCREMENT", "TBT_DOCUMENTO", "TBT_CODIGO", "TBT_CANTIDAD", "TBT_PRECIODEVENTA", 
+          "TBT_CTOCOSTOSTR", "TBT_OPERACION_AUTOINCREMENT", "TBT_TIPOOPERACION"])
     ]
     
     any_extracted = False
     for dat, csv_f, cols in tasks:
         if should_extract(dat, csv_f):
-            extract_table_to_csv(dat, csv_f, cols)
-            any_extracted = True
+            # Para ventas, aplicamos filtros especiales dentro de la extracción si es necesario
+            # Pero para mantener la función genérica, filtraremos en el loop de filas
+            filepath = os.path.join(base, dat)
+            tmp_filename = csv_f + ".tmp"
+            try:
+                db = pydbisam.PyDBISAM(filepath)
+                col_indices = [next((i for i, c in enumerate(db._columns) if c.name.upper() == target.upper()), -1) for target in cols]
+                
+                # Indices para filtros
+                idx_tipo = -1
+                idx_status = -1
+                if "THT_TIPO" in cols: idx_tipo = cols.index("THT_TIPO")
+                elif "TBT_TIPOOPERACION" in cols: idx_tipo = cols.index("TBT_TIPOOPERACION")
+                if "THT_STATUS" in cols: idx_status = cols.index("THT_STATUS")
+
+                with open(tmp_filename, 'w', newline='', encoding='utf-8-sig') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(cols)
+                    valid_rows = 0
+                    for row in db.rows():
+                        # Lógica de filtrado: Solo Facturas (11) y No Anuladas (Status != 4)
+                        if idx_tipo != -1:
+                            tipo_val = str(row[col_indices[idx_tipo]]).strip()
+                            if tipo_val != "11": continue # Solo Facturas
+                        
+                        if idx_status != -1:
+                            status_val = str(row[col_indices[idx_status]]).strip()
+                            if status_val == "4": continue # Saltar Anuladas
+
+                        out_row = []
+                        for idx in col_indices:
+                            val = row[idx] if idx != -1 else ''
+                            if isinstance(val, date): val = val.strftime('%Y-%m-%d')
+                            elif val == 'Fail': val = ''
+                            out_row.append(val)
+                        writer.writerow(out_row)
+                        valid_rows += 1
+                
+                os.replace(tmp_filename, csv_f)
+                print(f"  -> {dat}: Guardado {valid_rows} registros filtrados en {csv_f}")
+                any_extracted = True
+            except Exception as e:
+                print(f"Error procesando {dat}: {e}")
         else:
             print(f"[SKIP] {dat} no ha cambiado.")
             

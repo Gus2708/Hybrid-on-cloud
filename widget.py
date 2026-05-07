@@ -2,6 +2,7 @@ import tkinter as tk
 from tkinter import messagebox
 import urllib.request
 import json
+import socket
 import threading
 import time
 
@@ -41,6 +42,11 @@ class SerruchoWidget:
         self.sync_text = tk.Label(root, text="Última Sync: --:--", fg="#888888", bg="#1e1e1e", font=self.text_font)
         self.sync_text.pack()
         
+        # IP Label
+        self.ip_addr = self.get_local_ip()
+        self.ip_text = tk.Label(root, text=f"IP: {self.ip_addr}", fg="#555555", bg="#1e1e1e", font=("Segoe UI", 8))
+        self.ip_text.pack(side="bottom", pady=2)
+        
         # Buttons Frame
         self.btn_frame = tk.Frame(root, bg="#1e1e1e", pady=10)
         self.btn_frame.pack()
@@ -50,6 +56,17 @@ class SerruchoWidget:
         
         self.close_btn = tk.Button(self.btn_frame, text="✕", command=root.quit, bg="#333333", fg="white", relief="flat", font=self.title_font)
         self.close_btn.pack(side="left")
+
+    def get_local_ip(self):
+        try:
+            # Crea un socket temporal para detectar la interfaz de red activa
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except:
+            return "127.0.0.1"
 
         # Iniciar actualización periódica
         self.update_status()

@@ -49,8 +49,8 @@ class SerruchoPremiumWidget:
         self.root = root
         self.root.title("Serrucho Monitor")
         self.width = 310
-        self.height_full = 320
-        self.height_compact = 215
+        self.height_full = 335
+        self.height_compact = 230
         self.integrity_visible = True
         
         # Estética iOS 17
@@ -120,6 +120,10 @@ class SerruchoPremiumWidget:
         self.sync_time_label = self.canvas.create_text(155, 298, text="Último Sync: ...", fill=self.colors["subtext"], font=("Inter", 7), tags="footer_ui")
         self.check_time_label = self.canvas.create_text(155, 308, text="Último Monitoreo: --/-- --:--", fill=self.colors["subtext"], font=("Inter", 7), tags="footer_ui")
         
+        # IP Label
+        self.ip_addr = self.get_local_ip()
+        self.ip_label = self.canvas.create_text(155, 320, text=f"IP Local: {self.ip_addr}", fill="#444444", font=("Inter", 6), tags="footer_ui")
+        
         self.canvas.tag_bind("bg_layer", "<ButtonPress-1>", self.start_move)
         self.canvas.tag_bind("bg_layer", "<B1-Motion>", self.do_move)
         self.canvas.tag_bind("footer_ui", "<Button-1>", lambda e: self.trigger_sync_flow())
@@ -146,13 +150,23 @@ class SerruchoPremiumWidget:
         else:
             self.canvas.itemconfig("integrity_ui", state="hidden")
             self.canvas.itemconfig(self.toggle_btn, text="▶")
-            dy, h = -75, self.height_compact
+            dy, h = -105, self.height_compact
 
         self.canvas.move("footer_ui", 0, dy)
         # CORRECCIÓN: Recalcular puntos del polígono para que no se rompa el fondo
         new_pts = self.get_rounded_points(0, 0, self.width, h, 28)
         self.canvas.coords(self.bg_rect, *new_pts)
         self.root.geometry(f"{self.width}x{h}")
+
+    def get_local_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except:
+            return "127.0.0.1"
 
     def load_last_sync_time(self):
         try:
