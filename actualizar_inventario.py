@@ -32,6 +32,19 @@ def clean_val(val):
 def process_inventory():
     print(f"--- Iniciando extracción profesional de inventario ---")
     
+    # NUEVO: Evitar efecto cascada
+    rutas_criticas = [RUTA_INVENTARIO, RUTA_PRECIOS, RUTA_EXISTENCIA]
+    if os.path.exists(ARCHIVO_SALIDA):
+        csv_mtime = os.path.getmtime(ARCHIVO_SALIDA)
+        has_changes = False
+        for r in rutas_criticas:
+            if os.path.exists(r) and os.path.getmtime(r) > (csv_mtime + 2):
+                has_changes = True
+                break
+        if not has_changes:
+            print("  [SKIP] Los archivos de inventario no han cambiado. Saltando extracción.")
+            return True # Éxito (sin cambios)
+    
     # 1. Leer Catálogo Maestro
     productos = {}
     print(f"  -> Procesando catálogo: {os.path.basename(RUTA_INVENTARIO)}...")
@@ -59,13 +72,15 @@ def process_inventory():
     print(f"  -> Procesando precios: {os.path.basename(RUTA_PRECIOS)}...")
     try:
         db_precios = pydbisam.PyDBISAM(RUTA_PRECIOS)
-        # TPC_CODIGOPRODUCTO (1), TPC_COSTOACTUAL (4), TPC_PVPSINIMPUESTO1 (7)
+        # TPC_CODIGOPRODUCTO (1), TPC_COSTOACTUAL (4), TPC_PVPCONIMPUESTO1 (13)
+        # NOTA: Se usa columna [13] (CON impuesto) en vez de [7] (SIN impuesto)
+        #       para reflejar el precio real de venta incluyendo IVA 16%.
         for row in db_precios.rows():
             code = str(row[1]).strip()
             if code in productos:
                 try:
                     costo = float(row[4]) if row[4] != 'Fail' else 0.0
-                    precio = float(row[7]) if row[7] != 'Fail' else 0.0
+                    precio = float(row[13]) if row[13] != 'Fail' else 0.0
                     productos[code]['costo'] = costo
                     productos[code]['precio'] = precio
                 except: pass

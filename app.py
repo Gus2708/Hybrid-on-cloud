@@ -115,33 +115,37 @@ def trigger_sync_all():
     threading.Thread(target=run_all).start()
     return jsonify({"status": "success", "message": "Sincronización completa iniciada"})
 
+_COUNT_CACHE = {}
+
 @app.route("/api/v1/sync/status", methods=["GET"])
 def sync_status():
-    """Verifica integridad: compara conteos locales vs nube."""
+    """Verifica integridad: compara conteos locales vs nube con caché de disco."""
     import csv
     import urllib.request
-    import urllib.error
+    global _COUNT_CACHE
     
     try:
         from config import SUPABASE_REST_URL, SUPABASE_ANON_KEY
     except ImportError:
         return jsonify({"status": "error", "message": "Config no disponible"}), 500
     
-    headers = {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-        "Prefer": "count=exact"
-    }
+    headers = {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}", "Prefer": "count=exact"}
     
-    def count_csv(path):
+    def count_csv_smart(path):
         full = os.path.join(BASE_DIR, path)
-        if not os.path.exists(full):
-            return 0
+        if not os.path.exists(full): return 0
+        mtime = os.path.getmtime(full)
+        # Si el archivo no cambió, devolver caché
+        if path in _COUNT_CACHE and _COUNT_CACHE[path]["mtime"] == mtime:
+            return _COUNT_CACHE[path]["count"]
+        
+        # Contar filas (optimizado)
         try:
-            with open(full, 'r', encoding='utf-8-sig') as f:
-                return sum(1 for _ in csv.DictReader(f))
-        except:
-            return 0
+            with open(full, 'rb') as f:
+                count = sum(1 for line in f) - 1 # Restar cabecera
+            _COUNT_CACHE[path] = {"count": max(0, count), "mtime": mtime}
+            return _COUNT_CACHE[path]["count"]
+        except: return 0
     
     def count_supabase(table):
         try:
@@ -150,9 +154,7 @@ def sync_status():
             with urllib.request.urlopen(req, timeout=10) as resp:
                 cr = resp.headers.get("content-range", "*/0")
                 return int(cr.split("/")[-1])
-        except Exception as e:
-            print(f"[STATUS] Error contando {table}: {e}")
-            return -1
+        except: return -1
     
     entities = {
         "productos": {"csv": "MAESTRO_ACTUAL.csv", "table": "productos"},
@@ -164,11 +166,10 @@ def sync_status():
     result = {}
     all_ok = True
     for key, cfg in entities.items():
-        local = count_csv(cfg["csv"])
+        local = count_csv_smart(cfg["csv"])
         cloud = count_supabase(cfg["table"])
         ok = (local == cloud) if cloud >= 0 else False
-        if not ok:
-            all_ok = False
+        if not ok: all_ok = False
         result[key] = {"local": local, "cloud": cloud, "ok": ok}
     
     return jsonify({"status": "ok" if all_ok else "mismatch", "entities": result})

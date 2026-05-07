@@ -47,25 +47,31 @@ def extract_table_to_csv(dat_filename, csv_filename, target_columns):
         if os.path.exists(tmp_filename): os.remove(tmp_filename)
         print(f"Error procesando {dat_filename}: {e}")
 
+def should_extract(dat_filename, csv_filename):
+    dat_path = os.path.join(base, dat_filename)
+    if not os.path.exists(dat_path): return False
+    if not os.path.exists(csv_filename): return True
+    # Si el .dat es más nuevo que el .csv (con margen de 2s), extraer
+    return os.path.getmtime(dat_path) > (os.path.getmtime(csv_filename) + 2)
+
 if __name__ == '__main__':
-    # Clientes
-    extract_table_to_csv(
-        "TClientes.dat", 
-        "MAESTRO_CLIENTES.csv", 
-        ["CLT_CODIGO", "CLT_DESCRIPCION", "CLT_RIF", "CLT_TELEFONO", "CLT_DIRECCION1"]
-    )
+    # Lista de tareas: (DAT, CSV, Columnas)
+    tasks = [
+        ("TClientes.dat", "MAESTRO_CLIENTES.csv", 
+         ["CLT_CODIGO", "CLT_DESCRIPCION", "CLT_RIF", "CLT_TELEFONO", "CLT_DIRECCION1"]),
+        ("TTransaccionvta.dat", "VENTAS_CABECERA.csv", 
+         ["THT_AUTOINCREMENT", "THT_DOCUMENTO", "THT_FECHAEMISION", "THT_RIFCLIENTE", "THT_TOTALNETO", "THT_STATUS", "THT_NUMEROCONTROL", "THT_TOTALIMPUESTO"]),
+        ("TDetalleVta.dat", "VENTAS_DETALLE.csv", 
+         ["TBT_AUTOINCREMENT", "TBT_DOCUMENTO", "TBT_CODIGO", "TBT_CANTIDAD", "TBT_PRECIODEVENTA", "TBT_CTOCOSTOSTR", "TBT_OPERACION_AUTOINCREMENT"])
+    ]
     
-    # Cabecera de Ventas
-    extract_table_to_csv(
-        "TTransaccionvta.dat", 
-        "VENTAS_CABECERA.csv", 
-        ["THT_AUTOINCREMENT", "THT_DOCUMENTO", "THT_FECHAEMISION", "THT_RIFCLIENTE", "THT_TOTALNETO", "THT_STATUS", "THT_NUMEROCONTROL", "THT_TOTALIMPUESTO"]
-    )
-    
-    # Detalle de Ventas
-    extract_table_to_csv(
-        "TDetalleVta.dat", 
-        "VENTAS_DETALLE.csv", 
-        ["TBT_AUTOINCREMENT", "TBT_DOCUMENTO", "TBT_CODIGO", "TBT_CANTIDAD", "TBT_PRECIODEVENTA", "TBT_CTOCOSTOSTR", "TBT_OPERACION_AUTOINCREMENT"]
-    )
-    print("Extracción completada.")
+    any_extracted = False
+    for dat, csv_f, cols in tasks:
+        if should_extract(dat, csv_f):
+            extract_table_to_csv(dat, csv_f, cols)
+            any_extracted = True
+        else:
+            print(f"[SKIP] {dat} no ha cambiado.")
+            
+    if not any_extracted:
+        print("Todo está al día. No se extrajo nada.")
