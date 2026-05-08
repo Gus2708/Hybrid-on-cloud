@@ -1,51 +1,46 @@
 import pydbisam
 import os
 import csv
-from datetime import date
+import struct
+from datetime import date, datetime, timedelta
 
 base = r"h:\HybridLite\HybridEmpresa\HybridDataBase"
 
-def extract_table_to_csv(dat_filename, csv_filename, target_columns):
-    filepath = os.path.join(base, dat_filename)
-    if not os.path.exists(filepath):
-        print(f"Error: {filepath} no existe.")
-        return
-
-    print(f"Extrayendo {dat_filename} a {csv_filename}...")
-    tmp_filename = csv_filename + ".tmp"
+def get_payments_map():
+    path = os.path.join(base, "TDetalleFormasPagoVta.Dat")
+    if not os.path.exists(path):
+        return {}
+    
+    payments = {}
     try:
-        db = pydbisam.PyDBISAM(filepath)
-        col_indices = []
-        for target in target_columns:
-            found = False
-            for i, col in enumerate(db._columns):
-                if col.name.upper() == target.upper():
-                    col_indices.append(i)
-                    found = True
-                    break
-            if not found:
-                col_indices.append(-1)
-                
-        with open(tmp_filename, 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.writer(f)
-            writer.writerow(target_columns)
-            for row in db.rows():
-                out_row = []
-                for idx in col_indices:
-                    if idx != -1:
-                        val = row[idx]
-                        if isinstance(val, date): val = val.strftime('%Y-%m-%d')
-                        elif val == 'Fail': val = ''
-                        out_row.append(val)
-                    else: out_row.append('')
-                writer.writerow(out_row)
+        db = pydbisam.PyDBISAM(path)
+        # Identificar columnas necesarias
+        idx_id_src = -1
+        idx_desc = -1
+        for i, col in enumerate(db._columns):
+            if col.name.upper() == "DFP_IDUNICOSOURCE": idx_id_src = i
+            elif col.name.upper() == "DFP_DESCRIPCION": idx_desc = i
         
-        # Reemplazo atómico: El archivo original nunca está vacío
-        os.replace(tmp_filename, csv_filename)
-        print(f"  -> Guardado {db._total_rows} registros en {csv_filename}")
+        if idx_id_src == -1 or idx_desc == -1:
+            return {}
+
+        for row in db.rows():
+            id_src = row[idx_id_src]
+            desc = row[idx_desc]
+            if id_src:
+                payments[id_src] = desc
     except Exception as e:
-        if os.path.exists(tmp_filename): os.remove(tmp_filename)
-        print(f"Error procesando {dat_filename}: {e}")
+        print(f"Error cargando mapa de pagos: {e}")
+    return payments
+
+def decode_dbisam_time(ms_value):
+    """Decodifica milisegundos desde medianoche a formato HH:MM:SS"""
+    if not isinstance(ms_value, int):
+        return "00:00:00"
+    h = ms_value // (1000 * 3600)
+    m = (ms_value % (1000 * 3600)) // (1000 * 60)
+    s = (ms_value % (1000 * 60)) // 1000
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 def should_extract(dat_filename, csv_filename):
     dat_path = os.path.join(base, dat_filename)
@@ -62,7 +57,8 @@ if __name__ == '__main__':
         
         ("TTransaccionvta.dat", "VENTAS_CABECERA.csv", 
          ["THT_AUTOINCREMENT", "THT_DOCUMENTO", "THT_FECHAEMISION", "THT_RIFCLIENTE", "THT_TOTALNETO", 
-          "THT_STATUS", "THT_NUMEROCONTROL", "THT_TOTALIMPUESTO", "THT_TIPO", "THT_TOTALBRUTO", "THT_FACTORREFERENCIAL"]),
+          "THT_STATUS", "THT_NUMEROCONTROL", "THT_TOTALIMPUESTO", "THT_TIPO", "THT_TOTALBRUTO", 
+          "THT_FACTORREFERENCIAL", "THT_HORA", "THT_IDUNICO"]),
         
         ("TDetalleVta.dat", "VENTAS_DETALLE.csv", 
          ["TBT_AUTOINCREMENT", "TBT_DOCUMENTO", "TBT_CODIGO", "TBT_CANTIDAD", "TBT_PRECIODEVENTA", 
@@ -70,43 +66,82 @@ if __name__ == '__main__':
     ]
     
     any_extracted = False
+    payments_map = None
+    
     for dat, csv_f, cols in tasks:
         if should_extract(dat, csv_f):
-            # Para ventas, aplicamos filtros especiales dentro de la extracción si es necesario
-            # Pero para mantener la función genérica, filtraremos en el loop de filas
             filepath = os.path.join(base, dat)
             tmp_filename = csv_f + ".tmp"
+            
+            # Cargar mapa de pagos solo si vamos a procesar ventas
+            if dat == "TTransaccionvta.dat" and payments_map is None:
+                print("Cargando catálogo de métodos de pago...")
+                payments_map = get_payments_map()
+
             try:
                 db = pydbisam.PyDBISAM(filepath)
                 col_indices = [next((i for i, c in enumerate(db._columns) if c.name.upper() == target.upper()), -1) for target in cols]
                 
-                # Indices para filtros
-                idx_tipo = -1
-                idx_status = -1
-                if "THT_TIPO" in cols: idx_tipo = cols.index("THT_TIPO")
-                elif "TBT_TIPOOPERACION" in cols: idx_tipo = cols.index("TBT_TIPOOPERACION")
-                if "THT_STATUS" in cols: idx_status = cols.index("THT_STATUS")
+                # Columnas para lógica especial
+                idx_tipo = next((i for i, c in enumerate(cols) if c == "THT_TIPO" or c == "TBT_TIPOOPERACION"), -1)
+                idx_status = next((i for i, c in enumerate(cols) if c == "THT_STATUS"), -1)
+                idx_fecha = next((i for i, c in enumerate(cols) if c == "THT_FECHAEMISION"), -1)
+                idx_hora = next((i for i, c in enumerate(cols) if c == "THT_HORA"), -1)
+                idx_id_unico = next((i for i, c in enumerate(cols) if c == "THT_IDUNICO"), -1)
+
+                # Columnas de salida (agregamos metodo_pago y fecha_hora_completa al CSV)
+                out_cols = cols.copy()
+                if dat == "TTransaccionvta.dat":
+                    out_cols.append("METODO_PAGO")
+                    out_cols.append("FECHA_HORA_COMPLETA")
 
                 with open(tmp_filename, 'w', newline='', encoding='utf-8-sig') as f:
                     writer = csv.writer(f)
-                    writer.writerow(cols)
+                    writer.writerow(out_cols)
                     valid_rows = 0
-                    for row in db.rows():
+                    
+                    for i in range(db._total_rows + db._deleted_rows):
+                        row = db.row(i)
+                        if row is None: continue # Fila eliminada
+
                         # Lógica de filtrado: Solo Facturas (11) y No Anuladas (Status != 4)
                         if idx_tipo != -1:
                             tipo_val = str(row[col_indices[idx_tipo]]).strip()
-                            if tipo_val != "11": continue # Solo Facturas
+                            if tipo_val != "11": continue
                         
                         if idx_status != -1:
                             status_val = str(row[col_indices[idx_status]]).strip()
-                            if status_val == "4": continue # Saltar Anuladas
+                            if status_val == "4": continue
 
                         out_row = []
-                        for idx in col_indices:
-                            val = row[idx] if idx != -1 else ''
+                        for col_idx in col_indices:
+                            val = row[col_idx] if col_idx != -1 else ''
                             if isinstance(val, date): val = val.strftime('%Y-%m-%d')
                             elif val == 'Fail': val = ''
                             out_row.append(val)
+                        
+                        # Lógica especial para VENTAS_CABECERA
+                        if dat == "TTransaccionvta.dat":
+                            # 1. Método de Pago
+                            id_unico = row[col_indices[idx_id_unico]] if idx_id_unico != -1 else None
+                            metodo = payments_map.get(id_unico, "EFECTIVO") if id_unico else "EFECTIVO"
+                            out_row.append(metodo)
+                            
+                            # 2. Fecha y Hora Completa
+                            fecha_str = out_row[idx_fecha] if idx_fecha != -1 else ""
+                            # Decodificar hora manualmente desde el buffer crudo si pydbisam falla
+                            hora_str = "00:00:00"
+                            if idx_hora != -1:
+                                col_obj = db._columns[col_indices[idx_hora]]
+                                row_offset = db._data_offset + (i * db._row_size)
+                                field_data = db._data[row_offset + col_obj.row_offset : row_offset + col_obj.row_offset + 4]
+                                ms_val = struct.unpack("<I", field_data)[0]
+                                hora_str = decode_dbisam_time(ms_val)
+                            
+                            # Combinar en ISO 8601 con offset VZLA
+                            full_ts = f"{fecha_str} {hora_str}-04:00"
+                            out_row.append(full_ts)
+
                         writer.writerow(out_row)
                         valid_rows += 1
                 
@@ -114,6 +149,8 @@ if __name__ == '__main__':
                 print(f"  -> {dat}: Guardado {valid_rows} registros filtrados en {csv_f}")
                 any_extracted = True
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 print(f"Error procesando {dat}: {e}")
         else:
             print(f"[SKIP] {dat} no ha cambiado.")

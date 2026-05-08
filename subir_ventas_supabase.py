@@ -16,7 +16,6 @@ def upsert_batch(table: str, on_conflict: str, payload: list) -> bool:
     if not payload:
         return True
     
-    # Si la tabla no tiene llave primaria simple para on_conflict (ej. identity id), no usar on_conflict
     if on_conflict:
         url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/{table}?on_conflict={on_conflict}"
     else:
@@ -26,9 +25,11 @@ def upsert_batch(table: str, on_conflict: str, payload: list) -> bool:
     req = urllib.request.Request(url, data=data, headers=HEADERS, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            if resp.getcode() in (200, 201, 204):
+            code = resp.getcode()
+            body = resp.read().decode(errors='ignore')
+            if code in (200, 201, 204):
                 return True
-            print(f"Error {resp.getcode()}: {resp.read().decode(errors='ignore')}")
+            print(f"Error {code}: {body}")
             return False
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="ignore") if e.fp else ""
@@ -104,17 +105,20 @@ def subir_ventas():
                 "total_neto": to_float(row["THT_TOTALNETO"]),
                 "total_impuesto": to_float(row.get("THT_TOTALIMPUESTO", 0)),
                 "status": to_int(row["THT_STATUS"]),
-                "numero_control": row["THT_NUMEROCONTROL"]
+                "numero_control": row["THT_NUMEROCONTROL"],
+                "metodo_pago": row.get("METODO_PAGO", ""),
+                "created_at": row.get("FECHA_HORA_COMPLETA"), # Sobreescribir con hora real
+                "id_unico": to_int(row.get("THT_IDUNICO", 0))
             })
             if len(batch) >= 1000:
-                if not upsert_batch("ventas", "documento", batch):
+                if not upsert_batch("ventas", "id_unico", batch):
                     print("Error subiendo lote de ventas.")
                 total += len(batch)
                 batch = []
                 print(f"  ...{total} ventas subidas.")
         
         if batch:
-            upsert_batch("ventas", "documento", batch)
+            upsert_batch("ventas", "id_unico", batch)
             total += len(batch)
             print(f"  ...{total} ventas subidas.")
 
