@@ -78,19 +78,24 @@ def _upsert_with_urllib(url: str, payload: list) -> bool:
         return False
 
 
+_retry_count = 0
+
+def _exponential_backoff(attempt: int) -> float:
+    return min(1.5 ** attempt, 15.0)
+
 def upsert_batch_rest(rows: list, table: str = "productos") -> bool:
     """
     Hace upsert de una lista de dicts a la tabla indicada.
     Usa requests si está disponible, si no urllib.
-    Devuelve True si todo fue OK, False si hubo algún error.
+    Reintenta hasta 3 veces con backoff exponencial en caso de error transitorio.
     """
+    global _retry_count
     if not REST_URL or not ANON_KEY:
         print("[REST] REST_URL o ANON_KEY no configurados. Skipping.")
         return False
 
     url = f"{REST_URL.rstrip('/')}/rest/v1/{table}?on_conflict=codigo_interno"
 
-    # Normalizar payload: usar claves en minúsculas para PostgreSQL estándar
     payload = [
         {
             "codigo_interno":  r.get("CODIGO_INTERNO", r.get("codigo_interno", "")),
@@ -104,9 +109,23 @@ def upsert_batch_rest(rows: list, table: str = "productos") -> bool:
         for r in rows
     ]
 
-    if _requests is not None:
-        return _upsert_with_requests(url, payload)
-    return _upsert_with_urllib(url, payload)
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        if _requests is not None:
+            ok = _upsert_with_requests(url, payload)
+        else:
+            ok = _upsert_with_urllib(url, payload)
+        if ok:
+            _retry_count = 0
+            return True
+        if attempt < max_retries:
+            delay = _exponential_backoff(attempt)
+            print(f"[REST] Reintentando upsert ({attempt}/{max_retries}) en {delay:.0f}s...")
+            import time
+            time.sleep(delay)
+            _retry_count += 1
+    _retry_count += 1
+    return False
 
 
 def test_conexion() -> dict:
@@ -155,9 +174,18 @@ def get_row_count_rest(table: str = "productos") -> int:
         print(f"[REST] Error en get_row_count: {e}")
         return -1
 
+_MIN_SAFE_IDS = 10
+
 def delete_orphans_rest(valid_ids: list, table: str = "productos") -> bool:
     """Elimina filas de la tabla que NO estén en la lista de IDs válidos."""
     if not REST_URL or not ANON_KEY:
+        return False
+    
+    # 🛡️ SALVAGUARDA: si hay menos de MIN_SAFE_IDS IDs válidos, NO eliminar.
+    # Esto evita una catástrofe si la unidad H: está caída y el CSV salió vacío.
+    if len(valid_ids) < _MIN_SAFE_IDS:
+        print(f"[REST] SALVAGUARDA: Solo {len(valid_ids)} IDs válidos (< {_MIN_SAFE_IDS}). "
+              f"NO se eliminarán huérfanos para evitar borrado masivo accidental.")
         return False
     
     try:

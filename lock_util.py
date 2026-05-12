@@ -1,24 +1,60 @@
 import os
 import time
 import sys
+import glob
 from contextlib import contextmanager
 
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sync.lock")
 
+# ─── Limpieza al arrancar (post-apagón) ─────────────────────────────────────
+def clear_stale_locks():
+    """Elimina locks huérfanos y archivos .tmp colgados de sincronizaciones abortadas."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    for f in ["sync.lock"]:
+        p = os.path.join(base, f)
+        if os.path.exists(p):
+            try:
+                with open(p) as fh:
+                    pid_str = fh.read().strip()
+                if pid_str and pid_str.isdigit():
+                    old_pid = int(pid_str)
+                    if not pid_exists(old_pid):
+                        os.remove(p)
+                        print(f"[LOCK] Lock huérfano (PID {old_pid}) limpiado en inicio.")
+                else:
+                    os.remove(p)
+            except: os.remove(p)
+    for tmp in glob.glob(os.path.join(base, "*.tmp")):
+        try: os.remove(tmp)
+        except: pass
+
+clear_stale_locks()
+
 def pid_exists(pid):
-    """Verifica si un proceso sigue vivo en Windows/Linux."""
+    """Verifica si un proceso sigue vivo en Windows/Linux de forma silenciosa."""
     if pid <= 0: return False
-    try:
-        import subprocess
-        if sys.platform == "win32":
-            # Tasklist es nativo en Windows
-            output = subprocess.check_output(["tasklist", "/FI", f"PID eq {pid}"], text=True)
-            return str(pid) in output
-        else:
+    
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            # PROCESS_QUERY_LIMITED_INFORMATION (0x1000) es suficiente para GetExitCodeProcess
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, pid)
+            if handle:
+                exit_code = ctypes.c_ulong()
+                res = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+                kernel32.CloseHandle(handle)
+                if res:
+                    return exit_code.value == 259 # STILL_ACTIVE
+            return False
+        except:
+            return False
+    else:
+        try:
             os.kill(pid, 0)
             return True
-    except:
-        return False
+        except OSError:
+            return False
 
 @contextmanager
 def acquire_lock(timeout=120):
@@ -36,16 +72,19 @@ def acquire_lock(timeout=120):
         except FileExistsError:
             # Verificar si el lock es "huérfano" (el proceso murió)
             try:
-                with open(LOCK_FILE, "r") as f:
-                    old_pid = int(f.read().strip())
-                if not pid_exists(old_pid):
-                    print(f"[LOCK] Detectado lock huérfano (PID {old_pid}). Limpiando...")
-                    try: os.remove(LOCK_FILE)
-                    except: pass
-                    continue # Reintentar crear inmediatamente
+                if os.path.exists(LOCK_FILE):
+                    with open(LOCK_FILE, "r") as f:
+                        content = f.read().strip()
+                        if content:
+                            old_pid = int(content)
+                            if not pid_exists(old_pid):
+                                print(f"[LOCK] Detectado lock huérfano (PID {old_pid}). Limpiando...")
+                                try: os.remove(LOCK_FILE)
+                                except: pass
+                                continue
             except: pass
             
-            time.sleep(1)
+            time.sleep(2) # Aumentado de 1 a 2 para reducir spam
             continue
             
     if not acquired:

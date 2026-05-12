@@ -1,11 +1,17 @@
 from flask import Flask, jsonify, request
 import os
-import subprocess
 import sys
-import time
 import json
+import time
+
+# 🛡️ SILENCIO ABSOLUTO
+if sys.executable.lower().endswith("pythonw.exe"):
+    try:
+        sys.stdout = open(os.devnull, "w")
+        sys.stderr = open(os.devnull, "w")
+    except: pass
+
 import threading
-from datetime import datetime
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -57,7 +63,9 @@ def index():
         "endpoints": [
             "/api/v1/productos",
             "/api/v1/sync/inventory",
-            "/api/v1/sync/sales"
+            "/api/v1/sync/sales",
+            "/api/v1/sync/run",
+            "/api/v1/sync/force"
         ]
     })
 
@@ -86,34 +94,65 @@ def listar_productos():
 
 @app.route("/api/v1/sync/inventory", methods=["POST", "GET"])
 def sync_inventory():
-    from lock_util import is_locked
-    if is_locked():
-        return jsonify({"status": "error", "message": "Sincronización en curso"}), 429
-    
-    res = subprocess.run([sys.executable, "sync.py", "once"], capture_output=True, text=True)
-    if res.returncode == 0:
+    try:
+        from lock_util import acquire_lock
+        with acquire_lock(timeout=10):
+            import sync
+            import importlib
+            importlib.reload(sync)
+            sync.sync_incremental()
         return jsonify({"status": "success", "message": "Inventario sincronizado"})
-    return jsonify({"status": "error", "message": res.stderr}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route("/api/v1/sync/sales", methods=["POST", "GET"])
 def sync_sales():
-    from lock_util import is_locked
-    if is_locked():
-        return jsonify({"status": "error", "message": "Sincronización en curso"}), 429
-    
-    res = subprocess.run([sys.executable, "sync_ventas.py", "once"], capture_output=True, text=True)
-    if res.returncode == 0:
+    try:
+        from lock_util import acquire_lock
+        with acquire_lock(timeout=10):
+            import sync_ventas
+            import importlib
+            importlib.reload(sync_ventas)
+            sync_ventas.sync_incremental()
         return jsonify({"status": "success", "message": "Ventas sincronizadas"})
-    return jsonify({"status": "error", "message": res.stderr}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route("/api/v1/sync/run", methods=["POST", "GET"])
 def trigger_sync_all():
     def run_all():
-        subprocess.run([sys.executable, "sync.py", "once"])
-        subprocess.run([sys.executable, "sync_ventas.py", "once"])
+        try:
+            from lock_util import acquire_lock
+            with acquire_lock(timeout=10):
+                import sync
+                import sync_ventas
+                import importlib
+                importlib.reload(sync)
+                importlib.reload(sync_ventas)
+                sync.sync_incremental()
+                sync_ventas.sync_incremental()
+        except: pass
     
-    threading.Thread(target=run_all).start()
+    threading.Thread(target=run_all, daemon=True).start()
     return jsonify({"status": "success", "message": "Sincronización completa iniciada"})
+
+@app.route("/api/v1/sync/force", methods=["POST", "GET"])
+def trigger_sync_force():
+    def run_force():
+        try:
+            from lock_util import acquire_lock
+            with acquire_lock(timeout=10):
+                import sync
+                import sync_ventas
+                import importlib
+                importlib.reload(sync)
+                importlib.reload(sync_ventas)
+                sync.sync_incremental(force=True)
+                sync_ventas.sync_incremental()
+        except: pass
+    
+    threading.Thread(target=run_force, daemon=True).start()
+    return jsonify({"status": "success", "message": "Re-extracción forzada iniciada"})
 
 _COUNT_CACHE = {}
 
@@ -172,7 +211,83 @@ def sync_status():
         if not ok: all_ok = False
         result[key] = {"local": local, "cloud": cloud, "ok": ok}
     
-    return jsonify({"status": "ok" if all_ok else "mismatch", "entities": result})
+    from lock_util import is_locked
+    locked = is_locked()
+    
+    last_mon = "--/-- --:--"
+    try:
+        mon_path = os.path.join(BASE_DIR, "last_monitor.json")
+        if os.path.exists(mon_path):
+            with open(mon_path, "r") as f:
+                last_mon = json.load(f).get("last_check", last_mon)
+    except: pass
+
+    return jsonify({
+        "status": "ok" if all_ok else "mismatch", 
+        "entities": result,
+        "is_syncing": locked,
+        "last_monitor": last_mon
+    })
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Endpoint de diagnóstico completo: drive, Supabase, monitor, sincronización."""
+    try:
+        from network_util import check_drive, check_supabase, get_local_ip
+    except ImportError:
+        return jsonify({"status": "error", "detail": "network_util no disponible"}), 500
+    
+    from config import RUTA_INVENTARIO
+    
+    drive = check_drive(RUTA_INVENTARIO)
+    supabase = check_supabase()
+    ip = get_local_ip()
+    
+    mon_path = os.path.join(BASE_DIR, "last_monitor.json")
+    monitor_alive = False
+    last_mon = "--/-- --:--"
+    try:
+        if os.path.exists(mon_path):
+            with open(mon_path) as f:
+                d = json.load(f)
+                age = time.time() - d.get("timestamp", 0)
+                monitor_alive = age < 120
+                last_mon = d.get("last_check", last_mon)
+    except: pass
+    
+    from lock_util import is_locked
+    locked = is_locked()
+    
+    checks = {
+        "drive_h": {"ok": drive, "path": RUTA_INVENTARIO},
+        "supabase": supabase,
+        "monitor": {"ok": monitor_alive, "last_seen": last_mon},
+        "is_syncing": locked,
+    }
+    all_ok = all(v.get("ok", False) if isinstance(v, dict) else True for v in checks.values())
+    
+    return jsonify({
+        "status": "ok" if all_ok else "degraded",
+        "app": "El Serrucho Backend",
+        "ip": ip,
+        "checks": checks,
+    })
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    import socket
+    port = 5000
+    # Si el puerto está ocupado (restart rápido), probar puertos siguientes
+    for attempt in range(5):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(('0.0.0.0', port + attempt))
+            s.close()
+            app.run(host="0.0.0.0", port=port + attempt, debug=False)
+            break
+        except OSError:
+            if attempt < 4:
+                print(f"[APP] Puerto {port + attempt} ocupado, probando {port + attempt + 1}...")
+                continue
+            else:
+                print(f"[APP] No se pudo encontrar puerto libre en rango {port}-{port+4}. Abortando.")
+                sys.exit(1)

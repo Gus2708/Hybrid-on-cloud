@@ -2,9 +2,29 @@ import pydbisam
 import os
 import csv
 import struct
+import sys
+import time
 from datetime import date, datetime, timedelta
 
 base = r"h:\HybridLite\HybridEmpresa\HybridDataBase"
+
+# ─── Reintento para operaciones de red/archivo ───────────────────────────────
+_MAX_RETRIES = 3
+_RETRY_DELAY = 2
+
+def _safe_read_db(filepath: str, retries: int = _MAX_RETRIES):
+    """Lee un archivo DBISAM con reintentos si la red/unidad falla."""
+    for attempt in range(1, retries + 1):
+        try:
+            db = pydbisam.PyDBISAM(filepath)
+            _ = db._row_size
+            return db
+        except Exception as e:
+            if attempt < retries:
+                print(f"  [RETRY {attempt}/{retries}] Error leyendo {os.path.basename(filepath)}: {str(e)[:80]}")
+                time.sleep(_RETRY_DELAY)
+            else:
+                raise
 
 def get_payments_map():
     path = os.path.join(base, "TDetalleFormasPagoVta.Dat")
@@ -46,10 +66,19 @@ def should_extract(dat_filename, csv_filename):
     dat_path = os.path.join(base, dat_filename)
     if not os.path.exists(dat_path): return False
     if not os.path.exists(csv_filename): return True
-    # Si el .dat es más nuevo que el .csv (con margen de 2s), extraer
-    return os.path.getmtime(dat_path) > (os.path.getmtime(csv_filename) + 2)
+    return os.path.getmtime(dat_path) > os.path.getmtime(csv_filename) + 2
 
-if __name__ == '__main__':
+def run_extraction():
+    # ─── Verificar unidad de red antes de operar ───────────────────────────
+    test_path = os.path.join(base, "TInventario.dat")
+    if not os.path.exists(test_path):
+        print("  [DRIVE] Unidad H: no disponible. Abortando extracción de ventas.")
+        return False
+
+    # Solo extraer ventas de los últimos 90 días para evitar procesar
+    # años de datos históricos y consumir memoria innecesariamente
+    CORTE_FECHA = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
+
     # Lista de tareas: (DAT, CSV, Columnas)
     tasks = [
         ("TClientes.dat", "MAESTRO_CLIENTES.csv", 
@@ -78,8 +107,9 @@ if __name__ == '__main__':
                 print("Cargando catálogo de métodos de pago...")
                 payments_map = get_payments_map()
 
+            db = None
             try:
-                db = pydbisam.PyDBISAM(filepath)
+                db = _safe_read_db(filepath)
                 col_indices = [next((i for i, c in enumerate(db._columns) if c.name.upper() == target.upper()), -1) for target in cols]
                 
                 # Columnas para lógica especial
@@ -100,7 +130,11 @@ if __name__ == '__main__':
                     writer.writerow(out_cols)
                     valid_rows = 0
                     
-                    for i in range(db._total_rows + db._deleted_rows):
+                    total_rows = db._total_rows + db._deleted_rows
+                    if total_rows > 2_000_000:
+                        print(f"  ! {dat}: {total_rows} filas reportadas (>2M). Posible corrupción. Abortando.")
+                        raise Exception("Demasiadas filas — archivo corrupto o infinito")
+                    for i in range(total_rows):
                         row = db.row(i)
                         if row is None: continue # Fila eliminada
 
@@ -112,6 +146,12 @@ if __name__ == '__main__':
                         if idx_status != -1:
                             status_val = str(row[col_indices[idx_status]]).strip()
                             if status_val == "4": continue
+
+                        # Filtrar por fecha de corte (solo ventas recientes)
+                        if idx_fecha != -1 and dat == "TTransaccionvta.dat":
+                            fecha_val = str(row[col_indices[idx_fecha]]).strip()
+                            if fecha_val and fecha_val < CORTE_FECHA:
+                                continue
 
                         out_row = []
                         for col_idx in col_indices:
@@ -152,8 +192,15 @@ if __name__ == '__main__':
                 import traceback
                 traceback.print_exc()
                 print(f"Error procesando {dat}: {e}")
+            finally:
+                if db is not None:
+                    del db
         else:
             print(f"[SKIP] {dat} no ha cambiado.")
             
     if not any_extracted:
         print("Todo está al día. No se extrajo nada.")
+    return any_extracted
+
+if __name__ == '__main__':
+    run_extraction()

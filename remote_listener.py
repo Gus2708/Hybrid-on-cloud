@@ -1,56 +1,84 @@
+import os
+import sys
+
+if sys.executable.lower().endswith("pythonw.exe"):
+    try:
+        sys.stdout = open(os.devnull, "w")
+        sys.stderr = open(os.devnull, "w")
+    except: pass
+
 import time
 import json
 import urllib.request
 import urllib.error
-import os
+import threading
+import subprocess
 import datetime
 
-# --- CONFIGURACIÓN ---
+LOG_FILE = "sync_remote.log"
+_MAX_LOG_BYTES = 5 * 1024 * 1024
+
+def _rotate_log(log_path: str):
+    try:
+        if os.path.exists(log_path) and os.path.getsize(log_path) > _MAX_LOG_BYTES:
+            bak = log_path + ".1"
+            if os.path.exists(bak): os.remove(bak)
+            os.rename(log_path, bak)
+    except: pass
+
+def log(message):
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    safe_message = message.encode('ascii', 'replace').decode('ascii')
+    formatted_message = f"[{timestamp}] {safe_message}"
+    print(formatted_message)
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        log_path = os.path.join(base_dir, LOG_FILE)
+        _rotate_log(log_path)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {message}\n")
+    except Exception as e:
+        print(f"Error escribiendo en log: {e}")
+
 try:
     import config
     SUPABASE_REST_URL = config.SUPABASE_REST_URL
-    # Prioridad: SERVICE_KEY (si existe) -> ANON_KEY
-    SUPABASE_KEY = getattr(config, 'SUPABASE_SERVICE_KEY', config.SUPABASE_ANON_KEY)
+    # Usar explícitamente ANON_KEY para las cabeceras de la API REST
+    SUPABASE_ANON_KEY = config.SUPABASE_ANON_KEY
 except ImportError:
     print("Error: Archivo 'config.py' no encontrado o incompleto.")
     exit(1)
 
+log("=== Iniciando Listener de Comandos Remotos v2.4 ===")
+log(f"Conectado a: {SUPABASE_REST_URL}")
+
 HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "apikey": SUPABASE_ANON_KEY,
+    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
     "Content-Type": "application/json",
     "Prefer": "return=minimal"
 }
 
-LOG_FILE = "sync_remote.log"
-
-def log(message):
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    formatted_message = f"[{timestamp}] {message}"
-    print(formatted_message)
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(formatted_message + "\n")
-    except Exception as e:
-        print(f"Error escribiendo en log: {e}")
-
 def get_pending_commands():
-    # Buscamos 'pendiente' y también 'ejecutando' (por si el script se reinició)
     url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/comandos_remotos?status=in.(pendiente,ejecutando)&select=id,comando,status"
     req = urllib.request.Request(url, headers=HEADERS)
     try:
-        with urllib.request.urlopen(req) as response:
-            return json.loads(response.read().decode())
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            log("Error 401: No autorizado. Verifica las llaves de Supabase y las políticas RLS.")
+            log("Error 401: No autorizado. Verifica: 1) ANON_KEY vigente 2) RLS en 'comandos_remotos' permita SELECT para anon")
         elif e.code == 404:
-            log("Error 404: No se encontró la tabla 'comandos_remotos'.")
+            log("Error 404: No se encontro la tabla 'comandos_remotos'.")
         else:
-            log(f"HTTP Error al buscar comandos: {e.code} - {e.reason}")
+            try:
+                body = e.read().decode('utf-8')
+            except:
+                body = ""
+            log(f"HTTP Error al buscar comandos: {e.code} - {body or e.reason}")
         return []
     except Exception as e:
-        log(f"Error inesperado buscando comandos: {e}")
+        log(f"Error inesperado buscando comandos: {repr(e)}")
         return []
 
 def update_command_status(cmd_id, status):
@@ -58,88 +86,159 @@ def update_command_status(cmd_id, status):
     data = json.dumps({
         "status": status,
         "ejecutado_en": datetime.datetime.now(datetime.timezone.utc).isoformat()
-    }).encode()
-    
+    }).encode('utf-8')
+
     req = urllib.request.Request(url, data=data, headers=HEADERS, method="PATCH")
     try:
-        with urllib.request.urlopen(req) as response:
-            # 204 No Content es lo esperado con return=minimal
+        with urllib.request.urlopen(req, timeout=30) as response:
             return True
     except urllib.error.HTTPError as e:
-        body = e.read().decode() if e.fp else ""
-        log(f"Error HTTP {e.code} actualizando {cmd_id} a '{status}': {body or e.reason}")
+        try:
+            body = e.read().decode('utf-8')
+        except:
+            body = ""
+        detail = body or e.reason
+        if e.code == 401:
+            log(f"401 Unauthorized actualizando {cmd_id} a '{status}'. "
+                f"Verificar: 1) ANON_KEY vigente en Supabase Dashboard 2) RLS en tabla 'comandos_remotos' permita UPDATE para anon")
+        else:
+            log(f"Error HTTP {e.code} actualizando {cmd_id} a '{status}': {detail}")
         return False
     except Exception as e:
-        log(f"Error actualizando estado de comando {cmd_id} a '{status}': {e}")
+        log(f"Error actualizando estado de comando {cmd_id} a '{status}': {repr(e)}")
         return False
 
 def execute_local_sync(comando):
-    endpoints = {
-        "sync_inventory": "/api/v1/sync/inventory",
-        "sync_sales": "/api/v1/sync/sales",
-        "sync_all": "/api/v1/sync/run"
+    import subprocess
+    import sys
+
+    scripts = {
+        "sync_inventory": "sync.py",
+        "sync_sales": "sync_ventas.py",
+        "sync_all": "sync_ventas.py"
     }
-    
-    path = endpoints.get(comando, "/api/v1/sync/run")
-    url = f"http://localhost:5000{path}"
-    
-    log(f"Ejecutando sync local: {url}...")
-    
-    # Timeout largo porque el sync puede tardar varios segundos/minutos
-    req = urllib.request.Request(url, method="POST")
-    try:
-        # Usamos 120 segundos de timeout para estar seguros
-        with urllib.request.urlopen(req, timeout=120) as response:
-            res_data = response.read().decode()
-            log(f"Respuesta local: {res_data[:200]}...")
-            # Si el JSON dice status: success, retornamos True
-            try:
-                res_json = json.loads(res_data)
-                return res_json.get("status") == "success"
-            except:
-                return True # Asumimos éxito si no hay error de conexión y devolvió algo
-    except urllib.error.URLError as e:
-        log(f"Error de conexión local (¿Está Flask corriendo?): {e.reason}")
-        return False
-    except Exception as e:
-        log(f"Error ejecutando sync local: {e}")
+
+    script_name = scripts.get(comando)
+    if not script_name:
+        log(f"Comando desconocido: {comando}")
         return False
 
-log("=== Iniciando Listener de Comandos Remotos v2.1 ===")
-log(f"Conectado a: {SUPABASE_REST_URL}")
+    try:
+        log(f"Ejecutando script internamente: {script_name}...")
+        from lock_util import acquire_lock
+
+        with acquire_lock(timeout=30):
+            if comando == "sync_all":
+                import sync
+                import sync_ventas
+                import importlib
+                importlib.reload(sync)
+                importlib.reload(sync_ventas)
+                sync.sync_incremental()
+                sync_ventas.sync_incremental()
+            elif comando == "sync":
+                import sync
+                import importlib
+                importlib.reload(sync)
+                sync.sync_incremental()
+            elif comando == "sync_ventas":
+                import sync_ventas
+                import importlib
+                importlib.reload(sync_ventas)
+                sync_ventas.sync_incremental()
+            else:
+                exe = sys.executable
+                creation_flags = 0x08000000
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0
+                if exe.lower().endswith("python.exe"):
+                    pw = exe.lower().replace("python.exe", "pythonw.exe")
+                    if os.path.exists(pw): exe = pw
+                subprocess.run([exe, script_name, "once"], check=True, creationflags=creation_flags, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        log(f"Script {script_name} finalizado con exito.")
+        return True
+    except subprocess.CalledProcessError as e:
+        log(f"Error ejecutando script {script_name}: {repr(e)}")
+        return False
+    except Exception as e:
+        log(f"Error inesperado ejecutando localmente: {repr(e)}")
+        return False
+
+
+_COMMAND_TIMEOUT = 1800  # 30 minutos máximo
+_HEARTBEAT_INTERVAL = 60
+
+_last_heartbeat_ts = 0
 
 while True:
     try:
         cmds = get_pending_commands()
         if cmds:
             log(f"Detectados {len(cmds)} comandos a procesar.")
-            
+
         for c in cmds:
             cmd_id = c['id']
             comando = c['comando']
             status_actual = c.get('status', 'pendiente')
-            
-            log(f"--- Procesando: {comando} (ID: {cmd_id}, Status: {status_actual}) ---")
-            
-            # 1. Marcar como ejecutando (solo si estaba pendiente)
-            if status_actual == 'pendiente':
-                if not update_command_status(cmd_id, "ejecutando"):
-                    log(f"Saltando comando {cmd_id} por error al actualizar estado a 'ejecutando'.")
-                    continue
-            
-            # 2. Ejecutar localmente
-            success = execute_local_sync(comando)
-            
-            # 3. Marcar resultado final
-            final_status = "completado" if success else "error_local"
-            if update_command_status(cmd_id, final_status):
-                log(f"Resultado final: {final_status} (Actualizado en Nube)")
-            else:
-                log(f"ADVERTENCIA: No se pudo actualizar resultado '{final_status}' en la nube.")
-            
-    except Exception as e:
-        log(f"Error en el bucle principal: {e}")
-        
-    time.sleep(10)
 
+            log(f"--- Procesando: {comando} (ID: {cmd_id}, Status: {status_actual}) ---")
+
+            # 🛡️ Timeout: si lleva >30 min en 'ejecutando', marcarlo como error
+            if status_actual == 'ejecutando':
+                now_ts = time.time()
+                try:
+                    status_url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/comandos_remotos?id=eq.{cmd_id}&select=ejecutado_en"
+                    req = urllib.request.Request(status_url, headers=HEADERS, method="GET")
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        rows = json.loads(resp.read().decode())
+                        if rows and rows[0].get("ejecutado_en"):
+                            started = datetime.datetime.fromisoformat(rows[0]["ejecutado_en"].replace("Z", "+00:00"))
+                            elapsed = (datetime.datetime.now(datetime.timezone.utc) - started).total_seconds()
+                            if elapsed > _COMMAND_TIMEOUT:
+                                log(f"? Comando {cmd_id} lleva {elapsed:.0f}s en ejecutando (> {_COMMAND_TIMEOUT}s). Marcando timeout...")
+                                ok = update_command_status(cmd_id, "error_local")
+                                if not ok:
+                                    log(f"ADVERTENCIA: No se pudo marcar timeout de {cmd_id} en la nube. Saltando para evitar bucle.")
+                                continue
+                except Exception as e:
+                    log(f"Error verificando timeout de {cmd_id}: {e}")
+
+            try:
+                if status_actual == 'pendiente':
+                    if not update_command_status(cmd_id, "ejecutando"):
+                        log(f"Saltando comando {cmd_id} por error al actualizar estado a 'ejecutando'.")
+                        continue
+
+                success = execute_local_sync(comando)
+                final_status = "completado" if success else "error_local"
+
+            except Exception as e:
+                log(f"Error procesando comando {cmd_id} ({comando}): {repr(e)}")
+                final_status = "error_local"
+
+            try:
+                if update_command_status(cmd_id, final_status):
+                    log(f"Resultado final: {final_status} (Actualizado en Nube)")
+                else:
+                    log(f"ADVERTENCIA: No se pudo actualizar resultado '{final_status}' en la nube.")
+            except Exception as e:
+                log(f"Error critico actualizando estado final de {cmd_id}: {repr(e)}")
+
+        # ─── Heartbeat ───────────────────────────────────────────────────
+        if time.time() - _last_heartbeat_ts > _HEARTBEAT_INTERVAL:
+            try:
+                hb_url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/comandos_remotos?id=eq.-1&select=id"
+                req = urllib.request.Request(hb_url, headers=HEADERS, method="GET")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    _last_heartbeat_ts = time.time()
+                    log(f"[HEARTBEAT] Listener vivo — {datetime.datetime.now().strftime('%H:%M:%S')}")
+            except Exception:
+                pass
+
+    except Exception as e:
+        log(f"Error en el bucle principal: {repr(e)}")
+
+    time.sleep(10)
 

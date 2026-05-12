@@ -34,20 +34,47 @@ EXPORTER_SCRIPT = os.path.join(BASE_DIR, "actualizar_inventario.py")
 CACHE_FILE = os.path.join(BASE_DIR, "sync_cache.json")
 LAST_SYNC_FILE = os.path.join(BASE_DIR, "last_sync.json")
 
-def run_hybrid_exporter():
+def run_hybrid_exporter(force=False):
     print(f"[SYNC] -> Evaluando extracción de inventario...")
-    if not os.path.exists(EXPORTER_SCRIPT): return False
+    if not os.path.exists(EXPORTER_SCRIPT):
+        print(f"[SYNC] ! Script no encontrado: {EXPORTER_SCRIPT}")
+        return False
     try:
-        result = subprocess.run([sys.executable, EXPORTER_SCRIPT], capture_output=True, text=True, check=False)
-        return result.returncode == 0
-    except: return False
+        args = [sys.executable, EXPORTER_SCRIPT]
+        if force:
+            args.append("force")
+        result = subprocess.run(
+            args,
+            capture_output=True, text=True, timeout=45,
+            creationflags=0x08000000
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                print(f"  {line}")
+            return True
+        else:
+            print(f"[SYNC] ! Error en exportador (código {result.returncode}):")
+            for line in result.stderr.splitlines():
+                print(f"  ! {line}")
+            return False
+    except subprocess.TimeoutExpired:
+        print(f"[SYNC] ! TIMEOUT (45s): exportador colgado en H:. Abortando sync.")
+        return False
+    except Exception as e:
+        print(f"[SYNC] ! Error ejecutando exportador: {e}")
+        return False
 
 def get_row_hash(row: Dict) -> str:
     relevant_data = f"{row['codigo_interno']}|{row['descripcion']}|{row['costo']:.2f}|{row['precio_venta']:.2f}|{row['existencia']:.2f}|{row['codigo_barras']}|{row['unidad']}"
     return hashlib.md5(relevant_data.encode('utf-8')).hexdigest()
 
 def sync_incremental(force=False):
-    if not run_hybrid_exporter(): return
+    result = run_hybrid_exporter(force=force)
+    if result is False:
+        print("[SYNC] Extracción fallida (unidad de red probablemente caída). Abortando sync.")
+        return
+    if not result:
+        return
 
     # Actualizar Tasas
     try:
@@ -69,7 +96,20 @@ def sync_incremental(force=False):
     to_upsert = []
     new_cache = {}
     total_count = 0
+    zero_price_count = 0
     
+    def safe_decimal(val):
+        if val is None: return 0.0
+        s = str(val).strip()
+        if not s: return 0.0
+        # Manejar formato venezolano "1.500,50" -> 1500.50
+        if ',' in s and '.' in s:
+            s = s.replace('.', '').replace(',', '.')
+        elif ',' in s:
+            s = s.replace(',', '.')
+        try: return float(s)
+        except: return 0.0
+
     print(f"[SYNC] Procesando Inventario (Stream)...")
     try:
         with open(CSV_SOURCE_PATH, mode='r', encoding='utf-8-sig') as f:
@@ -77,9 +117,11 @@ def sync_incremental(force=False):
             error_occurred = False
             for row in reader:
                 try:
-                    costo = float(row.get('COSTO', 0))
-                    precio = float(row.get('PRECIO_VENTA', 0))
-                    existencia = float(row.get('EXISTENCIA', 0))
+                    costo = safe_decimal(row.get('COSTO', 0))
+                    precio = safe_decimal(row.get('PRECIO_VENTA', 0))
+                    existencia = safe_decimal(row.get('EXISTENCIA', 0))
+                    
+                    if precio == 0: zero_price_count += 1
                     
                     item = {
                         "codigo_interno": row.get('CODIGO_INTERNO', '').strip(),
@@ -98,6 +140,12 @@ def sync_incremental(force=False):
                         to_upsert.append(item)
                     
                     if len(to_upsert) >= 500:
+                        # Salvaguarda: si mas del 50% de lo procesado tiene precio 0, abortar
+                        if total_count > 100 and zero_price_count > total_count * 0.5:
+                            print(f"[SYNC] ! ABORTANDO: {zero_price_count}/{total_count} productos con precio 0. Posible error de lectura.")
+                            error_occurred = True
+                            break
+                        
                         print(f"  -> Upsert batch {len(to_upsert)}...")
                         if upsert_batch_rest(to_upsert): to_upsert = []
                         else: 
@@ -133,8 +181,14 @@ def sync_incremental(force=False):
 def verify_sync(csv_count: int):
     cloud_count = get_row_count_rest()
     if cloud_count != -1 and cloud_count != csv_count:
-        print(f"[SYNC] ! Discrepancia detectada. Corrigiendo huerfanos...")
-        # Nota: Aquí sí cargamos IDs en memoria para el delete_orphans
+        diff = abs(cloud_count - csv_count)
+        # 🛡️ No corregir si la diferencia es >10% del total — probablemente H: caída
+        max_count = max(cloud_count, csv_count)
+        if max_count > 100 and diff / max_count > 0.10:
+            print(f"[SYNC] Diferencia grande ({diff} filas, {diff/max_count*100:.1f}%). "
+                  f"Probablemente la unidad H: estaba caída. No se corrigen huérfanos.")
+            return
+        print(f"[SYNC] Discrepancia detectada ({diff} filas). Corrigiendo huérfanos...")
         try:
             with open(CSV_SOURCE_PATH, mode='r', encoding='utf-8-sig') as f:
                 ids = [r['CODIGO_INTERNO'].strip() for r in csv.DictReader(f)]
