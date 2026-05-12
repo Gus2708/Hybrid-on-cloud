@@ -59,12 +59,14 @@ def run_hybrid_exporter(force=False):
         stdout, stderr = proc.communicate(timeout=45)
         if proc.returncode == 0:
             for line in stdout.decode('utf-8', errors='replace').splitlines():
-                print(f"  {line}")
+                try: print(f"  {line}")
+                except: pass
             return True
         else:
             print(f"[SYNC] ! Error en exportador (código {proc.returncode}):")
             for line in stderr.decode('utf-8', errors='replace').splitlines():
-                print(f"  ! {line}")
+                try: print(f"  ! {line}")
+                except: pass
             return False
     except subprocess.TimeoutExpired:
         _kill_proc(proc)

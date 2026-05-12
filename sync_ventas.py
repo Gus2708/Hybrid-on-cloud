@@ -58,13 +58,18 @@ def run_exporter():
     try:
         stdout, stderr = proc.communicate(timeout=45)
         if proc.returncode == 0:
-            for line in stdout.decode('utf-8', errors='replace').splitlines():
-                print(f"  {line}")
+            # Intentar imprimir salida pero no morir si falla el encoding de la consola
+            try:
+                for line in stdout.decode('utf-8', errors='replace').splitlines():
+                    print(f"  {line}")
+            except: pass
             return True
         else:
             print(f"[SYNC VENTAS] ! Error en exportador (código {proc.returncode}):")
-            for line in stderr.decode('utf-8', errors='replace').splitlines():
-                print(f"  ! {line}")
+            try:
+                for line in stderr.decode('utf-8', errors='replace').splitlines():
+                    print(f"  ! {line}")
+            except: pass
             return False
     except subprocess.TimeoutExpired:
         _kill_proc(proc)
@@ -286,10 +291,11 @@ def sync_incremental(force=False):
                         cloud_id = cached_data[1]
                         ventas_map_ids[local_id] = cloud_id
                         new_entity_cache[pk] = [h, cloud_id]
-                    else:
-                        to_upsert.append((local_id, mapped))
+                    
+                    to_upsert.append((local_id, mapped))
                     
                     if len(to_upsert) >= 500:
+                        print(f"  [SYNC VENTAS] Upserting batch of {len(to_upsert)} sales...")
                         payload = [item[1] for item in to_upsert]
                         results = upsert_with_response("ventas", "id_unico", payload)
                         for i, res in enumerate(results):
@@ -298,9 +304,12 @@ def sync_incremental(force=False):
                             ventas_map_ids[lid] = cid
                             new_entity_cache[str(payload[i]["id_unico"])] = [get_hash(payload[i]), cid]
                         to_upsert = []
-                except: continue
+                except Exception as e: 
+                    print(f"  [ERROR VENTA] doc {row.get('THT_DOCUMENTO')}: {e}")
+                    continue
             
             if to_upsert:
+                print(f"  [SYNC VENTAS] Upserting final batch of {len(to_upsert)} sales...")
                 payload = [item[1] for item in to_upsert]
                 results = upsert_with_response("ventas", "id_unico", payload)
                 for i, res in enumerate(results):
@@ -309,6 +318,7 @@ def sync_incremental(force=False):
                     ventas_map_ids[lid] = cid
                     new_entity_cache[str(payload[i]["id_unico"])] = [get_hash(payload[i]), cid]
             
+            print(f"  [SYNC VENTAS] Total sales in mapping: {len(ventas_map_ids)}")
             cache["ventas"] = new_entity_cache
 
     # 3. Ventas Detalle
@@ -322,14 +332,15 @@ def sync_incremental(force=False):
             for row in csv.DictReader(f):
                 try:
                     doc_num = row["TBT_DOCUMENTO"].strip().zfill(8)
-                    tasa = doc_to_tasa.get(doc_num, FACTOR_USD)
+                    tasa = doc_to_tasa.get(doc_num, current_bcv_rate)
                     
                     local_parent_id = row.get("TBT_OPERACION_AUTOINCREMENT")
                     cloud_parent_id = ventas_map_ids.get(local_parent_id)
                     
                     # Si no tenemos el parent_id, el detalle no se puede linkear correctamente
                     if cloud_parent_id is None:
-                        # Intentar buscarlo en el caché si no se procesó en esta vuelta
+                        # Solo loguear una vez por documento para no inundar
+                        # print(f"  [WARN] No parent ID for detail doc {doc_num} (local_parent_id: {local_parent_id})")
                         continue 
 
                     precio_ves = safe_decimal(row["TBT_PRECIODEVENTA"])
@@ -351,15 +362,20 @@ def sync_incremental(force=False):
                     if old_cache.get(pk) != h: to_upsert.append(mapped)
                     
                     if len(to_upsert) >= 1000:
+                        print(f"  [SYNC VENTAS] Upserting batch of {len(to_upsert)} details...")
                         upsert_batch("ventas_detalle", "id", to_upsert)
                         to_upsert = []
-                except: continue
+                except Exception as e: 
+                    print(f"  [ERROR DETAIL] doc {row.get('TBT_DOCUMENTO')}: {e}")
+                    continue
             
             if to_upsert: upsert_batch("ventas_detalle", "id", to_upsert)
             cache["ventas_detalle"] = new_entity_cache
 
     # Guardar Caché Final
-    with open(CACHE_FILE, 'w') as cf: json.dump(cache, cf)
+    with open(CACHE_FILE, 'w') as cf: 
+        json.dump(cache, cf)
+        print(f"[SYNC VENTAS] Caché guardada en {CACHE_FILE}")
     
     # Limpieza de memoria explícita
     ventas_map_ids.clear()
@@ -376,7 +392,7 @@ def sync_incremental(force=False):
     
     # 🔍 RECONCILIACIÓN AUTOMÁTICA (Audit)
     # Solo si no hubo errores críticos y estamos en modo completo
-    reconcile_ventas()
+    # reconcile_ventas() # ⚠️ DESHABILITADO: Está borrando historial de más de 90 días
 
 _MIN_SAFE_IDS = 10
 
