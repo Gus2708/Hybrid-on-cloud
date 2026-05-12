@@ -231,7 +231,7 @@ def sync_status():
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Endpoint de diagnóstico completo: drive, Supabase, monitor, sincronización."""
+    """Endpoint de diagnóstico completo con timeouts para no bloquear."""
     try:
         from network_util import check_drive, check_supabase, get_local_ip
     except ImportError:
@@ -239,7 +239,18 @@ def health():
     
     from config import RUTA_INVENTARIO
     
-    drive = check_drive(RUTA_INVENTARIO)
+    # Ejecutar check_drive en un hilo con timeout para no bloquear Flask
+    # si la unidad H: está colgada
+    drive = False
+    def _check():
+        nonlocal drive
+        drive = check_drive(RUTA_INVENTARIO)
+    t = threading.Thread(target=_check, daemon=True)
+    t.start()
+    t.join(timeout=4)
+    if t.is_alive():
+        drive = False
+    
     supabase = check_supabase()
     ip = get_local_ip()
     

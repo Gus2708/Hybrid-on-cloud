@@ -41,11 +41,9 @@ KillOurProcesses "pythonw.exe"
 KillOurProcesses "python.exe"
 WScript.Sleep 2000
 
-' Iniciar procesos
-WshShell.Run "pythonw app.py", 0, False
-WshShell.Run "pythonw widget.pyw", 0, False
-WshShell.Run "pythonw monitor.py", 0, False
-WshShell.Run "pythonw remote_listener.py", 0, False
+' Iniciar el Watchdog (él se encargará de iniciar el resto)
+WshShell.Run "pythonw backend_watchdog.py", 0, False
+
 
 ' Limpiar lock
 On Error Resume Next

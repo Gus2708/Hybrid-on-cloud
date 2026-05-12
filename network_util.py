@@ -17,24 +17,40 @@ except ImportError:
     SUPABASE_ANON_KEY = ""
 
 
-def check_drive(path: str, timeout: float = 3.0) -> bool:
-    """Verifica si un directorio/unidad de red responde."""
-    if not path:
-        return False
+_DRIVE_CACHE = {}
+
+def check_drive(path: str, timeout: float = 2.0) -> bool:
+    """Verifica si un directorio/unidad de red responde con caché de corto plazo."""
+    if not path: return False
+    
+    drive = os.path.splitdrive(path)[0] or path
+    now = time.time()
+    
+    # Caché de 10 segundos para evitar bloqueos seguidos
+    if drive in _DRIVE_CACHE:
+        cached_val, ts = _DRIVE_CACHE[drive]
+        if now - ts < 10:
+            return cached_val
+
+
     try:
-        drive = os.path.splitdrive(path)[0] or path
+        # En Windows, os.path.exists en una unidad de red caída puede tardar mucho.
+        # No hay una forma directa de ponerle timeout a os.path.exists.
+        # Intentamos un truco: si falla rápido, mejor.
         if not os.path.exists(drive):
+            _DRIVE_CACHE[drive] = (False, now)
             return False
+        
+        # Si existe, probamos leer algo mínimo
         before = time.time()
         next(os.scandir(drive), None)
-        elapsed = time.time() - before
-        if elapsed > timeout:
-            print(f"[NET] Drive {drive} lento: {elapsed:.1f}s")
-        return elapsed < 30.0
-    except (PermissionError, OSError):
+        ok = (time.time() - before) < timeout
+        _DRIVE_CACHE[drive] = (ok, now)
+        return ok
+    except:
+        _DRIVE_CACHE[drive] = (False, now)
         return False
-    except Exception:
-        return False
+
 
 
 def wait_for_drive(path: str, timeout: float = 60.0, interval: float = 3.0) -> bool:

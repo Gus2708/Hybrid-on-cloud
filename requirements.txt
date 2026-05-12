@@ -8,3 +8,4 @@ responses
 Pillow
 pystray
 beautifulsoup4
+pywin32

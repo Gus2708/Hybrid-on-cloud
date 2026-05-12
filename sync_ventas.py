@@ -37,30 +37,41 @@ HEADERS = {
     "Prefer": "resolution=merge-duplicates",
 }
 
+def _kill_proc(proc):
+    try:
+        if proc.poll() is None:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=5)
+            proc.wait(timeout=5)
+    except: pass
+
 def run_exporter():
     print("[SYNC VENTAS] -> Evaluando extracción selectiva...")
     if not os.path.exists(EXPORTER_SCRIPT):
         print(f"[SYNC VENTAS] ! Script no encontrado: {EXPORTER_SCRIPT}")
         return False
+    proc = subprocess.Popen(
+        [sys.executable, EXPORTER_SCRIPT],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        creationflags=0x08000000
+    )
     try:
-        result = subprocess.run(
-            [sys.executable, EXPORTER_SCRIPT],
-            capture_output=True, text=True, timeout=45,
-            creationflags=0x08000000
-        )
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
+        stdout, stderr = proc.communicate(timeout=45)
+        if proc.returncode == 0:
+            for line in stdout.decode('utf-8', errors='replace').splitlines():
                 print(f"  {line}")
             return True
         else:
-            print(f"[SYNC VENTAS] ! Error en exportador (código {result.returncode}):")
-            for line in result.stderr.splitlines():
+            print(f"[SYNC VENTAS] ! Error en exportador (código {proc.returncode}):")
+            for line in stderr.decode('utf-8', errors='replace').splitlines():
                 print(f"  ! {line}")
             return False
     except subprocess.TimeoutExpired:
+        _kill_proc(proc)
         print(f"[SYNC VENTAS] ! TIMEOUT (45s): exportador colgado en H:. Abortando.")
         return False
     except Exception as e:
+        _kill_proc(proc)
         print(f"[SYNC VENTAS] ! Error ejecutando exportador: {e}")
         return False
 
@@ -91,10 +102,21 @@ def get_hash(data_dict):
     s = "|".join(str(v) for v in data_dict.values())
     return hashlib.md5(s.encode('utf-8')).hexdigest()
 
-# Tasa de cambio promedio para el periodo de Mayo (ajustado según reporte Hybrid)
-FACTOR_USD = 489.55
+# Tasa de cambio por defecto si falla el servicio
+FACTOR_USD_DEFAULT = 489.55
+
+def get_current_rate():
+    try:
+        from rates_service import RatesService
+        service = RatesService()
+        rates = service.get_all_rates()
+        # Intentar obtener BCV primero, luego Binance
+        return rates.get("bcv", rates.get("binance", FACTOR_USD_DEFAULT))
+    except:
+        return FACTOR_USD_DEFAULT
 
 def safe_decimal(val):
+
     if val is None: return 0.0
     s = str(val).replace('Bs.', '').replace(' ', '').strip()
     if not s: return 0.0
@@ -135,7 +157,15 @@ def upsert_with_response(table: str, on_conflict: str, payload: list) -> list:
 
 def sync_incremental(force=False):
     if not SUPABASE_REST_URL or not SUPABASE_ANON_KEY: return
+    
+    # Validar unidad H: antes de empezar
+    base_h = r"h:\HybridLite\HybridEmpresa\HybridDataBase"
+    if not os.path.exists(base_h):
+        print("[SYNC VENTAS] ! ERROR: Unidad de red H: no accesible. Abortando.")
+        return
+
     if not run_exporter(): return
+
 
     # ─── Validar CSV antes de procesar ─────────────────────────────────────
     def validate_csv(path, min_rows=5):
@@ -166,14 +196,13 @@ def sync_incremental(force=False):
         return {"codigo_cliente": row["CLT_CODIGO"], "nombre": row["CLT_DESCRIPCION"], "rif": row["CLT_RIF"], 
                 "telefono": row.get("CLT_TELEFONO", ""), "direccion": row.get("CLT_DIRECCION1", "")}
 
-    def map_venta(row):
+    def map_venta(row, fallback_rate):
         rif = row.get("THT_RIFCLIENTE", "").strip()
         
-        # 🔑 Tasa de cambio de la factura (crucial para Bug #2)
+        # 🔑 Tasa de cambio de la factura
         tasa_doc = safe_decimal(row.get("THT_FACTORREFERENCIAL", 0))
         if tasa_doc <= 1.0: 
-            # Fallback a tasa BCV si no viene en la factura
-            tasa_doc = FACTOR_USD
+            tasa_doc = fallback_rate
         
         neto_ves = safe_decimal(row["THT_TOTALNETO"])
         imp_ves = safe_decimal(row.get("THT_TOTALIMPUESTO", 0))
@@ -185,9 +214,10 @@ def sync_incremental(force=False):
         impuesto_usd = imp_ves / tasa_doc
         bruto_usd = bruto_ves / tasa_doc
 
-        # ID Único de HybridLite (Bug #5)
+        # ID Único de HybridLite
         id_unico = to_int(row.get("THT_IDUNICO"))
         if id_unico == 0: id_unico = to_int(row["THT_AUTOINCREMENT"]) # Fallback
+
 
         return {
             "id_unico": id_unico,
@@ -227,10 +257,12 @@ def sync_incremental(force=False):
     # 2. Ventas (Cabecera)
     ventas_map_ids = {}
     doc_to_tasa = {}
+    current_bcv_rate = get_current_rate()
     
     if validate_csv("VENTAS_CABECERA.csv"):
-        print("[SYNC VENTAS] Procesando ventas (Cabeceras)...")
+        print(f"[SYNC VENTAS] Procesando ventas (Tasa actual: {current_bcv_rate})...")
         to_upsert = []
+        # El caché ahora es {id_unico: [hash, cloud_id]}
         old_cache = cache.get("ventas", {})
         new_entity_cache = {}
         
@@ -239,23 +271,32 @@ def sync_incremental(force=False):
                 try:
                     local_id = row["THT_AUTOINCREMENT"]
                     doc_num = row["THT_DOCUMENTO"].strip().zfill(8)
-                    tasa = safe_decimal(row.get("THT_FACTORREFERENCIAL", FACTOR_USD))
-                    if tasa <= 1.0: tasa = FACTOR_USD
+                    tasa = safe_decimal(row.get("THT_FACTORREFERENCIAL", current_bcv_rate))
+                    if tasa <= 1.0: tasa = current_bcv_rate
                     doc_to_tasa[doc_num] = tasa
+
                     
-                    mapped = map_venta(row)
+                    mapped = map_venta(row, current_bcv_rate)
                     pk = str(mapped["id_unico"])
                     h = get_hash(mapped)
-                    new_entity_cache[pk] = h
                     
-                    to_upsert.append((local_id, mapped))
+                    # 💡 Si está en caché, recuperamos el cloud_id para los detalles
+                    cached_data = old_cache.get(pk)
+                    if cached_data and isinstance(cached_data, list) and cached_data[0] == h:
+                        cloud_id = cached_data[1]
+                        ventas_map_ids[local_id] = cloud_id
+                        new_entity_cache[pk] = [h, cloud_id]
+                    else:
+                        to_upsert.append((local_id, mapped))
                     
                     if len(to_upsert) >= 500:
                         payload = [item[1] for item in to_upsert]
                         results = upsert_with_response("ventas", "id_unico", payload)
                         for i, res in enumerate(results):
                             lid = to_upsert[i][0]
-                            ventas_map_ids[lid] = res["id"]
+                            cid = res["id"]
+                            ventas_map_ids[lid] = cid
+                            new_entity_cache[str(payload[i]["id_unico"])] = [get_hash(payload[i]), cid]
                         to_upsert = []
                 except: continue
             
@@ -264,7 +305,9 @@ def sync_incremental(force=False):
                 results = upsert_with_response("ventas", "id_unico", payload)
                 for i, res in enumerate(results):
                     lid = to_upsert[i][0]
-                    ventas_map_ids[lid] = res["id"]
+                    cid = res["id"]
+                    ventas_map_ids[lid] = cid
+                    new_entity_cache[str(payload[i]["id_unico"])] = [get_hash(payload[i]), cid]
             
             cache["ventas"] = new_entity_cache
 
@@ -284,6 +327,11 @@ def sync_incremental(force=False):
                     local_parent_id = row.get("TBT_OPERACION_AUTOINCREMENT")
                     cloud_parent_id = ventas_map_ids.get(local_parent_id)
                     
+                    # Si no tenemos el parent_id, el detalle no se puede linkear correctamente
+                    if cloud_parent_id is None:
+                        # Intentar buscarlo en el caché si no se procesó en esta vuelta
+                        continue 
+
                     precio_ves = safe_decimal(row["TBT_PRECIODEVENTA"])
                     precio_usd = precio_ves / tasa
                     
@@ -312,6 +360,11 @@ def sync_incremental(force=False):
 
     # Guardar Caché Final
     with open(CACHE_FILE, 'w') as cf: json.dump(cache, cf)
+    
+    # Limpieza de memoria explícita
+    ventas_map_ids.clear()
+    doc_to_tasa.clear()
+    
     print("[SYNC VENTAS] [OK] Sincronización finalizada.")
     
     # Metadata final
@@ -319,6 +372,7 @@ def sync_incremental(force=False):
         with open(LAST_SYNC_FILE, "w") as f:
             json.dump({"last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "timestamp": time.time()}, f)
     except: pass
+
     
     # 🔍 RECONCILIACIÓN AUTOMÁTICA (Audit)
     # Solo si no hubo errores críticos y estamos en modo completo
@@ -404,7 +458,14 @@ def delete_orphans_generic(table: str, pk_col: str, valid_ids: list) -> bool:
             ids_str = ",".join(map(str, batch))
             del_url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/{table}?{pk_col}=in.({ids_str})"
             _retry_http(del_url, method="DELETE", timeout=20)
+        
+        # 💡 Si borramos huérfanos, el caché local ya no es fiable.
+        if os.path.exists(CACHE_FILE):
+            try: os.remove(CACHE_FILE)
+            except: pass
+            
         return True
+
     except Exception as e:
         print(f"  [ERROR AUDIT] {table}: {e}")
         return False

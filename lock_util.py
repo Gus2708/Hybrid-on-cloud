@@ -32,20 +32,20 @@ clear_stale_locks()
 
 def pid_exists(pid):
     """Verifica si un proceso sigue vivo en Windows/Linux de forma silenciosa."""
-    if pid <= 0: return False
+    if not pid or pid <= 0: return False
     
     if sys.platform == "win32":
         try:
             import ctypes
-            # PROCESS_QUERY_LIMITED_INFORMATION (0x1000) es suficiente para GetExitCodeProcess
+            # PROCESS_QUERY_LIMITED_INFORMATION (0x1000)
             kernel32 = ctypes.windll.kernel32
             handle = kernel32.OpenProcess(0x1000, False, pid)
             if handle:
                 exit_code = ctypes.c_ulong()
                 res = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
                 kernel32.CloseHandle(handle)
-                if res:
-                    return exit_code.value == 259 # STILL_ACTIVE
+                # 259 es STILL_ACTIVE
+                return bool(res and exit_code.value == 259)
             return False
         except:
             return False
@@ -53,8 +53,9 @@ def pid_exists(pid):
         try:
             os.kill(pid, 0)
             return True
-        except OSError:
+        except (OSError, ProcessLookupError):
             return False
+
 
 @contextmanager
 def acquire_lock(timeout=120):

@@ -34,33 +34,44 @@ EXPORTER_SCRIPT = os.path.join(BASE_DIR, "actualizar_inventario.py")
 CACHE_FILE = os.path.join(BASE_DIR, "sync_cache.json")
 LAST_SYNC_FILE = os.path.join(BASE_DIR, "last_sync.json")
 
+def _kill_proc(proc):
+    """Mata un proceso forzadamente en Windows."""
+    try:
+        if proc.poll() is None:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=5)
+            proc.wait(timeout=5)
+    except: pass
+
 def run_hybrid_exporter(force=False):
     print(f"[SYNC] -> Evaluando extracción de inventario...")
     if not os.path.exists(EXPORTER_SCRIPT):
         print(f"[SYNC] ! Script no encontrado: {EXPORTER_SCRIPT}")
         return False
+    args = [sys.executable, EXPORTER_SCRIPT]
+    if force:
+        args.append("force")
+    proc = subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        creationflags=0x08000000
+    )
     try:
-        args = [sys.executable, EXPORTER_SCRIPT]
-        if force:
-            args.append("force")
-        result = subprocess.run(
-            args,
-            capture_output=True, text=True, timeout=45,
-            creationflags=0x08000000
-        )
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
+        stdout, stderr = proc.communicate(timeout=45)
+        if proc.returncode == 0:
+            for line in stdout.decode('utf-8', errors='replace').splitlines():
                 print(f"  {line}")
             return True
         else:
-            print(f"[SYNC] ! Error en exportador (código {result.returncode}):")
-            for line in result.stderr.splitlines():
+            print(f"[SYNC] ! Error en exportador (código {proc.returncode}):")
+            for line in stderr.decode('utf-8', errors='replace').splitlines():
                 print(f"  ! {line}")
             return False
     except subprocess.TimeoutExpired:
+        _kill_proc(proc)
         print(f"[SYNC] ! TIMEOUT (45s): exportador colgado en H:. Abortando sync.")
         return False
     except Exception as e:
+        _kill_proc(proc)
         print(f"[SYNC] ! Error ejecutando exportador: {e}")
         return False
 
@@ -69,12 +80,16 @@ def get_row_hash(row: Dict) -> str:
     return hashlib.md5(relevant_data.encode('utf-8')).hexdigest()
 
 def sync_incremental(force=False):
+    # Validar unidad H: antes de empezar
+    if not os.path.exists(os.path.dirname(CSV_SOURCE_PATH)):
+        print("[SYNC] ! ERROR: Unidad de red H: no accesible. Abortando.")
+        return
+
     result = run_hybrid_exporter(force=force)
     if result is False:
         print("[SYNC] Extracción fallida (unidad de red probablemente caída). Abortando sync.")
         return
-    if not result:
-        return
+
 
     # Actualizar Tasas
     try:
