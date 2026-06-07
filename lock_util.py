@@ -25,7 +25,9 @@ def clear_stale_locks():
                     os.remove(p)
             except: os.remove(p)
     for tmp in glob.glob(os.path.join(base, "*.tmp")):
-        try: os.remove(tmp)
+        try:
+            if time.time() - os.path.getmtime(tmp) > 60:
+                os.remove(tmp)
         except: pass
 
 clear_stale_locks()
@@ -37,8 +39,8 @@ def pid_exists(pid):
     if sys.platform == "win32":
         try:
             import ctypes
-            # PROCESS_QUERY_LIMITED_INFORMATION (0x1000)
             kernel32 = ctypes.windll.kernel32
+            # PROCESS_QUERY_LIMITED_INFORMATION (0x1000)
             handle = kernel32.OpenProcess(0x1000, False, pid)
             if handle:
                 exit_code = ctypes.c_ulong()
@@ -46,7 +48,12 @@ def pid_exists(pid):
                 kernel32.CloseHandle(handle)
                 # 259 es STILL_ACTIVE
                 return bool(res and exit_code.value == 259)
-            return False
+            else:
+                err = kernel32.GetLastError()
+                # 5 es ERROR_ACCESS_DENIED. Si da acceso denegado, el proceso está vivo
+                if err == 5:
+                    return True
+                return False
         except:
             return False
     else:
@@ -106,3 +113,25 @@ def is_locked():
         return pid_exists(old_pid)
     except:
         return False
+
+def safe_replace(src, dst, max_retries=5, delay=0.1):
+    """Reemplaza un archivo con reintentos para evitar bloqueos concurrentes en Windows (WinError 32)."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            if os.path.exists(dst):
+                os.replace(src, dst)
+            else:
+                os.rename(src, dst)
+            return True
+        except (PermissionError, FileExistsError):
+            if attempt < max_retries:
+                time.sleep(delay)
+            else:
+                raise
+        except Exception:
+            if attempt < max_retries:
+                time.sleep(delay)
+            else:
+                raise
+    return False
+

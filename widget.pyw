@@ -38,11 +38,7 @@ HYBRID_PATHS = [
 ]
 
 # --- Protección de Instancia Única ---
-try:
-    lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    lock_socket.bind(('127.0.0.1', 5006)) 
-except:
-    sys.exit(0)
+# Se difiere al bloque __main__ para permitir la importación en tests sin interrumpir
 
 class SerruchoPremiumWidget:
     def __init__(self, root):
@@ -92,6 +88,15 @@ class SerruchoPremiumWidget:
             except: pass
         self.canvas.create_text(290, 22, text="✕", fill=self.colors["subtext"], font=("Inter", 10, "bold"), tags="close_btn")
         self.canvas.tag_bind("close_btn", "<Button-1>", lambda e: self.hide_to_tray())
+        
+        # Botón Calculadora (%) con Estilo iOS
+        self.calc_btn_bg = self.draw_rounded_rect(225, 10, 250, 35, 8, self.colors["card"], tags="calc_btn")
+        self.calc_btn_txt = self.canvas.create_text(237, 22, text="%", fill=self.colors["blue"], font=("Inter", 11, "bold"), tags="calc_btn")
+        
+        # Efectos Hover y Clic
+        self.canvas.tag_bind("calc_btn", "<Enter>", lambda e: self.canvas.itemconfig(self.calc_btn_bg, fill="#3A3A3C"))
+        self.canvas.tag_bind("calc_btn", "<Leave>", lambda e: self.canvas.itemconfig(self.calc_btn_bg, fill=self.colors["card"]))
+        self.canvas.tag_bind("calc_btn", "<Button-1>", lambda e: self.open_calculator())
 
         # Spinner de Carga (oculto por defecto)
         self.spinner = self.canvas.create_arc(257, 14, 273, 30, start=0, extent=60, outline=self.colors["blue"], width=2, style="arc", state="hidden")
@@ -137,6 +142,7 @@ class SerruchoPremiumWidget:
         self.is_syncing = False
         self.anim_f = 0
         self.load_last_sync_time()
+        self.load_calc_settings()
         self.animate()
         self.update_loop()
         self.verify_loop()
@@ -189,6 +195,53 @@ class SerruchoPremiumWidget:
                 self.last_synced_at = max_ts
             else: self.last_synced_at = time.time()
         except: self.last_synced_at = time.time()
+
+    def load_calc_settings(self):
+        self.last_discount = 0.0
+        self.last_sale_percent = 30.0
+        self.calc_history = []
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            p = os.path.join(base_dir, "calc_settings.json")
+            if os.path.exists(p):
+                with open(p, "r") as fh:
+                    data = json.load(fh)
+                    self.last_discount = data.get("last_discount", 0.0)
+                    self.last_sale_percent = data.get("last_sale_percent", 30.0)
+                    self.calc_history = data.get("history", [])
+        except: pass
+
+    def save_calc_settings(self, val):
+        self.last_discount = val
+        # Actualizar historial: nuevo valor al principio, eliminar duplicados, máximo 5
+        if val > 0:
+            if val in self.calc_history: self.calc_history.remove(val)
+            self.calc_history.insert(0, val)
+            self.calc_history = self.calc_history[:5]
+            
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            p = os.path.join(base_dir, "calc_settings.json")
+            with open(p, "w") as fh:
+                json.dump({
+                    "last_discount": self.last_discount,
+                    "last_sale_percent": getattr(self, "last_sale_percent", 30.0),
+                    "history": self.calc_history
+                }, fh)
+        except: pass
+
+    def save_sale_settings(self, val):
+        self.last_sale_percent = val
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            p = os.path.join(base_dir, "calc_settings.json")
+            with open(p, "w") as fh:
+                json.dump({
+                    "last_discount": self.last_discount,
+                    "last_sale_percent": self.last_sale_percent,
+                    "history": self.calc_history
+                }, fh)
+        except: pass
 
     def setup_tray(self):
         try:
@@ -355,7 +408,289 @@ class SerruchoPremiumWidget:
         if HAS_TRAY and hasattr(self, "tray_icon"): self.tray_icon.stop()
         self.root.quit(); sys.exit()
 
+    def open_calculator(self):
+        if hasattr(self, "calc_win") and self.calc_win.winfo_exists():
+            self.calc_win.lift()
+            return
+        self.calc_win = tk.Toplevel(self.root)
+        DiscountCalculator(self.calc_win, self.colors, self.last_discount, self.last_sale_percent, self.calc_history, self.save_calc_settings, self.save_sale_settings)
+
+class DiscountCalculator:
+    def __init__(self, root, colors, initial_discount, initial_sale_percent, history, save_callback, save_sale_callback):
+        self.root = root
+        self.colors = colors
+        self.history = history
+        self.save_callback = save_callback
+        self.save_sale_callback = save_sale_callback
+        self.history_menu_win = None
+        self.calc_mode = "sub"
+        self.root.title("Calculadora de Descuento")
+        self.width, self.height = 300, 260
+        
+        # Estética iOS
+        self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True)
+        self.root.attributes("-transparentcolor", "#010101")
+        self.root.config(bg="#010101")
+        
+        # Posicionar cerca del widget principal
+        parent_x = self.root.master.winfo_x()
+        parent_y = self.root.master.winfo_y()
+        self.root.geometry(f"{self.width}x{self.height}+{parent_x - 20}+{parent_y + 50}")
+        
+        self.canvas = tk.Canvas(root, width=self.width, height=self.height, bg="#010101", highlightthickness=0, bd=0)
+        self.canvas.pack()
+        
+        # Fondo
+        self.draw_rounded_rect(0, 0, self.width, self.height, 24, self.colors["bg"], tags="drag")
+        
+        # Título y Cerrar
+        self.canvas.create_text(20, 25, text="Calculadora Proovedor", fill=self.colors["text"], font=("Inter", 10, "bold"), anchor="w", tags="drag")
+        self.canvas.create_text(self.width-20, 25, text="✕", fill=self.colors["subtext"], font=("Inter", 10, "bold"), tags="close")
+        self.canvas.tag_bind("close", "<Button-1>", lambda e: self.root.destroy())
+        
+        # Fila 1: Inputs
+        self.canvas.create_text(20, 55, text="PRECIO", fill=self.colors["subtext"], font=("Inter", 7, "bold"), anchor="w")
+        self.price_entry = self.create_entry(20, 68, 145, 98)
+        
+        self.canvas.create_text(155, 55, text="PORCENTAJE", fill=self.colors["subtext"], font=("Inter", 7, "bold"), anchor="w")
+        
+        # Segmented control toggle (- / +)
+        self.mode_toggle_bg = self.draw_rounded_rect(225, 44, 280, 64, 9, "#2C2C2E", tags="mode_toggle")
+        self.mode_indicator = self.draw_rounded_rect(227, 46, 252, 62, 8, self.colors["blue"], tags="mode_toggle")
+        self.mode_sub_txt = self.canvas.create_text(239, 54, text="-", fill="#FFFFFF", font=("Inter", 10, "bold"), tags="mode_toggle")
+        self.mode_add_txt = self.canvas.create_text(266, 54, text="+", fill=self.colors["subtext"], font=("Inter", 10, "bold"), tags="mode_toggle")
+        self.canvas.tag_bind("mode_toggle", "<Button-1>", lambda e: self.toggle_mode())
+
+        # Fondo completo del input de descuento
+        self.draw_rounded_rect(155, 68, 280, 98, 8, self.colors["card"])
+        # Widget Entry más corto para no tapar el chevron
+        self.pct_entry = self.create_entry_widget(155, 68, 250, 98)
+        self.pct_entry.insert(0, str(initial_discount) if initial_discount > 0 else "")
+        
+        # Chevron para Historial (ahora visible)
+        self.draw_chevron(268, 83)
+        
+        # Fila 2: Precio con Descuento
+        self.draw_rounded_rect(20, 115, 280, 165, 12, self.colors["card"])
+        self.cost_title_label = self.canvas.create_text(35, 130, text="COSTO NETO (-%)", fill=self.colors["subtext"], font=("Inter", 7, "bold"), anchor="w")
+        self.res_label = self.canvas.create_text(35, 148, text="0.00", fill=self.colors["text"], font=("Inter", 14, "bold"), anchor="w")
+        
+        # Botón Copiar Costo (Personalizado y Alineado)
+        self.draw_copy_icon(245, 132, self.res_label)
+
+        # Fila 3: Precio Venta (+Editable%)
+        self.draw_rounded_rect(20, 180, 280, 240, 12, self.colors["card"])
+        
+        # Elementos interactivos del porcentaje de venta
+        self.canvas.create_text(35, 195, text="PRECIO VENTA (+", fill=self.colors["green"], font=("Inter", 7, "bold"), anchor="w")
+        
+        # Entrada de porcentaje de venta con fondo oscuro redondeado
+        self.draw_rounded_rect(122, 185, 162, 205, 5, self.colors["bg"])
+        self.sale_pct_entry = tk.Entry(self.root, bg=self.colors["bg"], fg="#FFFFFF", font=("Inter", 9), borderwidth=0, highlightthickness=0, insertbackground="white", justify="center")
+        self.canvas.create_window(142, 195, window=self.sale_pct_entry, width=32, height=16)
+        self.sale_pct_entry.insert(0, str(initial_sale_percent) if initial_sale_percent > 0 else "30.0")
+        
+        self.canvas.create_text(166, 195, text="%)", fill=self.colors["green"], font=("Inter", 7, "bold"), anchor="w")
+        
+        self.profit_label = self.canvas.create_text(35, 218, text="0.00", fill=self.colors["text"], font=("Inter", 16, "bold"), anchor="w")
+        
+        # Botones de Acción (Alineados a la derecha)
+        self.round_btn_bg = self.canvas.create_oval(205, 203, 230, 228, outline=self.colors["blue"], width=1.5)
+        self.round_btn_txt = self.canvas.create_text(218, 215, text="R", fill=self.colors["blue"], font=("Inter", 10, "bold"))
+        self.canvas.tag_bind(self.round_btn_bg, "<Button-1>", lambda e: self.round_up())
+        self.canvas.tag_bind(self.round_btn_txt, "<Button-1>", lambda e: self.round_up())
+        
+        self.draw_copy_icon(245, 207, self.profit_label)
+
+        # Eventos
+        self.price_entry.bind("<KeyRelease>", lambda e: self.calculate())
+        self.pct_entry.bind("<KeyRelease>", lambda e: self.calculate())
+        self.sale_pct_entry.bind("<KeyRelease>", lambda e: self.calculate())
+        self.canvas.tag_bind("drag", "<ButtonPress-1>", self.start_move)
+        self.canvas.tag_bind("drag", "<B1-Motion>", self.do_move)
+        
+        # Focus inicial
+        self.price_entry.focus_set()
+
+    def draw_chevron(self, x, y):
+        tag = "chevron_btn"
+        # Chevron estilo iOS más grande y apuntando abajo
+        self.canvas.create_line(x-6, y-3, x, y+3, fill=self.colors["blue"], width=2, tags=tag)
+        self.canvas.create_line(x, y+3, x+6, y-3, fill=self.colors["blue"], width=2, tags=tag)
+        self.canvas.tag_bind(tag, "<Button-1>", lambda e: self.show_history_menu())
+
+    def show_history_menu(self):
+        if not self.history: return
+        
+        # Lógica de Toggle
+        if self.history_menu_win and self.history_menu_win.winfo_exists():
+            self.history_menu_win.destroy()
+            self.history_menu_win = None
+            return
+            
+        self.history_menu_win = tk.Toplevel(self.root)
+        self.history_menu_win.overrideredirect(True)
+        self.history_menu_win.attributes("-topmost", True)
+        self.history_menu_win.attributes("-transparentcolor", "#010101")
+        self.history_menu_win.config(bg="#010101")
+        
+        w, h_item = 125, 25
+        h = len(self.history) * h_item + 10
+        
+        canvas = tk.Canvas(self.history_menu_win, width=w, height=h, bg="#010101", highlightthickness=0, bd=0)
+        canvas.pack()
+        
+        self.draw_rounded_rect_custom(canvas, 0, 0, w, h, 12, self.colors["card"])
+        
+        def select(val):
+            self.pct_entry.delete(0, tk.END)
+            self.pct_entry.insert(0, str(val))
+            self.calculate()
+            self.history_menu_win.destroy()
+            self.history_menu_win = None
+
+        for i, val in enumerate(self.history):
+            y_item = 5 + i * h_item
+            rect = canvas.create_rectangle(5, y_item, w-5, y_item+h_item, fill="", outline="", tags=f"item_{i}")
+            txt = canvas.create_text(w/2, y_item+h_item/2, text=f"{val}%", fill=self.colors["text"], font=("Inter", 9), tags=f"item_{i}")
+            canvas.tag_bind(f"item_{i}", "<Enter>", lambda e, r=rect: canvas.itemconfig(r, fill="#3A3A3C"))
+            canvas.tag_bind(f"item_{i}", "<Leave>", lambda e, r=rect: canvas.itemconfig(r, fill=""))
+            canvas.tag_bind(f"item_{i}", "<Button-1>", lambda e, v=val: select(v))
+
+        self.update_menu_position()
+
+    def update_menu_position(self):
+        if self.history_menu_win and self.history_menu_win.winfo_exists():
+            x = self.root.winfo_x() + 155
+            y = self.root.winfo_y() + 100
+            self.history_menu_win.geometry(f"+{x}+{y}")
+
+    def get_rounded_points(self, x1, y1, x2, y2, r):
+        return [x1+r, y1, x1+r, y1, x2-r, y1, x2-r, y1, x2, y1, x2, y1+r, x2, y1+r, x2, y2-r, x2, y2-r, x2, y2, x2-r, y2, x2-r, y2, x1+r, y2, x1+r, y2, x1, y2, x1, y2-r, x1, y2-r, x1, y1+r, x1, y1+r, x1, y1]
+
+    def toggle_mode(self):
+        if self.calc_mode == "sub":
+            self.calc_mode = "add"
+            new_pts = self.get_rounded_points(253, 46, 278, 62, 8)
+            self.canvas.coords(self.mode_indicator, *new_pts)
+            self.canvas.itemconfig(self.mode_sub_txt, fill=self.colors["subtext"])
+            self.canvas.itemconfig(self.mode_add_txt, fill="#FFFFFF")
+            self.canvas.itemconfig(self.cost_title_label, text="COSTO NETO (+%)")
+        else:
+            self.calc_mode = "sub"
+            new_pts = self.get_rounded_points(227, 46, 252, 62, 8)
+            self.canvas.coords(self.mode_indicator, *new_pts)
+            self.canvas.itemconfig(self.mode_sub_txt, fill="#FFFFFF")
+            self.canvas.itemconfig(self.mode_add_txt, fill=self.colors["subtext"])
+            self.canvas.itemconfig(self.cost_title_label, text="COSTO NETO (-%)")
+        self.calculate()
+
+    def draw_rounded_rect_custom(self, canvas, x1, y1, x2, y2, r, color):
+        def get_pts(x1, y1, x2, y2, r):
+            return [x1+r, y1, x1+r, y1, x2-r, y1, x2-r, y1, x2, y1, x2, y1+r, x2, y1+r, x2, y2-r, x2, y2-r, x2, y2, x2-r, y2, x2-r, y2, x1+r, y2, x1+r, y2, x1, y2, x1, y2-r, x1, y2-r, x1, y1+r, x1, y1+r, x1, y1]
+        return canvas.create_polygon(get_pts(x1, y1, x2, y2, r), smooth=True, fill=color)
+
+    def draw_copy_icon(self, x, y, label_id):
+        tag = f"copy_{label_id}"
+        # Área de colisión (hitbox) invisible de 24x24 con el color de la tarjeta para capturar clics de forma confiable
+        self.canvas.create_rectangle(x-4, y-4, x+20, y+20, fill=self.colors["card"], outline="", tags=tag)
+        # Dibujamos dos rectángulos superpuestos estilo "outline"
+        self.draw_rounded_rect_outline(x, y+4, x+12, y+16, 3, self.colors["subtext"], tags=tag) # Fondo
+        self.draw_rounded_rect_outline(x+4, y, x+16, y+12, 3, self.colors["blue"], tags=tag) # Frente
+        self.canvas.tag_bind(tag, "<Button-1>", lambda e: self.copy_to_clipboard(label_id))
+
+    def draw_rounded_rect_outline(self, x1, y1, x2, y2, r, color, tags=""):
+        def get_pts(x1, y1, x2, y2, r):
+            return [x1+r, y1, x1+r, y1, x2-r, y1, x2-r, y1, x2, y1, x2, y1+r, x2, y1+r, x2, y2-r, x2, y2-r, x2, y2, x2-r, y2, x2-r, y2, x1+r, y2, x1+r, y2, x1, y2, x1, y2-r, x1, y2-r, x1, y1+r, x1, y1+r, x1, y1]
+        return self.canvas.create_polygon(get_pts(x1, y1, x2, y2, r), smooth=True, fill="", outline=color, width=1.5, tags=tags)
+
+    def create_entry(self, x1, y1, x2, y2):
+        self.draw_rounded_rect(x1, y1, x2, y2, 8, self.colors["card"])
+        return self.create_entry_widget(x1, y1, x2, y2)
+
+    def create_entry_widget(self, x1, y1, x2, y2):
+        entry = tk.Entry(self.root, bg=self.colors["card"], fg="#FFFFFF", font=("Inter", 11), borderwidth=0, highlightthickness=0, insertbackground="white")
+        self.canvas.create_window((x1+x2)/2, (y1+y2)/2, window=entry, width=(x2-x1)-15, height=(y2-y1)-5)
+        return entry
+
+    def calculate(self):
+        try:
+            p_val = self.price_entry.get().replace(",", ".")
+            d_val = self.pct_entry.get().replace(",", ".")
+            s_val = self.sale_pct_entry.get().replace(",", ".")
+            price = float(p_val) if p_val else 0.0
+            pct = float(d_val) if d_val else 0.0
+            sale_pct = float(s_val) if s_val else 0.0
+            
+            if self.calc_mode == "sub":
+                costo_neto = price * (1 - (pct / 100))
+            else:
+                costo_neto = price * (1 + (pct / 100))
+            precio_venta = costo_neto * (1 + (sale_pct / 100))
+            
+            self.canvas.itemconfig(self.res_label, text=f"{costo_neto:,.2f}")
+            self.canvas.itemconfig(self.profit_label, text=f"{precio_venta:,.2f}")
+            
+            if pct > 0: self.save_callback(pct)
+            if sale_pct >= 0: self.save_sale_callback(sale_pct)
+        except:
+            self.canvas.itemconfig(self.res_label, text="0.00")
+            self.canvas.itemconfig(self.profit_label, text="0.00")
+
+    def round_up(self):
+        try:
+            val = float(self.canvas.itemcget(self.profit_label, "text").replace(",", ""))
+            if val <= 0: return
+            
+            # Lógica de Redondeo Inteligente
+            # .00 - .15 -> .00
+            # .16 - .65 -> .50
+            # .66 - .99 -> 1.00
+            integer_part = int(val)
+            decimal_part = val - integer_part
+            
+            if decimal_part <= 0.15:
+                rounded = float(integer_part)
+            elif decimal_part <= 0.65:
+                rounded = integer_part + 0.5
+            else:
+                rounded = float(integer_part + 1)
+                
+            self.canvas.itemconfig(self.profit_label, text=f"{rounded:,.2f}")
+        except: pass
+
+    def copy_to_clipboard(self, label_id):
+        try:
+            text = self.canvas.itemcget(label_id, "text").replace(",", "")
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            # Feedback visual
+            old_color = self.canvas.itemcget(label_id, "fill")
+            self.canvas.itemconfig(label_id, fill=self.colors["green"])
+            self.root.after(500, lambda: self.canvas.itemconfig(label_id, fill=old_color))
+        except: pass
+
+    def draw_rounded_rect(self, x1, y1, x2, y2, r, color, tags=""):
+        def get_pts(x1, y1, x2, y2, r):
+            return [x1+r, y1, x1+r, y1, x2-r, y1, x2-r, y1, x2, y1, x2, y1+r, x2, y1+r, x2, y2-r, x2, y2-r, x2, y2, x2-r, y2, x2-r, y2, x1+r, y2, x1+r, y2, x1, y2, x1, y2-r, x1, y2-r, x1, y1+r, x1, y1+r, x1, y1]
+        return self.canvas.create_polygon(get_pts(x1, y1, x2, y2, r), smooth=True, fill=color, tags=tags)
+
+    def start_move(self, event): self.x, self.y = event.x, event.y
+    def do_move(self, event): 
+        self.root.geometry(f"+{self.root.winfo_x()+(event.x-self.x)}+{self.root.winfo_y()+(event.y-self.y)}")
+        self.update_menu_position()
+
+
 if __name__ == "__main__":
+    # --- Protección de Instancia Única ---
+    import socket
+    try:
+        lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        lock_socket.bind(('127.0.0.1', 5006)) 
+    except:
+        sys.exit(0)
+
     root = tk.Tk()
     app = SerruchoPremiumWidget(root)
     root.mainloop()

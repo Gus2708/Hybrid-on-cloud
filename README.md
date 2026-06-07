@@ -62,7 +62,7 @@ pip install -r requirements.txt
 ```
 
 ### 4. Preparación de la Base de Datos
-Importa los archivos SQL en el **SQL Editor** de Supabase para crear las tablas necesarias (`productos` y `tazas`).
+Importa los archivos SQL en el **SQL Editor** de Supabase para crear las tablas necesarias (`productos` y `tasas`).
 
 ---
 

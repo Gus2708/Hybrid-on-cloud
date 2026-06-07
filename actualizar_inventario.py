@@ -4,6 +4,7 @@ import sys
 import time
 import pydbisam
 from datetime import date
+from lock_util import safe_replace
 
 # ==========================================
 #         CONFIGURACIÓN
@@ -87,6 +88,7 @@ def process_inventory(force=False):
                 'desc': clean_val(row[1]),
                 'und': clean_val(row[8]) if row[8] != 'Fail' else 'UND',
                 'bar': clean_val(row[10]) if row[10] != 'Fail' and row[10] else 'SIN_CODIGO',
+                'referencia': clean_val(row[10]) if row[10] != 'Fail' and row[10] else '',
                 'costo': 0.0,
                 'precio': 0.0,
                 'existencia': 0.0
@@ -140,19 +142,21 @@ def process_inventory(force=False):
     try:
         with open(tmp_salida, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f)
-            writer.writerow(['CODIGO_INTERNO', 'DESCRIPCION', 'UNIDAD', 'CODIGO_BARRAS', 'COSTO', 'PRECIO_VENTA', 'EXISTENCIA'])
+            writer.writerow(['CODIGO_INTERNO', 'DESCRIPCION', 'UNIDAD', 'CODIGO_BARRAS', 'REFERENCIA', 'COSTO', 'PRECIO_VENTA', 'EXISTENCIA'])
             
             count = 0
             for code in sorted(productos.keys()):
                 p = productos[code]
                 if len(p['codigo']) < 2 or p['desc'] == 'SIN DESCRIPCION': continue
                 
-                writer.writerow([p['codigo'], p['desc'], p['und'], p['bar'], p['costo'], p['precio'], p['existencia']])
+                writer.writerow([p['codigo'], p['desc'], p['und'], p['bar'], p['referencia'], p['costo'], p['precio'], p['existencia']])
                 count += 1
         
-        os.replace(tmp_salida, ARCHIVO_SALIDA)
-        print(f"--- ÉXITO: {count} productos exportados correctamente ---")
-        return True
+        if safe_replace(tmp_salida, ARCHIVO_SALIDA):
+            print(f"--- ÉXITO: {count} productos exportados correctamente ---")
+            return True
+        else:
+            raise IOError("No se pudo reemplazar el archivo debido a bloqueos de Windows.")
     except Exception as e:
         if os.path.exists(tmp_salida): os.remove(tmp_salida)
         print(f"  ! Error guardando CSV: {e}")

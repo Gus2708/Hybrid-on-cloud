@@ -77,8 +77,48 @@ def run_hybrid_exporter(force=False):
         print(f"[SYNC] ! Error ejecutando exportador: {e}")
         return False
 
+def safe_decimal(val):
+    if val is None: return 0.0
+    s = str(val).strip()
+    if not s: return 0.0
+    # Manejar formato venezolano "1.500,50" -> 1500.50
+    if ',' in s and '.' in s:
+        s = s.replace('.', '').replace(',', '.')
+    elif ',' in s:
+        s = s.replace(',', '.')
+    try: return float(s)
+    except: return 0.0
+
+def _load_csv(file_path: str) -> List[Dict]:
+    rows = []
+    if not os.path.exists(file_path):
+        return rows
+    try:
+        with open(file_path, mode='r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    costo = safe_decimal(row.get('COSTO', 0))
+                    precio = safe_decimal(row.get('PRECIO_VENTA', 0))
+                    existencia = safe_decimal(row.get('EXISTENCIA', 0))
+                    item = {
+                        "codigo_interno": row.get('CODIGO_INTERNO', '').strip(),
+                        "descripcion": row.get('DESCRIPCION', '').strip()[:200],
+                        "unidad": row.get('UNIDAD', '').strip()[:50],
+                        "codigo_barras": row.get('CODIGO_BARRAS', '').strip()[:100],
+                        "referencia": row.get('REFERENCIA', '').strip()[:100],
+                        "costo": round(costo, 2),
+                        "precio_venta": round(precio, 2),
+                        "existencia": round(existencia, 2)
+                    }
+                    rows.append(item)
+                except:
+                    continue
+    except: pass
+    return rows
+
 def get_row_hash(row: Dict) -> str:
-    relevant_data = f"{row['codigo_interno']}|{row['descripcion']}|{row['costo']:.2f}|{row['precio_venta']:.2f}|{row['existencia']:.2f}|{row['codigo_barras']}|{row['unidad']}"
+    relevant_data = f"{row.get('codigo_interno', '')}|{row.get('descripcion', '')}|{row.get('costo', 0.0):.2f}|{row.get('precio_venta', 0.0):.2f}|{row.get('existencia', 0.0):.2f}|{row.get('codigo_barras', '')}|{row.get('referencia', '')}|{row.get('unidad', '')}"
     return hashlib.md5(relevant_data.encode('utf-8')).hexdigest()
 
 def sync_incremental(force=False):
@@ -95,10 +135,30 @@ def sync_incremental(force=False):
 
     # Actualizar Tasas
     try:
-        service = RatesService()
-        rates = service.get_all_rates()
-        service.save_to_db(rates)
-    except: pass
+        last_rates_time = 0.0
+        if os.path.exists(LAST_SYNC_FILE):
+            try:
+                with open(LAST_SYNC_FILE, 'r') as f:
+                    last_rates_time = json.load(f).get("last_rates_update", 0.0)
+            except: pass
+        
+        now_time = time.time()
+        if force or (now_time - last_rates_time >= 3600):
+            print("[SYNC] Actualizando tasas de cambio...")
+            service = RatesService()
+            rates = service.get_all_rates()
+            if service.save_to_db(rates):
+                try:
+                    meta = {}
+                    if os.path.exists(LAST_SYNC_FILE):
+                        with open(LAST_SYNC_FILE, 'r') as f: meta = json.load(f)
+                    meta["last_rates_update"] = now_time
+                    with open(LAST_SYNC_FILE, 'w') as f: json.dump(meta, f)
+                except: pass
+        else:
+            print("[SYNC] Tasas de cambio actualizadas recientemente. Saltando.")
+    except Exception as e:
+        print(f"[SYNC] Error en tasas: {e}")
 
     # Cargar caché
     cache = {}
@@ -107,68 +167,46 @@ def sync_incremental(force=False):
             with open(CACHE_FILE, 'r') as f: cache = json.load(f)
         except: pass
 
-    if not os.path.exists(CSV_SOURCE_PATH): return
+    rows = _load_csv(CSV_SOURCE_PATH)
+    if not rows: return
 
-    # Procesamiento por STREAM
     to_upsert = []
     new_cache = {}
     total_count = 0
     zero_price_count = 0
-    
-    def safe_decimal(val):
-        if val is None: return 0.0
-        s = str(val).strip()
-        if not s: return 0.0
-        # Manejar formato venezolano "1.500,50" -> 1500.50
-        if ',' in s and '.' in s:
-            s = s.replace('.', '').replace(',', '.')
-        elif ',' in s:
-            s = s.replace(',', '.')
-        try: return float(s)
-        except: return 0.0
+    error_occurred = False
 
-    print(f"[SYNC] Procesando Inventario (Stream)...")
+    print(f"[SYNC] Procesando Inventario ({len(rows)} productos)...")
     try:
-        with open(CSV_SOURCE_PATH, mode='r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f)
-            error_occurred = False
-            for row in reader:
-                try:
-                    costo = safe_decimal(row.get('COSTO', 0))
-                    precio = safe_decimal(row.get('PRECIO_VENTA', 0))
-                    existencia = safe_decimal(row.get('EXISTENCIA', 0))
+        for item in rows:
+            try:
+                costo = item["costo"]
+                precio = item["precio_venta"]
+                existencia = item["existencia"]
+                
+                if precio == 0: zero_price_count += 1
+                
+                cid = item['codigo_interno']
+                h = get_row_hash(item)
+                new_cache[cid] = h
+                total_count += 1
+                
+                if cache.get(cid) != h:
+                    to_upsert.append(item)
+                
+                if len(to_upsert) >= 500:
+                    # Salvaguarda: si mas del 50% de lo procesado tiene precio 0, abortar
+                    if total_count > 100 and zero_price_count > total_count * 0.5:
+                        print(f"[SYNC] ! ABORTANDO: {zero_price_count}/{total_count} productos con precio 0. Posible error de lectura.")
+                        error_occurred = True
+                        break
                     
-                    if precio == 0: zero_price_count += 1
-                    
-                    item = {
-                        "codigo_interno": row.get('CODIGO_INTERNO', '').strip(),
-                        "descripcion": row.get('DESCRIPCION', '').strip()[:200],
-                        "unidad": row.get('UNIDAD', '').strip()[:50],
-                        "codigo_barras": row.get('CODIGO_BARRAS', '').strip()[:100],
-                        "costo": round(costo, 2), "precio_venta": round(precio, 2), "existencia": round(existencia, 2)
-                    }
-                    
-                    cid = item['codigo_interno']
-                    h = get_row_hash(item)
-                    new_cache[cid] = h
-                    total_count += 1
-                    
-                    if cache.get(cid) != h:
-                        to_upsert.append(item)
-                    
-                    if len(to_upsert) >= 500:
-                        # Salvaguarda: si mas del 50% de lo procesado tiene precio 0, abortar
-                        if total_count > 100 and zero_price_count > total_count * 0.5:
-                            print(f"[SYNC] ! ABORTANDO: {zero_price_count}/{total_count} productos con precio 0. Posible error de lectura.")
-                            error_occurred = True
-                            break
-                        
-                        print(f"  -> Upsert batch {len(to_upsert)}...")
-                        if upsert_batch_rest(to_upsert): to_upsert = []
-                        else: 
-                            error_occurred = True
-                            break
-                except: continue
+                    print(f"  -> Upsert batch {len(to_upsert)}...")
+                    if upsert_batch_rest(to_upsert): to_upsert = []
+                    else: 
+                        error_occurred = True
+                        break
+            except: continue
         
         if error_occurred:
             print("[SYNC] ! Error crítico durante la subida de lotes. Abortando.")
@@ -185,17 +223,33 @@ def sync_incremental(force=False):
         
         # Guardar Metadata
         try:
+            meta = {}
+            if os.path.exists(LAST_SYNC_FILE):
+                try:
+                    with open(LAST_SYNC_FILE, 'r') as f: meta = json.load(f)
+                except: pass
+            meta.update({
+                "last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "timestamp": time.time()
+            })
             with open(LAST_SYNC_FILE, "w") as f:
-                json.dump({"last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "timestamp": time.time()}, f)
+                json.dump(meta, f)
         except: pass
 
         print(f"[SYNC] [OK] Sincronización finalizada. Total: {total_count}")
-        verify_sync(total_count)
+        verify_sync(total_count, force=force)
+
+        # 🔄 Sincronizar también movimientos locales (ajustes y compras) a Supabase
+        try:
+            from sync_ajustes import sync_movimientos_locales
+            sync_movimientos_locales(force=force)
+        except Exception as e:
+            print(f"[SYNC] Error importando/ejecutando sincronización de ajustes: {e}")
 
     except Exception as e:
         print(f"[SYNC] Error: {e}")
 
-def verify_sync(csv_count: int):
+def verify_sync(csv_count: int, force: bool = False):
     cloud_count = get_row_count_rest()
     if cloud_count != -1 and cloud_count != csv_count:
         diff = abs(cloud_count - csv_count)
@@ -205,12 +259,33 @@ def verify_sync(csv_count: int):
             print(f"[SYNC] Diferencia grande ({diff} filas, {diff/max_count*100:.1f}%). "
                   f"Probablemente la unidad H: estaba caída. No se corrigen huérfanos.")
             return
+        
+        # Verificar cooldown de reconciliación (12 horas)
+        last_reconcile = 0.0
+        if os.path.exists(LAST_SYNC_FILE):
+            try:
+                with open(LAST_SYNC_FILE, 'r') as f:
+                    last_reconcile = json.load(f).get("last_reconcile", 0.0)
+            except: pass
+        
+        now = time.time()
+        if not force and (now - last_reconcile < 12 * 3600):
+            print(f"[SYNC] Discrepancia detectada ({diff} filas), pero la última reconciliación fue hace menos de 12 horas. Saltando reconciliación de huérfanos.")
+            return
+            
         print(f"[SYNC] Discrepancia detectada ({diff} filas). Corrigiendo huérfanos...")
         try:
             with open(CSV_SOURCE_PATH, mode='r', encoding='utf-8-sig') as f:
                 ids = [r['CODIGO_INTERNO'].strip() for r in csv.DictReader(f)]
                 if delete_orphans_rest(ids):
-                    if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
+                    # Actualizar metadata con el timestamp de la última reconciliación exitosa
+                    try:
+                        meta = {}
+                        if os.path.exists(LAST_SYNC_FILE):
+                            with open(LAST_SYNC_FILE, 'r') as f: meta = json.load(f)
+                        meta["last_reconcile"] = now
+                        with open(LAST_SYNC_FILE, 'w') as f: json.dump(meta, f)
+                    except: pass
         except: pass
 
 if __name__ == "__main__":

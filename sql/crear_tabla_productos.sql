@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS public.productos (
     costo           NUMERIC(20,4) NOT NULL DEFAULT 0,
     precio_venta    NUMERIC(20,4) NOT NULL DEFAULT 0,
     existencia      NUMERIC(20,4) NOT NULL DEFAULT 0,
+    referencia      TEXT        NOT NULL DEFAULT '',
     actualizado_en  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -23,6 +24,10 @@ CREATE INDEX IF NOT EXISTS idx_productos_descripcion
 -- 3. Índice por código de barras (lookup en caja/scanner)
 CREATE INDEX IF NOT EXISTS idx_productos_barcode
     ON public.productos (codigo_barras);
+
+-- 3b. Índice por referencia original del proveedor
+CREATE INDEX IF NOT EXISTS idx_productos_referencia
+    ON public.productos (referencia);
 
 -- 4. Índice de texto completo (opcional, para búsquedas más avanzadas)
 CREATE INDEX IF NOT EXISTS idx_productos_fts

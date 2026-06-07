@@ -51,6 +51,7 @@ def _enrich(item):
         item["codigo_interno"] = item.get("CODIGO_INTERNO", "")
         item["descripcion"] = item.get("DESCRIPCION", "")
         item["codigo_barras"] = item.get("CODIGO_BARRAS", "")
+        item["referencia"] = item.get("REFERENCIA", "")
         item["unidad"] = item.get("UNIDAD", "")
     except: pass
     return item
@@ -81,7 +82,7 @@ def listar_productos():
     else:
         encontrados = [
             p for p in _LOCAL_CACHE 
-            if q in p.get("CODIGO_INTERNO", "").upper() or q in p.get("DESCRIPCION", "").upper() or q in p.get("CODIGO_BARRAS", "").upper()
+            if q in p.get("CODIGO_INTERNO", "").upper() or q in p.get("DESCRIPCION", "").upper() or q in p.get("CODIGO_BARRAS", "").upper() or q in p.get("REFERENCIA", "").upper()
         ]
 
     total = len(encontrados)

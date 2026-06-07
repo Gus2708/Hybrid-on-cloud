@@ -139,13 +139,28 @@ class RatesService:
                     }
                     requests.post(base_url, json=ant_payload, headers=headers, timeout=10)
 
-            # 3. Upsert de la tasa 'actual'
+            # 3. Upsert de la tasa 'actual' con salvaguarda de fallback si falla el scraping
+            new_bcv_usd = rates["bcv_usd"]
+            new_bcv_eur = rates["bcv_eur"]
+            new_binance = rates["binance_p2p"]
+
+            if tasa_actual_db:
+                if new_bcv_usd <= 0.0:
+                    new_bcv_usd = float(tasa_actual_db.get("bcv_usd", 0.0))
+                    print(f"[RATES] Fallback a tasa BCV USD anterior de la DB: {new_bcv_usd}")
+                if new_bcv_eur <= 0.0:
+                    new_bcv_eur = float(tasa_actual_db.get("bcv_eur", 0.0))
+                    print(f"[RATES] Fallback a tasa BCV EUR anterior de la DB: {new_bcv_eur}")
+                if new_binance <= 0.0:
+                    new_binance = float(tasa_actual_db.get("binance_p2p", 0.0))
+                    print(f"[RATES] Fallback a tasa Binance anterior de la DB: {new_binance}")
+
             payload = {
                 "nombre": "actual",
-                "bcv_usd": rates["bcv_usd"],
-                "bcv_eur": rates["bcv_eur"],
-                "binance_p2p": rates["binance_p2p"],
-                "tasa_promedio": (rates["bcv_usd"] + rates["binance_p2p"]) / 2 if rates["bcv_usd"] > 0 and rates["binance_p2p"] > 0 else rates["bcv_usd"],
+                "bcv_usd": new_bcv_usd,
+                "bcv_eur": new_bcv_eur,
+                "binance_p2p": new_binance,
+                "tasa_promedio": (new_bcv_usd + new_binance) / 2 if new_bcv_usd > 0 and new_binance > 0 else new_bcv_usd,
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }
             

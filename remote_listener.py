@@ -136,12 +136,12 @@ def execute_local_sync(comando):
                 importlib.reload(sync_ventas)
                 sync.sync_incremental()
                 sync_ventas.sync_incremental()
-            elif comando == "sync":
+            elif comando == "sync_inventory":
                 import sync
                 import importlib
                 importlib.reload(sync)
                 sync.sync_incremental()
-            elif comando == "sync_ventas":
+            elif comando == "sync_sales":
                 import sync_ventas
                 import importlib
                 importlib.reload(sync_ventas)
@@ -187,7 +187,6 @@ while True:
 
             # 🛡️ Timeout: si lleva >30 min en 'ejecutando', marcarlo como error
             if status_actual == 'ejecutando':
-                now_ts = time.time()
                 try:
                     status_url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/comandos_remotos?id=eq.{cmd_id}&select=ejecutado_en"
                     req = urllib.request.Request(status_url, headers=HEADERS, method="GET")
@@ -197,13 +196,13 @@ while True:
                             started = datetime.datetime.fromisoformat(rows[0]["ejecutado_en"].replace("Z", "+00:00"))
                             elapsed = (datetime.datetime.now(datetime.timezone.utc) - started).total_seconds()
                             if elapsed > _COMMAND_TIMEOUT:
-                                log(f"? Comando {cmd_id} lleva {elapsed:.0f}s en ejecutando (> {_COMMAND_TIMEOUT}s). Marcando timeout...")
-                                ok = update_command_status(cmd_id, "error_local")
-                                if not ok:
-                                    log(f"ADVERTENCIA: No se pudo marcar timeout de {cmd_id} en la nube. Saltando para evitar bucle.")
-                                continue
+                                log(f"[TIMEOUT] Comando {cmd_id} lleva {elapsed:.0f}s en ejecutando (> {_COMMAND_TIMEOUT}s). Marcando como error...")
+                                update_command_status(cmd_id, "error_local")
                 except Exception as e:
                     log(f"Error verificando timeout de {cmd_id}: {e}")
+                
+                # ─── CRÍTICO: Si está en ejecución y no ha vencido el timeout, saltamos para dejar que continúe ───
+                continue
 
             try:
                 if status_actual == 'pendiente':

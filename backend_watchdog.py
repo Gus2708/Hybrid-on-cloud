@@ -31,7 +31,12 @@ def is_alive(pid):
             ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(ec))
             ctypes.windll.kernel32.CloseHandle(h)
             return ok and ec.value == 259
-        return False
+        else:
+            err = ctypes.windll.kernel32.GetLastError()
+            # 5 es ERROR_ACCESS_DENIED. Si da acceso denegado, el proceso está vivo
+            if err == 5:
+                return True
+            return False
     except: return False
 
 def get_wmi():

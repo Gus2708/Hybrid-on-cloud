@@ -5,6 +5,7 @@ import struct
 import sys
 import time
 from datetime import date, datetime, timedelta
+from lock_util import safe_replace
 
 base = r"h:\HybridLite\HybridEmpresa\HybridDataBase"
 
@@ -66,18 +67,33 @@ def should_extract(dat_filename, csv_filename):
     dat_path = os.path.join(base, dat_filename)
     if not os.path.exists(dat_path): return False
     if not os.path.exists(csv_filename): return True
-    return os.path.getmtime(dat_path) > os.path.getmtime(csv_filename) + 2
+    return os.path.getmtime(dat_path) > os.path.getmtime(csv_filename)
 
-def run_extraction():
+def load_existing_csv_simple(csv_path, key_idx=0):
+    rows_dict = {}
+    if not os.path.exists(csv_path):
+        return rows_dict
+    try:
+        with open(csv_path, "r", encoding="utf-8-sig") as f:
+            reader = csv.reader(f)
+            header = next(reader, None) # Saltar cabecera
+            if not header:
+                return rows_dict
+            for r in reader:
+                if len(r) > key_idx:
+                    key = r[key_idx].strip()
+                    if key:
+                        rows_dict[key] = r
+    except Exception as e:
+        print(f"Error cargando CSV existente {csv_path}: {e}")
+    return rows_dict
+
+def run_extraction(force=False):
     # ─── Verificar unidad de red antes de operar ───────────────────────────
     test_path = os.path.join(base, "TInventario.dat")
     if not os.path.exists(test_path):
         print("  [DRIVE] Unidad H: no disponible. Abortando extracción de ventas.")
         return False
-
-    # Solo extraer ventas de los últimos 90 días para evitar procesar
-    # años de datos históricos y consumir memoria innecesariamente
-    CORTE_FECHA = (datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d')
 
     # Lista de tareas: (DAT, CSV, Columnas)
     tasks = [
@@ -97,8 +113,14 @@ def run_extraction():
     any_extracted = False
     payments_map = None
     
+    # ─── Determinar si las ventas cambiaron (cabecera o detalle) ───
+    ventas_changed = should_extract("TTransaccionvta.dat", "VENTAS_CABECERA.csv") or should_extract("TDetalleVta.dat", "VENTAS_DETALLE.csv")
+    
     for dat, csv_f, cols in tasks:
-        if should_extract(dat, csv_f):
+        is_venta = dat in ["TTransaccionvta.dat", "TDetalleVta.dat"]
+        need_extract = (ventas_changed if is_venta else should_extract(dat, csv_f)) or force
+        
+        if need_extract:
             filepath = os.path.join(base, dat)
             tmp_filename = csv_f + ".tmp"
             
@@ -119,79 +141,111 @@ def run_extraction():
                 idx_hora = next((i for i, c in enumerate(cols) if c == "THT_HORA"), -1)
                 idx_id_unico = next((i for i, c in enumerate(cols) if c == "THT_IDUNICO"), -1)
 
-                # Columnas de salida (agregamos metodo_pago y fecha_hora_completa al CSV)
+                # Columnas de salida
                 out_cols = cols.copy()
                 if dat == "TTransaccionvta.dat":
                     out_cols.append("METODO_PAGO")
                     out_cols.append("FECHA_HORA_COMPLETA")
 
+                # Cargar datos existentes si es incremental
+                existing_data = {}
+                is_incremental = False
+                total_rows = db._total_rows + db._deleted_rows
+
+                if not force and os.path.exists(csv_f):
+                    existing_data = load_existing_csv_simple(csv_f, key_idx=0)
+                    if existing_data and len(existing_data) > 100:
+                        is_incremental = True
+
+                start_idx = 0
+                if is_incremental:
+                    limit_n = 2000 if dat == "TDetalleVta.dat" else 1000
+                    if total_rows > limit_n:
+                        start_idx = total_rows - limit_n
+                        print(f"  [INCREMENTAL] {dat}: Extrayendo últimos {limit_n} registros (de {total_rows})...")
+
+                if total_rows > 2_000_000:
+                    print(f"  ! {dat}: {total_rows} filas reportadas (>2M). Posible corrupción. Abortando.")
+                    raise Exception("Demasiadas filas — archivo corrupto o infinito")
+
+                # Recolectar o actualizar registros
+                new_rows = []
+                for i in range(start_idx, total_rows):
+                    row = db.row(i)
+                    if row is None: continue # Fila eliminada
+
+                    # Lógica de filtrado: Solo Facturas (11) y No Anuladas (Status != 4)
+                    if idx_tipo != -1:
+                        tipo_val = str(row[col_indices[idx_tipo]]).strip()
+                        if tipo_val != "11": continue
+                    
+                    if idx_status != -1:
+                        status_val = str(row[col_indices[idx_status]]).strip()
+                        if status_val == "4": continue
+
+                    out_row = []
+                    for col_idx in col_indices:
+                        val = row[col_idx] if col_idx != -1 else ''
+                        if isinstance(val, date): val = val.strftime('%Y-%m-%d')
+                        elif val == 'Fail': val = ''
+                        out_row.append(val)
+                    
+                    # Lógica especial para VENTAS_CABECERA
+                    if dat == "TTransaccionvta.dat":
+                        id_unico = row[col_indices[idx_id_unico]] if idx_id_unico != -1 else None
+                        metodo = payments_map.get(id_unico, "EFECTIVO") if id_unico else "EFECTIVO"
+                        out_row.append(metodo)
+                        
+                        fecha_str = out_row[idx_fecha] if idx_fecha != -1 else ""
+                        hora_str = "00:00:00"
+                        if idx_hora != -1:
+                            col_obj = db._columns[col_indices[idx_hora]]
+                            row_offset = db._data_offset + (i * db._row_size)
+                            field_data = db._data[row_offset + col_obj.row_offset : row_offset + col_obj.row_offset + 4]
+                            ms_val = struct.unpack("<I", field_data)[0]
+                            hora_str = decode_dbisam_time(ms_val)
+                        
+                        full_ts = f"{fecha_str} {hora_str}-04:00"
+                        out_row.append(full_ts)
+
+                    # Si es incremental, actualizamos el diccionario en memoria
+                    if is_incremental:
+                        key = str(out_row[0]).strip()
+                        if key:
+                            existing_data[key] = out_row
+                    else:
+                        new_rows.append(out_row)
+
+                # Guardar el CSV resultante
                 with open(tmp_filename, 'w', newline='', encoding='utf-8-sig') as f:
                     writer = csv.writer(f)
                     writer.writerow(out_cols)
-                    valid_rows = 0
                     
-                    total_rows = db._total_rows + db._deleted_rows
-                    if total_rows > 2_000_000:
-                        print(f"  ! {dat}: {total_rows} filas reportadas (>2M). Posible corrupción. Abortando.")
-                        raise Exception("Demasiadas filas — archivo corrupto o infinito")
-                    for i in range(total_rows):
-                        row = db.row(i)
-                        if row is None: continue # Fila eliminada
-
-                        # Lógica de filtrado: Solo Facturas (11) y No Anuladas (Status != 4)
-                        if idx_tipo != -1:
-                            tipo_val = str(row[col_indices[idx_tipo]]).strip()
-                            if tipo_val != "11": continue
-                        
-                        if idx_status != -1:
-                            status_val = str(row[col_indices[idx_status]]).strip()
-                            if status_val == "4": continue
-
-                        # Filtrar por fecha de corte (solo ventas recientes)
-                        if idx_fecha != -1 and dat == "TTransaccionvta.dat":
-                            fecha_val = str(row[col_indices[idx_fecha]]).strip()
-                            if fecha_val and fecha_val < CORTE_FECHA:
-                                continue
-
-                        out_row = []
-                        for col_idx in col_indices:
-                            val = row[col_idx] if col_idx != -1 else ''
-                            if isinstance(val, date): val = val.strftime('%Y-%m-%d')
-                            elif val == 'Fail': val = ''
-                            out_row.append(val)
-                        
-                        # Lógica especial para VENTAS_CABECERA
-                        if dat == "TTransaccionvta.dat":
-                            # 1. Método de Pago
-                            id_unico = row[col_indices[idx_id_unico]] if idx_id_unico != -1 else None
-                            metodo = payments_map.get(id_unico, "EFECTIVO") if id_unico else "EFECTIVO"
-                            out_row.append(metodo)
-                            
-                            # 2. Fecha y Hora Completa
-                            fecha_str = out_row[idx_fecha] if idx_fecha != -1 else ""
-                            # Decodificar hora manualmente desde el buffer crudo si pydbisam falla
-                            hora_str = "00:00:00"
-                            if idx_hora != -1:
-                                col_obj = db._columns[col_indices[idx_hora]]
-                                row_offset = db._data_offset + (i * db._row_size)
-                                field_data = db._data[row_offset + col_obj.row_offset : row_offset + col_obj.row_offset + 4]
-                                ms_val = struct.unpack("<I", field_data)[0]
-                                hora_str = decode_dbisam_time(ms_val)
-                            
-                            # Combinar en ISO 8601 con offset VZLA
-                            full_ts = f"{fecha_str} {hora_str}-04:00"
-                            out_row.append(full_ts)
-
-                        writer.writerow(out_row)
-                        valid_rows += 1
+                    if is_incremental:
+                        # Escribir todos los registros fusionados en memoria
+                        for key in existing_data:
+                            writer.writerow(existing_data[key])
+                        valid_rows = len(existing_data)
+                    else:
+                        for r in new_rows:
+                            writer.writerow(r)
+                        valid_rows = len(new_rows)
                 
-                os.replace(tmp_filename, csv_f)
-                print(f"  -> {dat}: Guardado {valid_rows} registros filtrados en {csv_f}")
+                # Reemplazo seguro con reintentos
+                if safe_replace(tmp_filename, csv_f):
+                    mode_str = "Incremental" if is_incremental else "Completo"
+                    print(f"  -> {dat}: ({mode_str}) Guardado {valid_rows} registros filtrados en {csv_f}")
+                else:
+                    raise IOError(f"No se pudo reemplazar {csv_f} debido a bloqueos de archivos en Windows.")
+                
                 any_extracted = True
             except Exception as e:
                 import traceback
                 traceback.print_exc()
                 print(f"Error procesando {dat}: {e}")
+                if os.path.exists(tmp_filename):
+                    try: os.remove(tmp_filename)
+                    except: pass
             finally:
                 if db is not None:
                     del db
@@ -203,4 +257,6 @@ def run_extraction():
     return any_extracted
 
 if __name__ == '__main__':
-    run_extraction()
+    force = len(sys.argv) > 1 and sys.argv[1] == "force"
+    run_extraction(force=force)
+

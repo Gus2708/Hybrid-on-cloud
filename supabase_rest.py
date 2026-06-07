@@ -34,7 +34,7 @@ def _build_headers() -> dict:
         "apikey": ANON_KEY,
         "Authorization": f"Bearer {ANON_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates",
+        "Prefer": "return=minimal,resolution=merge-duplicates",
     }
 
 
@@ -102,6 +102,7 @@ def upsert_batch_rest(rows: list, table: str = "productos") -> bool:
             "descripcion":     r.get("DESCRIPCION",    r.get("descripcion", "")),
             "unidad":          r.get("UNIDAD",         r.get("unidad", "")),
             "codigo_barras":   r.get("CODIGO_BARRAS",  r.get("codigo_barras", "")),
+            "referencia":      r.get("REFERENCIA",     r.get("referencia", "")),
             "costo":           r.get("COSTO",          r.get("costo", 0.0)),
             "precio_venta":    r.get("PRECIO_VENTA",   r.get("precio_venta", 0.0)),
             "existencia":      r.get("EXISTENCIA",     r.get("existencia", 0.0)),

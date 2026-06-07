@@ -34,7 +34,7 @@ HEADERS = {
     "apikey": SUPABASE_ANON_KEY,
     "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
     "Content-Type": "application/json",
-    "Prefer": "resolution=merge-duplicates",
+    "Prefer": "return=minimal,resolution=merge-duplicates",
 }
 
 def _kill_proc(proc):
@@ -45,13 +45,16 @@ def _kill_proc(proc):
             proc.wait(timeout=5)
     except: pass
 
-def run_exporter():
+def run_exporter(force=False):
     print("[SYNC VENTAS] -> Evaluando extracción selectiva...")
     if not os.path.exists(EXPORTER_SCRIPT):
         print(f"[SYNC VENTAS] ! Script no encontrado: {EXPORTER_SCRIPT}")
         return False
+    args = [sys.executable, EXPORTER_SCRIPT]
+    if force:
+        args.append("force")
     proc = subprocess.Popen(
-        [sys.executable, EXPORTER_SCRIPT],
+        args,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         creationflags=0x08000000
     )
@@ -169,7 +172,7 @@ def sync_incremental(force=False):
         print("[SYNC VENTAS] ! ERROR: Unidad de red H: no accesible. Abortando.")
         return
 
-    if not run_exporter(): return
+    if not run_exporter(force=force): return
 
 
     # ─── Validar CSV antes de procesar ─────────────────────────────────────
@@ -291,18 +294,22 @@ def sync_incremental(force=False):
                         cloud_id = cached_data[1]
                         ventas_map_ids[local_id] = cloud_id
                         new_entity_cache[pk] = [h, cloud_id]
-                    
-                    to_upsert.append((local_id, mapped))
+                    else:
+                        to_upsert.append((local_id, mapped))
                     
                     if len(to_upsert) >= 500:
                         print(f"  [SYNC VENTAS] Upserting batch of {len(to_upsert)} sales...")
                         payload = [item[1] for item in to_upsert]
                         results = upsert_with_response("ventas", "id_unico", payload)
-                        for i, res in enumerate(results):
-                            lid = to_upsert[i][0]
-                            cid = res["id"]
-                            ventas_map_ids[lid] = cid
-                            new_entity_cache[str(payload[i]["id_unico"])] = [get_hash(payload[i]), cid]
+                        res_map = {r["id_unico"]: r["id"] for r in results if "id_unico" in r and "id" in r}
+                        for lid, mapped_item in to_upsert:
+                            uid = mapped_item["id_unico"]
+                            cid = res_map.get(uid)
+                            if cid is not None:
+                                ventas_map_ids[lid] = cid
+                                new_entity_cache[str(uid)] = [get_hash(mapped_item), cid]
+                            else:
+                                print(f"  [WARN] No se obtuvo cloud_id para id_unico {uid}")
                         to_upsert = []
                 except Exception as e: 
                     print(f"  [ERROR VENTA] doc {row.get('THT_DOCUMENTO')}: {e}")
@@ -312,11 +319,15 @@ def sync_incremental(force=False):
                 print(f"  [SYNC VENTAS] Upserting final batch of {len(to_upsert)} sales...")
                 payload = [item[1] for item in to_upsert]
                 results = upsert_with_response("ventas", "id_unico", payload)
-                for i, res in enumerate(results):
-                    lid = to_upsert[i][0]
-                    cid = res["id"]
-                    ventas_map_ids[lid] = cid
-                    new_entity_cache[str(payload[i]["id_unico"])] = [get_hash(payload[i]), cid]
+                res_map = {r["id_unico"]: r["id"] for r in results if "id_unico" in r and "id" in r}
+                for lid, mapped_item in to_upsert:
+                    uid = mapped_item["id_unico"]
+                    cid = res_map.get(uid)
+                    if cid is not None:
+                        ventas_map_ids[lid] = cid
+                        new_entity_cache[str(uid)] = [get_hash(mapped_item), cid]
+                    else:
+                        print(f"  [WARN] No se obtuvo cloud_id para id_unico {uid}")
             
             print(f"  [SYNC VENTAS] Total sales in mapping: {len(ventas_map_ids)}")
             cache["ventas"] = new_entity_cache
@@ -392,13 +403,28 @@ def sync_incremental(force=False):
     
     # 🔍 RECONCILIACIÓN AUTOMÁTICA (Audit)
     # Solo si no hubo errores críticos y estamos en modo completo
-    # reconcile_ventas() # ⚠️ DESHABILITADO: Está borrando historial de más de 90 días
+    reconcile_ventas(force=force)
 
 _MIN_SAFE_IDS = 10
 
-def reconcile_ventas():
-    """Busca registros en Supabase que ya no existen en los CSV locales y los elimina."""
+def reconcile_ventas(force: bool = False):
+    """Busca registros en Supabase que ya no existen en los CSV locales y los elimina (con cooldown de 12h)."""
+    # Verificar cooldown de 12 horas
+    last_reconcile_time = 0.0
+    last_reconcile_file = os.path.join(BASE_DIR, "ventas_last_reconcile.json")
+    if os.path.exists(last_reconcile_file):
+        try:
+            with open(last_reconcile_file, 'r') as f:
+                last_reconcile_time = json.load(f).get("last_reconcile", 0.0)
+        except: pass
+    
+    now = time.time()
+    if not force and (now - last_reconcile_time < 12 * 3600):
+        print(f"[AUDIT] La última reconciliación de ventas fue hace menos de 12 horas. Saltando reconciliación.")
+        return
+
     try:
+        reconciled_any = False
         # 1. Reconciliar VENTAS (Cabecera) usando id_unico
         if os.path.exists("VENTAS_CABECERA.csv"):
             print("[AUDIT] Verificando integridad de Ventas...")
@@ -411,6 +437,7 @@ def reconcile_ventas():
                       f"Posible unidad H: caída. No se eliminarán registros remotos.")
             elif delete_orphans_generic("ventas", "id_unico", list(local_ids)):
                 print("[AUDIT] Reconciliación de Ventas completada.")
+                reconciled_any = True
 
         # 2. Reconciliar DETALLES usando id (HybridLite autoincrement)
         if os.path.exists("VENTAS_DETALLE.csv"):
@@ -423,6 +450,13 @@ def reconcile_ventas():
                       f"Posible unidad H: caída. No se eliminarán registros remotos.")
             elif delete_orphans_generic("ventas_detalle", "id", list(local_ids)):
                 print("[AUDIT] Reconciliación de Detalles completada.")
+                reconciled_any = True
+                
+        if reconciled_any or not os.path.exists(last_reconcile_file):
+            try:
+                with open(last_reconcile_file, 'w') as f:
+                    json.dump({"last_reconcile": now}, f)
+            except: pass
     except Exception as e:
         print(f"[AUDIT] Error: {e}")
 
@@ -467,6 +501,14 @@ def delete_orphans_generic(table: str, pk_col: str, valid_ids: list) -> bool:
             print(f"  [OK] No se detectaron huérfanos en {table}.")
             return True
 
+        # 🛡️ Salvaguarda inteligente contra eliminación masiva accidental
+        total_cloud = len(cloud_ids)
+        if total_cloud > 100 and len(orphans) > 200 and (len(orphans) / total_cloud) > 0.05:
+            print(f"  [ABORT] Salvaguarda de Seguridad: Detectados demasiados huérfanos para eliminar "
+                  f"({len(orphans)} de {total_cloud}, {len(orphans)/total_cloud*100:.1f}%). "
+                  f"Posible error local o corrupción del CSV. Operación cancelada para proteger la nube.")
+            return False
+
         print(f"  [!] Detectados {len(orphans)} registros huérfanos en {table}. Eliminando...")
         batch_size = 100
         for i in range(0, len(orphans), batch_size):
@@ -474,11 +516,6 @@ def delete_orphans_generic(table: str, pk_col: str, valid_ids: list) -> bool:
             ids_str = ",".join(map(str, batch))
             del_url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/{table}?{pk_col}=in.({ids_str})"
             _retry_http(del_url, method="DELETE", timeout=20)
-        
-        # 💡 Si borramos huérfanos, el caché local ya no es fiable.
-        if os.path.exists(CACHE_FILE):
-            try: os.remove(CACHE_FILE)
-            except: pass
             
         return True
 
