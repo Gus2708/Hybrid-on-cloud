@@ -42,7 +42,11 @@ KillOurProcesses "python.exe"
 WScript.Sleep 2000
 
 ' Iniciar el Watchdog (él se encargará de iniciar el resto)
-WshShell.Run "pythonw backend_watchdog.py", 0, False
+' Ruta ABSOLUTA obligatoria: con ruta relativa la línea de comandos del
+' watchdog no contiene scriptDir y KillOurProcesses nunca lo encuentra,
+' dejando watchdogs viejos vivos tras cada reinicio.
+WshShell.CurrentDirectory = scriptDir
+WshShell.Run "pythonw """ & scriptDir & "\backend_watchdog.py""", 0, False
 
 
 ' Limpiar lock
