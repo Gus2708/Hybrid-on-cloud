@@ -7,6 +7,14 @@ __pycache__/
 *.Dat
 *.json
 *.log
+*.log.1
+*.log.old
+*.lock
+*.tmp
+*.bak
 .agents/
 .gemini/
 tests/.pytest_cache/
+# Junctions hacia .agents/ (ya ignorado); committearlos duplicaría su contenido
+.claude/skills/
+skills/improve/

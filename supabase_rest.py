@@ -16,11 +16,19 @@ except Exception:
     _REST_URL = ""
     _ANON_KEY = ""
 
+# SUPABASE_SERVICE_KEY es opcional: si config.py no la expone (versión vieja del
+# archivo) o falla el import, seguimos igual que siempre con la anon key.
+try:
+    from config import SUPABASE_SERVICE_KEY as _SERVICE_KEY
+except Exception:
+    _SERVICE_KEY = ""
+
 REST_URL = os.environ.get("SUPABASE_REST_URL", _REST_URL) or ""
 ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", _ANON_KEY) or ""
+SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", _SERVICE_KEY) or ""
 
 # Debug sin imprimir secretos
-print(f"[SUPABASE REST] REST_URL configurado: {bool(REST_URL)} | ANON_KEY configurado: {bool(ANON_KEY)}")
+print(f"[SUPABASE REST] REST_URL configurado: {bool(REST_URL)} | ANON_KEY configurado: {bool(ANON_KEY)} | SERVICE_KEY configurado: {bool(SERVICE_KEY)}")
 
 # requests es opcional — urllib es el fallback stdlib
 try:
@@ -30,12 +38,38 @@ except ImportError:
 
 
 def _build_headers() -> dict:
+    """
+    Headers para escritura (upsert/delete) en este módulo.
+    'apikey' siempre es la ANON key (así lo espera PostgREST). 'Authorization'
+    usa la SERVICE_KEY si está configurada (escritura elevada); si no, cae a
+    la ANON key, que es el comportamiento actual sin cambios.
+    """
+    write_key = SERVICE_KEY or ANON_KEY
     return {
         "apikey": ANON_KEY,
-        "Authorization": f"Bearer {ANON_KEY}",
+        "Authorization": f"Bearer {write_key}",
         "Content-Type": "application/json",
         "Prefer": "return=minimal,resolution=merge-duplicates",
     }
+
+
+def build_write_headers(extra_prefer: str = None) -> dict:
+    """
+    Helper reutilizable para que otros módulos (sync_ventas, remote_listener,
+    rates_service, etc.) construyan headers de ESCRITURA con el mismo patrón:
+    'apikey' = ANON_KEY, 'Authorization' = SERVICE_KEY si existe, si no ANON_KEY.
+
+    extra_prefer: valor opcional para el header 'Prefer' (por defecto
+    'return=minimal,resolution=merge-duplicates', igual que _build_headers()).
+    """
+    write_key = SERVICE_KEY or ANON_KEY
+    headers = {
+        "apikey": ANON_KEY,
+        "Authorization": f"Bearer {write_key}",
+        "Content-Type": "application/json",
+        "Prefer": extra_prefer or "return=minimal,resolution=merge-duplicates",
+    }
+    return headers
 
 
 def _upsert_with_requests(url: str, payload: list) -> bool:

@@ -23,7 +23,11 @@ def clear_stale_locks():
                         print(f"[LOCK] Lock huérfano (PID {old_pid}) limpiado en inicio.")
                 else:
                     os.remove(p)
-            except: os.remove(p)
+            except Exception:
+                # Si el lock no se puede leer/borrar (p.ej. bloqueado por otro
+                # proceso), no reventar el import: acquire_lock lo reintentará.
+                try: os.remove(p)
+                except Exception: pass
     for tmp in glob.glob(os.path.join(base, "*.tmp")):
         try:
             if time.time() - os.path.getmtime(tmp) > 60:

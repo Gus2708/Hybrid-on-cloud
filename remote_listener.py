@@ -52,18 +52,33 @@ except ImportError:
 log("=== Iniciando Listener de Comandos Remotos v2.4 ===")
 log(f"Conectado a: {SUPABASE_REST_URL}")
 
-HEADERS = {
-    "apikey": SUPABASE_ANON_KEY,
-    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=minimal"
-}
+# HEADERS de escritura (PATCH de status en comandos_remotos): usa
+# SUPABASE_SERVICE_KEY si está configurada (vía build_write_headers en
+# supabase_rest.py), si no cae al comportamiento actual con la anon key.
+# try/except porque este listener debe seguir funcionando aunque falle el
+# import (p.ej. supabase_rest.py roto o ausente).
+try:
+    from supabase_rest import build_write_headers
+    HEADERS = build_write_headers(extra_prefer="return=minimal")
+except Exception:
+    HEADERS = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
+
+_consec_net_fails = 0
 
 def get_pending_commands():
+    global _consec_net_fails
     url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/comandos_remotos?status=in.(pendiente,ejecutando)&select=id,comando,status"
     req = urllib.request.Request(url, headers=HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
+            if _consec_net_fails >= 3:
+                log("Conexión con Supabase recuperada.")
+            _consec_net_fails = 0
             return json.loads(response.read().decode('utf-8'))
     except urllib.error.HTTPError as e:
         if e.code == 401:
@@ -78,7 +93,11 @@ def get_pending_commands():
             log(f"HTTP Error al buscar comandos: {e.code} - {body or e.reason}")
         return []
     except Exception as e:
-        log(f"Error inesperado buscando comandos: {repr(e)}")
+        # Sin internet este error se repite cada 10s: loguear las primeras
+        # veces y luego 1 de cada 30 (~5 min) para no inflar el log
+        _consec_net_fails += 1
+        if _consec_net_fails <= 3 or _consec_net_fails % 30 == 0:
+            log(f"Error de red buscando comandos ({_consec_net_fails} seguidos): {repr(e)}")
         return []
 
 def update_command_status(cmd_id, status):
@@ -127,6 +146,7 @@ def execute_local_sync(comando):
         log(f"Ejecutando script internamente: {script_name}...")
         from lock_util import acquire_lock
 
+        ok = True
         with acquire_lock(timeout=30):
             if comando == "sync_all":
                 import sync
@@ -134,18 +154,18 @@ def execute_local_sync(comando):
                 import importlib
                 importlib.reload(sync)
                 importlib.reload(sync_ventas)
-                sync.sync_incremental()
-                sync_ventas.sync_incremental()
+                ok = sync.sync_incremental() is not False
+                ok = (sync_ventas.sync_incremental() is not False) and ok
             elif comando == "sync_inventory":
                 import sync
                 import importlib
                 importlib.reload(sync)
-                sync.sync_incremental()
+                ok = sync.sync_incremental() is not False
             elif comando == "sync_sales":
                 import sync_ventas
                 import importlib
                 importlib.reload(sync_ventas)
-                sync_ventas.sync_incremental()
+                ok = sync_ventas.sync_incremental() is not False
             else:
                 exe = sys.executable
                 creation_flags = 0x08000000
@@ -157,8 +177,11 @@ def execute_local_sync(comando):
                     if os.path.exists(pw): exe = pw
                 subprocess.run([exe, script_name, "once"], check=True, creationflags=creation_flags, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        log(f"Script {script_name} finalizado con exito.")
-        return True
+        if ok:
+            log(f"Script {script_name} finalizado con exito.")
+        else:
+            log(f"Script {script_name} termino con errores (¿sin conexion o unidad H: caida?).")
+        return ok
     except subprocess.CalledProcessError as e:
         log(f"Error ejecutando script {script_name}: {repr(e)}")
         return False

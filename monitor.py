@@ -116,15 +116,19 @@ class SyncTriggerHandler(FileSystemEventHandler):
                         import sync_ventas
                         import importlib
                         importlib.reload(sync_ventas)
-                        sync_ventas.sync_incremental()
+                        ok = sync_ventas.sync_incremental() is not False
                     else:
                         import sync
                         import importlib
                         importlib.reload(sync)
-                        sync.sync_incremental()
-                
-                self.last_sync_time[sync_type] = time.time()
-                log_monitor(f"OK: Sincronización {sync_type} finalizada.")
+                        ok = sync.sync_incremental() is not False
+
+                if ok:
+                    self.last_sync_time[sync_type] = time.time()
+                    log_monitor(f"OK: Sincronización {sync_type} finalizada.")
+                else:
+                    # No actualizar last_sync_time: el self-heal periódico reintentará
+                    log_monitor(f"WARN: Sincronización {sync_type} incompleta (¿sin conexión?). Se reintentará automáticamente.")
             except Exception as e:
                 log_monitor(f"ERROR en sync ({sync_type}): {e}")
 
@@ -151,55 +155,129 @@ def log_monitor(message):
             f.write(f"[{timestamp}] {message}\n")
     except: pass
 
-def auto_heal_startup(sync_handler: SyncTriggerHandler):
+RATE_REFRESH_INTERVAL = 15 * 60  # 15 minutos
+
+def rate_refresh_worker():
+    """Thread daemon que actualiza tasas BCV y Binance en Supabase cada 15 minutos."""
+    log_monitor("Rate refresh thread iniciado (intervalo: 15 min).")
+    while True:
+        try:
+            from rates_service import RatesService
+            service = RatesService()
+            rates = service.get_all_rates()
+            if service.save_to_db(rates):
+                log_monitor(f"Tasas actualizadas: BCV={rates.get('bcv_usd', 0):.2f}, Binance={rates.get('binance_p2p', 0):.2f}")
+            else:
+                log_monitor("Error al guardar tasas en Supabase.")
+        except Exception as e:
+            log_monitor(f"Error en rate refresh: {e}")
+        time.sleep(RATE_REFRESH_INTERVAL)
+
+
+def start_rate_refresh_thread():
+    """Inicia el thread de actualización de tasas como daemon."""
+    t = threading.Thread(target=rate_refresh_worker, daemon=True, name="rate-refresh")
+    t.start()
+    return t
+
+
+_HEAL_INTERVAL = 30 * 60  # re-verificación periódica de integridad (30 min)
+_heal_was_ok = True       # para alertar solo en la transición OK → discrepancia
+
+
+def auto_heal_check(sync_handler: SyncTriggerHandler) -> bool:
     """
-    Verifica si hay discrepancias al iniciar y ejecuta la sincronización
-    rápida por hashes automáticamente (Self-Healing).
+    Una pasada de Self-Healing: consulta /sync/status y dispara los syncs
+    necesarios. Devuelve True si logró verificar, False si la API no respondió.
     """
-    log_monitor("Iniciando rutina de Auto-Healing...")
-    # Esperar hasta que app.py esté disponible (máx 30 segs)
-    for _ in range(6):
+    global _heal_was_ok
+    for _ in range(3):
         try:
             req = urllib.request.Request("http://localhost:5000/api/v1/sync/status")
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
-                
-                # Chequeamos si el status general es "ok"
-                if data.get("status") == "ok":
-                    log_monitor("✅ Auto-Healing: Integridad de datos correcta.")
-                    return
-                
-                log_monitor("⚠️ Auto-Healing: Discrepancias detectadas. Evaluando módulos...")
-                
-                entities = data.get("entities", {})
-                
-                # Check Inventario/Productos
-                prod_ok = entities.get("productos", {}).get("ok", True)
-                if not prod_ok:
-                    log_monitor("  -> Discrepancia en Inventario. Solicitando sync automático...")
-                    sync_handler.run_sync("Auto-Healing Startup", "inventario")
-                
-                # Check Ventas/Detalles/Clientes
-                ventas_ok = entities.get("ventas", {}).get("ok", True)
-                detalle_ok = entities.get("detalle", {}).get("ok", True)
-                clientes_ok = entities.get("clientes", {}).get("ok", True)
-                
-                if not (ventas_ok and detalle_ok and clientes_ok):
-                    log_monitor("  -> Discrepancia en Ventas/Clientes. Solicitando sync automático...")
-                    sync_handler.run_sync("Auto-Healing Startup", "ventas")
-                
-                return # Salimos del bucle si logramos verificar
         except Exception:
-            time.sleep(5) # Esperar a que app.py inicie
-    
-    log_monitor("⚠️ Auto-Healing: No se pudo contactar a la API de estado para verificar.")
+            time.sleep(5)  # Esperar a que app.py inicie/responda
+            continue
+
+        if data.get("is_syncing"):
+            log_monitor("Self-Healing: hay un sync en curso; se verificará en el próximo ciclo.")
+            return True
+
+        if data.get("status") == "ok":
+            if not _heal_was_ok:
+                log_monitor("✅ Self-Healing: Integridad de datos recuperada.")
+            _heal_was_ok = True
+            return True
+
+        log_monitor("⚠️ Self-Healing: Discrepancias detectadas. Evaluando módulos...")
+        first_failure = _heal_was_ok
+        _heal_was_ok = False
+        entities = data.get("entities", {})
+
+        # Check Inventario/Productos
+        if not entities.get("productos", {}).get("ok", True):
+            log_monitor("  -> Discrepancia en Inventario. Solicitando sync automático...")
+            sync_handler.run_sync("Self-Healing", "inventario")
+            if first_failure:
+                try:
+                    from alert_util import send_alert
+                    send_alert("warning", "Self-Healing: Discrepancia en Inventario detectada. Sync automático iniciado.")
+                except Exception:
+                    pass
+
+        # Check Ventas/Detalles/Clientes
+        ventas_ok = entities.get("ventas", {}).get("ok", True)
+        detalle_ok = entities.get("detalle", {}).get("ok", True)
+        clientes_ok = entities.get("clientes", {}).get("ok", True)
+
+        if not (ventas_ok and detalle_ok and clientes_ok):
+            log_monitor("  -> Discrepancia en Ventas/Clientes. Solicitando sync automático...")
+            sync_handler.run_sync("Self-Healing", "ventas")
+            if first_failure:
+                try:
+                    from alert_util import send_alert
+                    send_alert("warning", "Self-Healing: Discrepancia en Ventas/Clientes detectada. Sync automático iniciado.")
+                except Exception:
+                    pass
+
+        return True
+    return False
+
+
+def self_heal_worker(sync_handler: SyncTriggerHandler, heal_event: threading.Event):
+    """
+    Thread daemon: verifica integridad al arrancar y luego cada 30 minutos
+    (o inmediatamente cuando heal_event se activa, p.ej. al reconectar H:).
+    Esto garantiza que un sync fallido por corte de internet/red se reintente
+    solo, sin esperar un nuevo cambio en los .DAT ni reiniciar la PC.
+    """
+    time.sleep(30)  # dar tiempo a que app.py levante
+    log_monitor(f"Self-Healing periódico iniciado (cada {_HEAL_INTERVAL // 60} min).")
+    while True:
+        try:
+            if check_drive(WATCH_DIR):
+                if not auto_heal_check(sync_handler):
+                    log_monitor("⚠️ Self-Healing: No se pudo contactar a la API de estado para verificar.")
+            else:
+                log_monitor("Self-Healing: Unidad H: no disponible; se reintentará en el próximo ciclo.")
+        except Exception as e:
+            log_monitor(f"Error en self-heal: {repr(e)}")
+        heal_event.wait(timeout=_HEAL_INTERVAL)
+        heal_event.clear()
 
 def start_monitor():
     log_monitor(f"Iniciando monitoreo en: {WATCH_DIR}")
     _drive_was_offline = False
-    _needs_auto_heal = True
     last_heartbeat = 0
-    
+
+    # Handler persistente: sobrevive a reconexiones de H: y conserva cooldowns/timers
+    event_handler = SyncTriggerHandler()
+    heal_event = threading.Event()
+    threading.Thread(target=self_heal_worker, args=(event_handler, heal_event),
+                     daemon=True, name="self-heal").start()
+    start_rate_refresh_thread()
+
     while True:
         now = time.time()
         
@@ -221,19 +299,13 @@ def start_monitor():
                 if not _drive_was_offline:
                     log_monitor(f"⚠️ Unidad H: NO DISPONIBLE. Esperando reconexión...")
                     _drive_was_offline = True
-                    _needs_auto_heal = True
                 time.sleep(10)
                 continue
-            
-            if _drive_was_offline:
-                log_monitor("✅ Unidad H: RECONECTADA.")
-                _drive_was_offline = False
 
-            event_handler = SyncTriggerHandler()
-            
-            if _needs_auto_heal:
-                threading.Thread(target=auto_heal_startup, args=(event_handler,), daemon=True).start()
-                _needs_auto_heal = False
+            if _drive_was_offline:
+                log_monitor("✅ Unidad H: RECONECTADA. Verificando integridad...")
+                _drive_was_offline = False
+                heal_event.set()  # disparar self-heal inmediato tras la reconexión
 
             observer = Observer()
             observer.schedule(event_handler, WATCH_DIR, recursive=False)

@@ -1,11 +1,12 @@
-Flask>=2.3.0
-requests
-python-dotenv
-pytest
-pytest-flask
-pytest-mock
-responses
-Pillow
-pystray
-beautifulsoup4
-pywin32
+# Dependencias de producción — versiones capturadas 2026-06-20 con Python 3.14
+Flask==3.1.3
+flask-cors==6.0.2
+requests==2.33.1
+python-dotenv==1.2.2
+Pillow==12.2.0
+pystray==0.19.5
+beautifulsoup4==4.14.3
+pywin32==312
+watchdog==6.0.0
+pydbisam==1.2.1
+waitress==3.0.2

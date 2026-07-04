@@ -31,19 +31,37 @@ if _env_path.exists():
             pass
 
 # ─── Supabase (cliente Python supabase-py) ───────────────────────────────────
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://YOUR-PROJECT-REF.supabase.co")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_91qCibM40mWzij-bW5bQyA_xkGA3fsj")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
 # ─── Supabase REST API (fallback sin supabase-py) ────────────────────────────
 # SUPABASE_REST_URL: URL base del proyecto (misma que SUPABASE_URL)
 # SUPABASE_ANON_KEY: anon/public JWT — se obtiene en Supabase > Settings > API
-SUPABASE_REST_URL = os.environ.get("SUPABASE_REST_URL", "https://YOUR-PROJECT-REF.supabase.co")
-SUPABASE_ANON_KEY = os.environ.get(
-    "SUPABASE_ANON_KEY",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-    "REDACTED-JWT-PAYLOAD."
-    "REDACTED-JWT-SIGNATURE"
-)
+# Configurar en .env (ver .env.example)
+SUPABASE_REST_URL = os.environ.get("SUPABASE_REST_URL", "")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+
+# SUPABASE_SERVICE_KEY: clave service_role (opcional). Si está presente, las
+# operaciones de ESCRITURA (INSERT/UPDATE/DELETE) la usan en vez de la anon key,
+# lo que permite endurecer las políticas RLS (ver sql/harden_rls.sql) sin dejar
+# de leer con anon. Es opcional: si falta, todo sigue funcionando igual que hoy
+# con la anon key para lectura y escritura, por eso NO se advierte si está vacía.
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
+if not SUPABASE_REST_URL or not SUPABASE_ANON_KEY:
+    print("[CONFIG] ADVERTENCIA: SUPABASE_REST_URL y/o SUPABASE_ANON_KEY no configurados.")
+    print("[CONFIG] Crear/verificar el archivo .env con las credenciales del proyecto Supabase.")
+
+# ─── Alertas (opcional) ───────────────────────────────────────────────────────
+# URL de webhook para alertas de sync. Vacío = alertas deshabilitadas.
+ALERT_WEBHOOK_URL = os.environ.get("ALERT_WEBHOOK_URL", "")
+
+# ─── Auth para endpoints de sync ─────────────────────────────────────────────
+# Header X-API-Key requerido en /api/v1/sync/*. Vacío = sin restricción (solo desarrollo).
+SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "")
+
+# ─── CORS ─────────────────────────────────────────────────────────────────────
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "http://localhost:5000,http://127.0.0.1:5000").split(",") if o.strip()]
 
 # ─── Tasa de cambio USD → Bolívares ──────────────────────────────────────────
 # Actualizar con la tasa actual. Se puede pasar como var de entorno TASA_BS.

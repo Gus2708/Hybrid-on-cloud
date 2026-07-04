@@ -18,30 +18,12 @@ except ImportError:
 
 from supabase_rest import upsert_batch_rest, get_row_count_rest, delete_orphans_rest
 from rates_service import RatesService
-
-def set_priority_low():
-    """Establece prioridad baja para no impactar el rendimiento de Windows."""
-    if sys.platform == "win32":
-        try:
-            import win32api, win32process, win32con
-            pid = win32api.GetCurrentProcessId()
-            handle = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, True, pid)
-            win32process.SetPriorityClass(handle, win32process.BELOW_NORMAL_PRIORITY_CLASS)
-        except: pass
+from sync_utils import safe_decimal, set_priority_low, _kill_proc
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EXPORTER_SCRIPT = os.path.join(BASE_DIR, "actualizar_inventario.py")
 CACHE_FILE = os.path.join(BASE_DIR, "sync_cache.json")
 LAST_SYNC_FILE = os.path.join(BASE_DIR, "last_sync.json")
-
-def _kill_proc(proc):
-    """Mata un proceso forzadamente en Windows."""
-    try:
-        if proc.poll() is None:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=5)
-            proc.wait(timeout=5)
-    except: pass
 
 def run_hybrid_exporter(force=False):
     print(f"[SYNC] -> Evaluando extracción de inventario...")
@@ -56,7 +38,7 @@ def run_hybrid_exporter(force=False):
         creationflags=0x08000000
     )
     try:
-        stdout, stderr = proc.communicate(timeout=45)
+        stdout, stderr = proc.communicate(timeout=120)
         if proc.returncode == 0:
             for line in stdout.decode('utf-8', errors='replace').splitlines():
                 try: print(f"  {line}")
@@ -70,24 +52,12 @@ def run_hybrid_exporter(force=False):
             return False
     except subprocess.TimeoutExpired:
         _kill_proc(proc)
-        print(f"[SYNC] ! TIMEOUT (45s): exportador colgado en H:. Abortando sync.")
+        print(f"[SYNC] ! TIMEOUT (120s): exportador colgado en H:. Abortando sync.")
         return False
     except Exception as e:
         _kill_proc(proc)
         print(f"[SYNC] ! Error ejecutando exportador: {e}")
         return False
-
-def safe_decimal(val):
-    if val is None: return 0.0
-    s = str(val).strip()
-    if not s: return 0.0
-    # Manejar formato venezolano "1.500,50" -> 1500.50
-    if ',' in s and '.' in s:
-        s = s.replace('.', '').replace(',', '.')
-    elif ',' in s:
-        s = s.replace(',', '.')
-    try: return float(s)
-    except: return 0.0
 
 def _load_csv(file_path: str) -> List[Dict]:
     rows = []
@@ -122,15 +92,22 @@ def get_row_hash(row: Dict) -> str:
     return hashlib.md5(relevant_data.encode('utf-8')).hexdigest()
 
 def sync_incremental(force=False):
+    """Sincroniza inventario a Supabase. Devuelve True si terminó completo, False si abortó."""
     # Validar unidad H: antes de empezar
-    if not os.path.exists(os.path.dirname(CSV_SOURCE_PATH)):
-        print("[SYNC] ! ERROR: Unidad de red H: no accesible. Abortando.")
-        return
+    try:
+        from config import RUTA_INVENTARIO
+        from network_util import check_drive
+        if not check_drive(os.path.dirname(RUTA_INVENTARIO)):
+            print("[SYNC] ! ERROR: Unidad de red H: no accesible. Abortando.")
+            return False
+    except Exception as e:
+        print(f"[SYNC] ! No se pudo verificar unidad H:: {e}")
+        # Continuar — run_hybrid_exporter fallará si H: está caída
 
     result = run_hybrid_exporter(force=force)
     if result is False:
         print("[SYNC] Extracción fallida (unidad de red probablemente caída). Abortando sync.")
-        return
+        return False
 
 
     # Actualizar Tasas
@@ -168,7 +145,9 @@ def sync_incremental(force=False):
         except: pass
 
     rows = _load_csv(CSV_SOURCE_PATH)
-    if not rows: return
+    if not rows:
+        print("[SYNC] ! CSV vacío o ilegible. Abortando.")
+        return False
 
     to_upsert = []
     new_cache = {}
@@ -210,13 +189,13 @@ def sync_incremental(force=False):
         
         if error_occurred:
             print("[SYNC] ! Error crítico durante la subida de lotes. Abortando.")
-            return
+            return False
 
         if to_upsert:
             print(f"  -> Upsert final {len(to_upsert)}...")
             if not upsert_batch_rest(to_upsert):
                 print("[SYNC] ! Error en el lote final. Abortando.")
-                return
+                return False
 
         # Guardar Caché
         with open(CACHE_FILE, 'w') as f: json.dump(new_cache, f)
@@ -239,15 +218,21 @@ def sync_incremental(force=False):
         print(f"[SYNC] [OK] Sincronización finalizada. Total: {total_count}")
         verify_sync(total_count, force=force)
 
-        # 🔄 Sincronizar también movimientos locales (ajustes y compras) a Supabase
+        # Sincronizar movimientos locales (ajustes y compras) a Supabase via pydbisam
         try:
             from sync_ajustes import sync_movimientos_locales
             sync_movimientos_locales(force=force)
+            print("[SYNC] Sincronización de ajustes/compras completada.")
+        except ImportError as e:
+            print(f"[SYNC] sync_ajustes no disponible (¿pydbisam instalado?): {e}")
         except Exception as e:
-            print(f"[SYNC] Error importando/ejecutando sincronización de ajustes: {e}")
+            print(f"[SYNC] Error en sincronización de ajustes: {e}")
+
+        return True
 
     except Exception as e:
         print(f"[SYNC] Error: {e}")
+        return False
 
 def verify_sync(csv_count: int, force: bool = False):
     cloud_count = get_row_count_rest()
@@ -256,8 +241,14 @@ def verify_sync(csv_count: int, force: bool = False):
         # 🛡️ No corregir si la diferencia es >10% del total — probablemente H: caída
         max_count = max(cloud_count, csv_count)
         if max_count > 100 and diff / max_count > 0.10:
-            print(f"[SYNC] Diferencia grande ({diff} filas, {diff/max_count*100:.1f}%). "
-                  f"Probablemente la unidad H: estaba caída. No se corrigen huérfanos.")
+            msg = (f"Diferencia grande ({diff} filas, {diff/max_count*100:.1f}%). "
+                   f"Probablemente la unidad H: estaba caída. No se corrigen huérfanos.")
+            print(f"[SYNC] {msg}")
+            try:
+                from alert_util import send_alert
+                send_alert("warning", msg)
+            except Exception:
+                pass
             return
         
         # Verificar cooldown de reconciliación (12 horas)
@@ -273,7 +264,13 @@ def verify_sync(csv_count: int, force: bool = False):
             print(f"[SYNC] Discrepancia detectada ({diff} filas), pero la última reconciliación fue hace menos de 12 horas. Saltando reconciliación de huérfanos.")
             return
             
-        print(f"[SYNC] Discrepancia detectada ({diff} filas). Corrigiendo huérfanos...")
+        msg = f"Discrepancia detectada ({diff} filas). Corrigiendo huérfanos..."
+        print(f"[SYNC] {msg}")
+        try:
+            from alert_util import send_alert
+            send_alert("warning", msg)
+        except Exception:
+            pass
         try:
             with open(CSV_SOURCE_PATH, mode='r', encoding='utf-8-sig') as f:
                 ids = [r['CODIGO_INTERNO'].strip() for r in csv.DictReader(f)]

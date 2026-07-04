@@ -25,8 +25,17 @@ except ImportError:
     HAS_TRAY = False
 
 # --- Configuración ---
-SUPABASE_REST_URL = "https://YOUR-PROJECT-REF.supabase.co"
-SUPABASE_ANON_KEY = "REDACTED-JWT"
+# Se intenta leer de config.py (que a su vez lee .env) para no desincronizar
+# el widget si se rota la anon key. Si config.py falla o deja valores vacíos,
+# se cae a los valores hardcodeados como respaldo (el widget nunca debe morir
+# por esto: es la cara visible del sistema).
+try:
+    from config import SUPABASE_REST_URL, SUPABASE_ANON_KEY
+    if not SUPABASE_REST_URL or not SUPABASE_ANON_KEY:
+        raise ValueError("config.py devolvió valores vacíos")
+except Exception:
+    SUPABASE_REST_URL = "https://YOUR-PROJECT-REF.supabase.co"
+    SUPABASE_ANON_KEY = "REDACTED-JWT"
 
 HYBRID_PATHS = [
     r'H:\HybridLite\HybridEmpresa\HybridDataBase\TInventario.dat',
@@ -39,6 +48,20 @@ HYBRID_PATHS = [
 
 # --- Protección de Instancia Única ---
 # Se difiere al bloque __main__ para permitir la importación en tests sin interrumpir
+
+
+def log_widget_error(msg):
+    """Escribe en widget_error.log con rotación (sin conexión escribe cada 15s y crecía sin límite)."""
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        p = os.path.join(base_dir, "widget_error.log")
+        if os.path.exists(p) and os.path.getsize(p) > 2 * 1024 * 1024:
+            bak = p + ".1"
+            if os.path.exists(bak): os.remove(bak)
+            os.rename(p, bak)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now()}] {msg}\n")
+    except: pass
 
 class SerruchoPremiumWidget:
     def __init__(self, root):
@@ -179,22 +202,31 @@ class SerruchoPremiumWidget:
             return "127.0.0.1"
 
     def load_last_sync_time(self):
-        try:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            syncs = ["last_sync.json", "ventas_last_sync.json"]
-            max_ts = 0
-            for f in syncs:
-                p = os.path.join(base_dir, f)
-                if os.path.exists(p):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        syncs = ["last_sync.json", "ventas_last_sync.json"]
+        max_ts = 0
+        for f in syncs:
+            p = os.path.join(base_dir, f)
+            if os.path.exists(p):
+                try:
                     with open(p, "r") as fh:
-                        ts = json.load(fh).get("timestamp", 0)
-                        if ts > max_ts: max_ts = ts
+                        data = json.load(fh)
+                        if isinstance(data, dict):
+                            ts = data.get("timestamp", 0)
+                            if ts > max_ts:
+                                max_ts = ts
+                except Exception:
+                    pass
+        try:
             if max_ts > 0:
                 now_str = datetime.fromtimestamp(max_ts).strftime("%d/%m %H:%M:%S")
                 self.canvas.itemconfig(self.sync_time_label, text=f"Último Sync: {now_str}")
                 self.last_synced_at = max_ts
-            else: self.last_synced_at = time.time()
-        except: self.last_synced_at = time.time()
+            else:
+                self.canvas.itemconfig(self.sync_time_label, text="Último Sync: Sin datos")
+                self.last_synced_at = time.time()
+        except Exception:
+            self.last_synced_at = time.time()
 
     def load_calc_settings(self):
         self.last_discount = 0.0
@@ -339,6 +371,7 @@ class SerruchoPremiumWidget:
     def update_loop(self):
         def task():
             while True:
+                # 1. Obtener tasas de Supabase (aislado)
                 try:
                     url = f"{SUPABASE_REST_URL}/rest/v1/tazas?nombre=eq.actual&limit=1"
                     headers = {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"}
@@ -348,15 +381,24 @@ class SerruchoPremiumWidget:
                         if data:
                             bcv, bnb = data[0].get("bcv_usd", 0), data[0].get("binance_p2p", 0)
                             self.root.after(0, lambda bcv=bcv, bnb=bnb: self._update_rates_ui(bcv, bnb))
-                    
+                except Exception as e:
+                    try:
+                        self.root.after(0, lambda: self.canvas.itemconfig(self.diff_label, text="Brecha: --.--% (Sin conexión)"))
+                        log_widget_error(f"Error tazas Supabase: {repr(e)}")
+                    except: pass
+                
+                # 2. Obtener estado de la API Local (aislado)
+                try:
                     h_req = urllib.request.Request("http://localhost:5000/health")
                     with urllib.request.urlopen(h_req, timeout=5) as h_resp:
                         h_data = json.loads(h_resp.read().decode())
                         self.root.after(0, lambda d=h_data: self._update_health_ui(d))
                         self._health_failures = 0
-                except Exception:
+                except Exception as e:
                     self.root.after(0, lambda: self.canvas.itemconfig(self.status_ring, state="normal", outline=self.colors["red"]))
-                    self.root.after(0, lambda: self.canvas.itemconfig(self.detail_label, text="⚠️ API local no responde — reinicia el backend manualmente"))
+                    self.root.after(0, lambda: self.canvas.itemconfig(self.detail_label, text="⚠️ API local no responde — reiniciando..."))
+                    log_widget_error(f"Error API local: {repr(e)}")
+                
                 time.sleep(15)
         threading.Thread(target=task, daemon=True).start()
 

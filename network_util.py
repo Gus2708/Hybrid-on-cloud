@@ -6,6 +6,7 @@ import os
 import time
 import sys
 import socket
+import threading
 import urllib.request
 import urllib.error
 import json
@@ -18,38 +19,60 @@ except ImportError:
 
 
 _DRIVE_CACHE = {}
+_PROBE_IN_FLIGHT = set()
+_PROBE_LOCK = threading.Lock()
+
+
+def _probe_drive(drive: str) -> bool:
+    """Sondeo real del disco. Puede bloquear largo rato si la unidad SMB está caída."""
+    try:
+        if not os.path.exists(drive):
+            return False
+        next(os.scandir(drive), None)
+        return True
+    except Exception:
+        return False
+
 
 def check_drive(path: str, timeout: float = 2.0) -> bool:
-    """Verifica si un directorio/unidad de red responde con caché de corto plazo."""
+    """Verifica si un directorio/unidad de red responde con caché de corto plazo.
+
+    El sondeo corre en un hilo aparte con timeout duro: os.path.exists sobre una
+    unidad SMB caída puede bloquear 30-60s y congelaba monitor/app/sync.
+    Si el sondeo no responde en `timeout` segundos se considera caída.
+    """
     if not path: return False
-    
+
     drive = os.path.splitdrive(path)[0] or path
     now = time.time()
-    
+
     # Caché de 10 segundos para evitar bloqueos seguidos
     if drive in _DRIVE_CACHE:
         cached_val, ts = _DRIVE_CACHE[drive]
         if now - ts < 10:
             return cached_val
 
+    # Si ya hay un sondeo colgado para esta unidad, no apilar más hilos
+    with _PROBE_LOCK:
+        if drive in _PROBE_IN_FLIGHT:
+            return _DRIVE_CACHE.get(drive, (False, now))[0]
+        _PROBE_IN_FLIGHT.add(drive)
 
-    try:
-        # En Windows, os.path.exists en una unidad de red caída puede tardar mucho.
-        # No hay una forma directa de ponerle timeout a os.path.exists.
-        # Intentamos un truco: si falla rápido, mejor.
-        if not os.path.exists(drive):
-            _DRIVE_CACHE[drive] = (False, now)
-            return False
-        
-        # Si existe, probamos leer algo mínimo
-        before = time.time()
-        next(os.scandir(drive), None)
-        ok = (time.time() - before) < timeout
-        _DRIVE_CACHE[drive] = (ok, now)
-        return ok
-    except:
-        _DRIVE_CACHE[drive] = (False, now)
-        return False
+    result = {"ok": False}
+
+    def _worker():
+        try:
+            result["ok"] = _probe_drive(drive)
+        finally:
+            with _PROBE_LOCK:
+                _PROBE_IN_FLIGHT.discard(drive)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout)
+    ok = result["ok"] and not t.is_alive()
+    _DRIVE_CACHE[drive] = (ok, now)
+    return ok
 
 
 
@@ -78,7 +101,7 @@ def check_supabase() -> dict:
     before = time.time()
     try:
         req = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
             latency = (time.time() - before) * 1000
             return {"ok": resp.getcode() == 200, "detail": f"HTTP {resp.getcode()}", "latency": round(latency, 1)}
     except urllib.error.HTTPError as e:

@@ -15,35 +15,27 @@ except ImportError:
     SUPABASE_REST_URL = ""
     SUPABASE_ANON_KEY = ""
 
-def set_priority_low():
-    """Establece prioridad baja para no impactar el rendimiento de Windows."""
-    if sys.platform == "win32":
-        try:
-            import win32api, win32process, win32con
-            pid = win32api.GetCurrentProcessId()
-            handle = win32api.OpenProcess(win32con.PROCESS_ALL_ACCESS, True, pid)
-            win32process.SetPriorityClass(handle, win32process.BELOW_NORMAL_PRIORITY_CLASS)
-        except: pass
+from sync_utils import safe_decimal, set_priority_low, _kill_proc, exponential_backoff
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EXPORTER_SCRIPT = os.path.join(BASE_DIR, "extraer_ventas.py")
 CACHE_FILE = os.path.join(BASE_DIR, "ventas_cache.json")
 LAST_SYNC_FILE = os.path.join(BASE_DIR, "ventas_last_sync.json")
 
-HEADERS = {
-    "apikey": SUPABASE_ANON_KEY,
-    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=minimal,resolution=merge-duplicates",
-}
-
-def _kill_proc(proc):
-    try:
-        if proc.poll() is None:
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=5)
-            proc.wait(timeout=5)
-    except: pass
+# HEADERS de escritura: usa SUPABASE_SERVICE_KEY si está configurada (vía
+# build_write_headers en supabase_rest.py), si no cae al comportamiento
+# actual con la anon key. Con try/except porque este script debe seguir
+# funcionando aunque falle el import (p.ej. supabase_rest.py roto o ausente).
+try:
+    from supabase_rest import build_write_headers
+    HEADERS = build_write_headers()
+except Exception:
+    HEADERS = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal,resolution=merge-duplicates",
+    }
 
 def run_exporter(force=False):
     print("[SYNC VENTAS] -> Evaluando extracción selectiva...")
@@ -59,7 +51,7 @@ def run_exporter(force=False):
         creationflags=0x08000000
     )
     try:
-        stdout, stderr = proc.communicate(timeout=45)
+        stdout, stderr = proc.communicate(timeout=120)
         if proc.returncode == 0:
             # Intentar imprimir salida pero no morir si falla el encoding de la consola
             try:
@@ -76,17 +68,14 @@ def run_exporter(force=False):
             return False
     except subprocess.TimeoutExpired:
         _kill_proc(proc)
-        print(f"[SYNC VENTAS] ! TIMEOUT (45s): exportador colgado en H:. Abortando.")
+        print(f"[SYNC VENTAS] ! TIMEOUT (120s): exportador colgado en H:. Abortando.")
         return False
     except Exception as e:
         _kill_proc(proc)
         print(f"[SYNC VENTAS] ! Error ejecutando exportador: {e}")
         return False
 
-def _exponential_backoff(attempt: int) -> float:
-    return min(1.5 ** attempt, 15.0)
-
-def upsert_batch(table: str, on_conflict: str, payload: list) -> bool:
+def _send_batch_request(table: str, on_conflict: str, payload: list) -> bool:
     if not payload: return True
     url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/{table}?on_conflict={on_conflict}"
     data = json.dumps(payload).encode("utf-8")
@@ -98,13 +87,38 @@ def upsert_batch(table: str, on_conflict: str, payload: list) -> bool:
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="ignore")
             print(f"  [ERROR] HTTP {e.code}: {body[:200]}")
+            # Si es un error de clave foránea o de cliente, no reintentar para fallar rápido
+            if e.code in (400, 409):
+                return False
         except Exception as e:
             print(f"  [ERROR] {e}")
         if attempt < 3:
-            delay = _exponential_backoff(attempt)
+            delay = exponential_backoff(attempt)
             print(f"  [RETRY] Upsert {table} ({attempt}/3) en {delay:.0f}s...")
             time.sleep(delay)
     return False
+
+def upsert_batch(table: str, on_conflict: str, payload: list) -> bool:
+    if not payload: return True
+    success = _send_batch_request(table, on_conflict, payload)
+    if success:
+        return True
+    
+    # Si falla y el lote tiene más de un elemento, lo dividimos recursivamente
+    if len(payload) > 1:
+        print(f"  [WARN] Lote de {len(payload)} registros en '{table}' falló. Dividiendo lote para aislar el error...")
+        mid = len(payload) // 2
+        left_ok = upsert_batch(table, on_conflict, payload[:mid])
+        right_ok = upsert_batch(table, on_conflict, payload[mid:])
+        return left_ok and right_ok
+    else:
+        # Si es un único elemento que falla, lo identificamos y lo omitimos
+        item = payload[0]
+        if table == "ventas_detalle":
+            print(f"  [SKIPPED] Detalle omitido: ID {item.get('id')} (Doc: {item.get('documento')}, Producto: {item.get('codigo_producto')} - No existe en 'productos' o viola FK)")
+        else:
+            print(f"  [SKIPPED] Registro omitido en '{table}': {item}")
+        return False
 
 def get_hash(data_dict):
     s = "|".join(str(v) for v in data_dict.values())
@@ -118,23 +132,10 @@ def get_current_rate():
         from rates_service import RatesService
         service = RatesService()
         rates = service.get_all_rates()
-        # Intentar obtener BCV primero, luego Binance
-        return rates.get("bcv", rates.get("binance", FACTOR_USD_DEFAULT))
+        # Intentar obtener BCV USD primero, luego Binance P2P como fallback
+        return rates.get("bcv_usd", rates.get("binance_p2p", FACTOR_USD_DEFAULT))
     except:
         return FACTOR_USD_DEFAULT
-
-def safe_decimal(val):
-
-    if val is None: return 0.0
-    s = str(val).replace('Bs.', '').replace(' ', '').strip()
-    if not s: return 0.0
-    # Manejar formato venezolano "1.500,50" -> 1500.50
-    if ',' in s and '.' in s:
-        s = s.replace('.', '').replace(',', '.')
-    elif ',' in s:
-        s = s.replace(',', '.')
-    try: return float(s)
-    except: return 0.0
 
 def to_float(val):
     return safe_decimal(val)
@@ -158,21 +159,36 @@ def upsert_with_response(table: str, on_conflict: str, payload: list) -> list:
         except Exception as e:
             print(f"  [ERROR UPSERT] {e}")
             if attempt < 3:
-                delay = _exponential_backoff(attempt)
+                delay = exponential_backoff(attempt)
                 print(f"  [RETRY] Upsert {table} con respuesta ({attempt}/3) en {delay:.0f}s...")
                 time.sleep(delay)
     return []
 
 def sync_incremental(force=False):
-    if not SUPABASE_REST_URL or not SUPABASE_ANON_KEY: return
-    
-    # Validar unidad H: antes de empezar
-    base_h = r"h:\HybridLite\HybridEmpresa\HybridDataBase"
-    if not os.path.exists(base_h):
-        print("[SYNC VENTAS] ! ERROR: Unidad de red H: no accesible. Abortando.")
-        return
+    """Sincroniza ventas/clientes a Supabase. Devuelve True si terminó completo, False si abortó o hubo lotes fallidos."""
+    if not SUPABASE_REST_URL or not SUPABASE_ANON_KEY: return False
 
-    if not run_exporter(force=force): return
+    # Validar unidad H: antes de empezar (check_drive tiene timeout duro;
+    # os.path.exists directo puede colgarse minutos con la unidad SMB caída)
+    try:
+        from config import RUTA_VENTAS_CABECERA
+        base_h = os.path.dirname(RUTA_VENTAS_CABECERA)
+    except ImportError:
+        base_h = r"H:\HybridLite\HybridEmpresa\HybridDataBase"
+    try:
+        from network_util import check_drive
+        drive_ok = check_drive(base_h)
+    except ImportError:
+        drive_ok = os.path.exists(base_h)
+    if not drive_ok:
+        print("[SYNC VENTAS] ! ERROR: Unidad de red H: no accesible. Abortando.")
+        return False
+
+    if not run_exporter(force=force): return False
+
+    # Si algún lote falla (p.ej. corte de internet a mitad de subida), NO se debe
+    # cachear su hash: quedaría marcado como subido y no se reintentaría jamás.
+    had_errors = False
 
 
     # ─── Validar CSV antes de procesar ─────────────────────────────────────
@@ -234,32 +250,44 @@ def sync_incremental(force=False):
             "rif_cliente": rif if rif else None, 
             "total_neto": round(neto_usd, 4),
             "total_impuesto": round(impuesto_usd, 4),
-            "total_bruto": round(bruto_usd, 4), # Bug #3
+            "total_bruto": round(bruto_usd, 4),
             "status": to_int(row["THT_STATUS"]),
             "numero_control": row["THT_NUMEROCONTROL"],
             "metodo_pago": row.get("METODO_PAGO", "EFECTIVO"),
-            "created_at": row.get("FECHA_HORA_COMPLETA") # Bug #5 (Time)
+            "created_at": row.get("FECHA_HORA_COMPLETA")
         }
 
     # 1. Clientes
     if validate_csv("MAESTRO_CLIENTES.csv"):
         print("[SYNC VENTAS] Procesando clientes...")
-        to_upsert = []
+        to_upsert = []  # lista de (pk, hash, mapped): el hash se cachea solo si el lote sube OK
         old_cache = cache.get("clientes", {})
         new_entity_cache = {}
+
+        def flush_clientes(batch):
+            nonlocal had_errors
+            if not batch: return
+            if upsert_batch("clientes", "codigo_cliente", [m for _, _, m in batch]):
+                for pk, h, _ in batch:
+                    new_entity_cache[pk] = h
+            else:
+                had_errors = True
+
         with open("MAESTRO_CLIENTES.csv", "r", encoding="utf-8-sig") as f:
             for row in csv.DictReader(f):
                 try:
                     mapped = map_cliente(row)
                     pk = mapped["codigo_cliente"]
                     h = get_hash(mapped)
-                    new_entity_cache[pk] = h
-                    if old_cache.get(pk) != h: to_upsert.append(mapped)
+                    if old_cache.get(pk) != h:
+                        to_upsert.append((pk, h, mapped))
+                    else:
+                        new_entity_cache[pk] = h
                     if len(to_upsert) >= 500:
-                        upsert_batch("clientes", "codigo_cliente", to_upsert)
+                        flush_clientes(to_upsert)
                         to_upsert = []
                 except: continue
-            if to_upsert: upsert_batch("clientes", "codigo_cliente", to_upsert)
+            flush_clientes(to_upsert)
             cache["clientes"] = new_entity_cache
 
     # 2. Ventas (Cabecera)
@@ -273,7 +301,9 @@ def sync_incremental(force=False):
         # El caché ahora es {id_unico: [hash, cloud_id]}
         old_cache = cache.get("ventas", {})
         new_entity_cache = {}
-        
+        total_ventas_count = 0
+        zero_total_count = 0
+
         with open("VENTAS_CABECERA.csv", "r", encoding="utf-8-sig") as f:
             for row in csv.DictReader(f):
                 try:
@@ -283,8 +313,10 @@ def sync_incremental(force=False):
                     if tasa <= 1.0: tasa = current_bcv_rate
                     doc_to_tasa[doc_num] = tasa
 
-                    
                     mapped = map_venta(row, current_bcv_rate)
+                    total_ventas_count += 1
+                    if mapped.get("total_neto", 0) == 0.0:
+                        zero_total_count += 1
                     pk = str(mapped["id_unico"])
                     h = get_hash(mapped)
                     
@@ -298,6 +330,11 @@ def sync_incremental(force=False):
                         to_upsert.append((local_id, mapped))
                     
                     if len(to_upsert) >= 500:
+                        # Salvaguarda: si >50% de ventas tienen total_neto=0, posible error de lectura
+                        if total_ventas_count > 50 and zero_total_count > total_ventas_count * 0.5:
+                            print(f"[SYNC VENTAS] ! ABORTANDO: {zero_total_count}/{total_ventas_count} "
+                                  f"ventas con total_neto=0. Posible CSV corrupto o tasa cero.")
+                            return False
                         print(f"  [SYNC VENTAS] Upserting batch of {len(to_upsert)} sales...")
                         payload = [item[1] for item in to_upsert]
                         results = upsert_with_response("ventas", "id_unico", payload)
@@ -310,6 +347,7 @@ def sync_incremental(force=False):
                                 new_entity_cache[str(uid)] = [get_hash(mapped_item), cid]
                             else:
                                 print(f"  [WARN] No se obtuvo cloud_id para id_unico {uid}")
+                                had_errors = True
                         to_upsert = []
                 except Exception as e: 
                     print(f"  [ERROR VENTA] doc {row.get('THT_DOCUMENTO')}: {e}")
@@ -328,17 +366,27 @@ def sync_incremental(force=False):
                         new_entity_cache[str(uid)] = [get_hash(mapped_item), cid]
                     else:
                         print(f"  [WARN] No se obtuvo cloud_id para id_unico {uid}")
-            
+                        had_errors = True
+
             print(f"  [SYNC VENTAS] Total sales in mapping: {len(ventas_map_ids)}")
             cache["ventas"] = new_entity_cache
 
     # 3. Ventas Detalle
     if validate_csv("VENTAS_DETALLE.csv"):
         print("[SYNC VENTAS] Procesando ventas (Detalles)...")
-        to_upsert = []
+        to_upsert = []  # lista de (pk, hash, mapped): el hash se cachea solo si el lote sube OK
         old_cache = cache.get("ventas_detalle", {})
         new_entity_cache = {}
-        
+
+        def flush_detalles(batch):
+            nonlocal had_errors
+            if not batch: return
+            if upsert_batch("ventas_detalle", "id", [m for _, _, m in batch]):
+                for pk, h, _ in batch:
+                    new_entity_cache[pk] = h
+            else:
+                had_errors = True
+
         with open("VENTAS_DETALLE.csv", "r", encoding="utf-8-sig") as f:
             for row in csv.DictReader(f):
                 try:
@@ -369,18 +417,20 @@ def sync_incremental(force=False):
                     
                     pk = str(mapped["id"])
                     h = get_hash(mapped)
-                    new_entity_cache[pk] = h
-                    if old_cache.get(pk) != h: to_upsert.append(mapped)
-                    
+                    if old_cache.get(pk) != h:
+                        to_upsert.append((pk, h, mapped))
+                    else:
+                        new_entity_cache[pk] = h
+
                     if len(to_upsert) >= 1000:
                         print(f"  [SYNC VENTAS] Upserting batch of {len(to_upsert)} details...")
-                        upsert_batch("ventas_detalle", "id", to_upsert)
+                        flush_detalles(to_upsert)
                         to_upsert = []
-                except Exception as e: 
+                except Exception as e:
                     print(f"  [ERROR DETAIL] doc {row.get('TBT_DOCUMENTO')}: {e}")
                     continue
-            
-            if to_upsert: upsert_batch("ventas_detalle", "id", to_upsert)
+
+            flush_detalles(to_upsert)
             cache["ventas_detalle"] = new_entity_cache
 
     # Guardar Caché Final
@@ -391,19 +441,26 @@ def sync_incremental(force=False):
     # Limpieza de memoria explícita
     ventas_map_ids.clear()
     doc_to_tasa.clear()
-    
+
+    if had_errors:
+        print("[SYNC VENTAS] [WARN] Sincronización finalizada CON ERRORES: "
+              "algunos lotes no subieron y se reintentarán en el próximo sync.")
+        # No reconciliar con datos parciales: podría borrar registros válidos en la nube
+        return False
+
     print("[SYNC VENTAS] [OK] Sincronización finalizada.")
-    
+
     # Metadata final
     try:
         with open(LAST_SYNC_FILE, "w") as f:
             json.dump({"last_sync": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "timestamp": time.time()}, f)
     except: pass
 
-    
+
     # 🔍 RECONCILIACIÓN AUTOMÁTICA (Audit)
     # Solo si no hubo errores críticos y estamos en modo completo
     reconcile_ventas(force=force)
+    return True
 
 _MIN_SAFE_IDS = 10
 
@@ -470,7 +527,7 @@ def _retry_http(url: str, method: str = "GET", data: bytes = None, timeout: int 
         except Exception as e:
             print(f"  [RETRY {method} {url.split('/')[-1]}] ({attempt}/3): {str(e)[:80]}")
             if attempt < 3:
-                time.sleep(_exponential_backoff(attempt))
+                time.sleep(exponential_backoff(attempt))
     return None
 
 def delete_orphans_generic(table: str, pk_col: str, valid_ids: list) -> bool:

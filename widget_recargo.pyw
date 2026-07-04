@@ -24,8 +24,17 @@ except ImportError:
     HAS_TRAY = False
 
 # --- Configuración de Supabase (Copiada del Widget Original) ---
-SUPABASE_REST_URL = "https://YOUR-PROJECT-REF.supabase.co"
-SUPABASE_ANON_KEY = "REDACTED-JWT"
+# Se intenta leer de config.py (que a su vez lee .env) para no desincronizar
+# el widget si se rota la anon key. Si config.py falla o deja valores vacíos,
+# se cae a los valores hardcodeados como respaldo (el widget nunca debe morir
+# por esto: es la cara visible del sistema).
+try:
+    from config import SUPABASE_REST_URL, SUPABASE_ANON_KEY
+    if not SUPABASE_REST_URL or not SUPABASE_ANON_KEY:
+        raise ValueError("config.py devolvió valores vacíos")
+except Exception:
+    SUPABASE_REST_URL = "https://YOUR-PROJECT-REF.supabase.co"
+    SUPABASE_ANON_KEY = "REDACTED-JWT"
 
 # --- Protección de Instancia Única en Puerto 5007 ---
 try:

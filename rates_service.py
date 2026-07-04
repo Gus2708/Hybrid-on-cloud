@@ -1,9 +1,22 @@
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 import json
 import time
 import os
 from typing import Dict, Optional
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+def _http_get_bcv(url, headers, timeout):
+    """GET con SSL verificado; solo si la cadena de certificados del BCV falla
+    (problema histórico de ese sitio) reintenta sin verificación."""
+    try:
+        return requests.get(url, headers=headers, timeout=timeout)
+    except requests.exceptions.SSLError:
+        return requests.get(url, headers=headers, timeout=timeout, verify=False)
+
 
 class RatesService:
     """
@@ -21,7 +34,7 @@ class RatesService:
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
             }
-            response = requests.get(self.BCV_URL, headers=headers, timeout=15, verify=False)
+            response = _http_get_bcv(self.BCV_URL, headers=headers, timeout=15)
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, "html.parser")
                 
@@ -104,13 +117,21 @@ class RatesService:
             if not REST_URL or not ANON_KEY:
                 print("[RATES] DB config missing.")
                 return False
-            
-            headers = {
-                "apikey": ANON_KEY,
-                "Authorization": f"Bearer {ANON_KEY}",
-                "Content-Type": "application/json",
-                "Prefer": "resolution=merge-duplicates"
-            }
+
+            # Headers de escritura: usa SUPABASE_SERVICE_KEY si está configurada
+            # (vía build_write_headers), si no cae a la anon key (igual que antes).
+            # try/except porque este método debe seguir funcionando aunque falle
+            # el import del helper.
+            try:
+                from supabase_rest import build_write_headers
+                headers = build_write_headers(extra_prefer="resolution=merge-duplicates")
+            except Exception:
+                headers = {
+                    "apikey": ANON_KEY,
+                    "Authorization": f"Bearer {ANON_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates"
+                }
             
             # 1. Obtener la tasa actual guardada para verificar la fecha
             base_url = f"{REST_URL.rstrip('/')}/rest/v1/tazas"
