@@ -161,11 +161,23 @@ def ensure_single_instance():
 
 ensure_single_instance()
 
+# Cada entrada: (script, nombre) o (script, nombre, opts). opts puede traer:
+#   "subdir": subcarpeta (relativa a BASE_DIR) donde vive el script; también su cwd.
+#   "env":    variables de entorno extra SOLO para ese proceso (no tocan el resto
+#             ni el .env).
 SCRIPTS = [
     ("app.py",              "API Flask"),
     ("monitor.py",          "Monitor archivos"),
     ("remote_listener.py",  "Listener remoto"),
     ("widget.pyw",          "Widget UI"),
+    ("listener_writeback.py", "Write-back stock", {
+        "subdir": "hybrid_writeback",
+        # HYBRID_WRITE_ENABLED=1 -> aplica los ajustes de verdad en HybridLite.
+        # Se pasa SOLO a este proceso (no al .env) para que correr el script a
+        # mano siga siendo preview seguro por defecto. Sin HYBRID_WRITE_WINDOW =
+        # sin restricción horaria (procesa a cualquier hora).
+        "env": {"HYBRID_WRITE_ENABLED": "1"},
+    }),
 ]
 
 # ─── Detección de procesos colgados (vivos pero congelados) ──────────────────
@@ -259,7 +271,9 @@ log("=== Watchdog robusto iniciado ===")
 while True:
     now = time.time()
 
-    for script, name in SCRIPTS:
+    for entry in SCRIPTS:
+        script, name = entry[0], entry[1]
+        opts = entry[2] if len(entry) > 2 else {}
         # 1. Verificar si ya tenemos un PID en caché y si sigue vivo
         pid = _PID_MAP.get(script)
         alive = is_alive(pid)
@@ -309,17 +323,24 @@ while True:
             try:
                 if script == "app.py":
                     free_api_port()  # garantizar que el puerto esté libre antes de enlazar
-                script_path = os.path.join(BASE_DIR, script)
+                subdir = opts.get("subdir")
+                work_dir = os.path.join(BASE_DIR, subdir) if subdir else BASE_DIR
+                script_path = os.path.join(work_dir, script)
                 pythonw = sys.executable.replace("python.exe", "pythonw.exe")
                 if not os.path.exists(pythonw): pythonw = sys.executable
-                
+
+                # Entorno extra por-proceso (p. ej. HYBRID_WRITE_ENABLED del listener).
+                # env=None hereda el entorno del watchdog, como el resto de scripts.
+                proc_env = {**os.environ, **opts["env"]} if opts.get("env") else None
+
                 # Usar rutas absolutas para mayor claridad en el futuro
                 proc = subprocess.Popen(
                     [pythonw, script_path],
-                    cwd=BASE_DIR,
+                    cwd=work_dir,
                     creationflags=0x08000000,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
+                    stderr=subprocess.DEVNULL,
+                    env=proc_env
                 )
                 _PID_MAP[script] = proc.pid
                 _RESTART_COOLDOWN[script] = now

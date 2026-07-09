@@ -73,9 +73,14 @@ import read_db_existencia
 
 HYBRID_WRITE_ENABLED = os.environ.get("HYBRID_WRITE_ENABLED") == "1"
 
+# force=True: los módulos importados arriba (flujo_stock_real, etc.) ya llamaron
+# logging.basicConfig con solo StreamHandler, y basicConfig es no-op si el root
+# ya tiene handlers -> sin force, el FileHandler NUNCA se agregaba y bajo pythonw
+# (consola a DEVNULL) el listener corría sin dejar rastro en writeback.log.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
+    force=True,
     handlers=[
         logging.StreamHandler(),
         logging.FileHandler(os.path.join(os.path.dirname(os.path.abspath(__file__)),
