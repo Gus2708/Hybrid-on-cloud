@@ -69,6 +69,7 @@ except Exception as e:  # pragma: no cover
     sys.exit(1)
 
 import flujo_stock_real
+import flujo_precio_real
 import read_db_existencia
 
 HYBRID_WRITE_ENABLED = os.environ.get("HYBRID_WRITE_ENABLED") == "1"
@@ -93,11 +94,11 @@ TABLE = "ordenes_cambio_items"
 POLL_INTERVAL = 8          # segundos entre sondeos
 MAX_INTENTOS = 3
 
-# Etapas de flujo_stock_real.ajustar_stock() anteriores a cualquier commit en
-# HybridLite: un fallo ahí es reintentable sin riesgo. Cualquier otra etapa
-# (post-commit, ambigua) o una excepción se tratan como error inmediato en
+# Etapas de flujo_stock_real.ajustar_stock() y flujo_precio_real.set_precio() anteriores
+# a cualquier commit en HybridLite: un fallo ahí es reintentable sin riesgo. Cualquier
+# otra etapa (post-commit, ambigua) o una excepción se tratan como error inmediato en
 # procesar() — ver comentario ahí (F5).
-ETAPAS_REINTENTABLES = ("abrir_hybrid", "carga/conteo")
+ETAPAS_REINTENTABLES = ("abrir_hybrid", "carga/conteo", "escritura", "aceptar")
 
 API_KEY = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
 if not SUPABASE_SERVICE_KEY:
@@ -200,6 +201,7 @@ def get_pendientes():
         path = (f"{TABLE}?backend_status=eq.pendiente"
                 f"&select=id,orden_id,codigo_producto,descripcion,delta,"
                 f"existencia_actual,nueva_existencia,backend_intentos,"
+                f"precio_actual,nuevo_precio,"
                 f"ordenes_cambio!inner(status,creado_por)"
                 f"&ordenes_cambio.status=eq.emitido"
                 f"&ordenes_cambio.creado_por=not.is.null"
@@ -254,45 +256,55 @@ def procesar(item):
     iid = item["id"]
     codigo = item.get("codigo_producto")
     delta = item.get("delta")
+    nueva_existencia = item.get("nueva_existencia")
+    precio_actual = item.get("precio_actual")
+    nuevo_precio = item.get("nuevo_precio")
     intentos = (item.get("backend_intentos") or 0) + 1
 
-    log.info("Procesando item %s (orden %s): codigo=%s delta=%s intento=%s",
-              iid, item.get("orden_id"), codigo, delta, intentos)
+    log.info("Procesando item %s (orden %s): codigo=%s delta=%s nueva_existencia=%s precio_actual=%s nuevo_precio=%s intento=%s",
+              iid, item.get("orden_id"), codigo, delta, nueva_existencia, precio_actual, nuevo_precio, intentos)
 
-    # F1: delta NULL -> el dato no se generó bien (probablemente falta
-    # existencia_actual en la orden). No es reintentable: no consume el
-    # mecanismo de intentos, va directo a 'error' para revisión manual.
-    if delta is None:
-        update_item(iid, backend_status="error",
-                    backend_resultado="delta llegó NULL (probable existencia_actual "
-                                       "faltante en la orden). Corregir/recrear el item "
-                                       "desde la app; no se reintenta automáticamente.")
-        log.error("Item %s con delta NULL -> 'error' sin reintentar.", iid)
-        return
+    tiene_stock_cambio = nueva_existencia is not None and delta is not None and float(delta) != 0
+    tiene_precio_cambio = nuevo_precio is not None and precio_actual is not None and float(nuevo_precio) != float(precio_actual)
 
-    # F1: delta 0 -> nada que ajustar en HybridLite. Se completa directo sin
-    # tocar la app (evita un ciclo de input real de ~30s para no-operación).
-    if float(delta) == 0:
+    if not tiene_stock_cambio and not tiene_precio_cambio:
+        # Nada que cambiar (o delta es 0 y el precio es igual)
         update_item(iid, backend_status="completado",
-                    backend_resultado="delta 0: nada que aplicar.",
+                    backend_resultado="Sin cambios de stock ni de precio a realizar.",
                     backend_aplicado_en=datetime.datetime.now(datetime.timezone.utc).isoformat())
-        log.info("Item %s con delta 0 -> 'completado' sin tocar HybridLite.", iid)
+        log.info("Item %s sin cambios reales -> 'completado' sin tocar HybridLite.", iid)
         return
 
     # Marca 'aplicando' (lock optimista)
     if not update_item(iid, backend_status="aplicando", backend_intentos=intentos):
         return
 
+    res = {"ok": True, "etapa": "inicio", "detalle": "Iniciando proceso"}
     try:
-        res = flujo_stock_real.ajustar_stock(codigo, float(delta),
-                                              commit=HYBRID_WRITE_ENABLED, delta=True)
+        # 1. Aplicar cambio de precio si corresponde
+        if tiene_precio_cambio:
+            log.info("Aplicando cambio de precio a %s: %s -> %s", codigo, precio_actual, nuevo_precio)
+            res = flujo_precio_real.set_precio(codigo, float(nuevo_precio), commit=HYBRID_WRITE_ENABLED)
+            if not res["ok"]:
+                log.error("Fallo aplicando precio a %s: %s", codigo, res["detalle"])
+
+        # 2. Aplicar cambio de stock si corresponde y el precio fue exitoso (o no había cambio de precio)
+        if res["ok"] and tiene_stock_cambio:
+            log.info("Aplicando cambio de stock a %s: delta=%s", codigo, delta)
+            res_stock = flujo_stock_real.ajustar_stock(codigo, float(delta),
+                                                       commit=HYBRID_WRITE_ENABLED, delta=True)
+            if tiene_precio_cambio:
+                # Combinamos detalles
+                res["detalle"] = f"Precio: {res['detalle']} | Stock: {res_stock['detalle']}"
+                res["ok"] = res_stock["ok"]
+                res["etapa"] = res_stock["etapa"]
+            else:
+                res = res_stock
+
     except Exception as e:
         res = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
 
-    # Con HYBRID_WRITE_ENABLED apagado, todo queda en preview: nunca se marca
-    # 'completado' aunque el resultado sea ok, para no confundirlo con un commit real.
-    # El llamador (loop) sólo invoca procesar() en modo preview para pruebas puntuales
-    # (--once), nunca en bucle continuo, para no reintentar el item sin fin.
+    # Con HYBRID_WRITE_ENABLED apagado, todo queda en preview
     if res["ok"] and HYBRID_WRITE_ENABLED and res.get("etapa") == "commit":
         update_item(iid, backend_status="completado", backend_resultado=res["detalle"],
                     backend_aplicado_en=datetime.datetime.now(datetime.timezone.utc).isoformat())
@@ -301,14 +313,7 @@ def procesar(item):
         update_item(iid, backend_status="pendiente", backend_resultado=f"[PREVIEW] {res['detalle']}")
         log.info("PREVIEW item %s (HYBRID_WRITE_ENABLED=0, no se aplicó): %s", iid, res["detalle"])
     else:
-        # F5: política de reintentos conservadora. El ajuste es RELATIVO
-        # (delta), así que reintentar tras un commit en etapa ambigua puede
-        # aplicar el delta DOS VECES y desajustar el inventario real. Solo
-        # las etapas anteriores a cualquier intento de commit (abrir_hybrid,
-        # carga/conteo) son reintentables; cualquier otra etapa (totalizar,
-        # verificacion_db, etc.) o una excepción van a 'error' de inmediato,
-        # sin importar cuántos intentos queden, con una advertencia explícita
-        # para revisión manual antes de reencolar.
+        # Política de reintentos conservadora.
         etapa = res.get("etapa")
         if etapa in ETAPAS_REINTENTABLES:
             final = "error" if intentos >= MAX_INTENTOS else "pendiente"
@@ -319,7 +324,7 @@ def procesar(item):
             resultado = (f"{res['detalle']} | ATENCIÓN: fallo en etapa ambigua "
                          f"(etapa={etapa!r}) — verificar en HybridLite si el ajuste "
                          f"se aplicó ANTES de reencolar manualmente (riesgo de "
-                         f"ajuste doble).")
+                         f"ajuste doble/precio parcial).")
             update_item(iid, backend_status="error", backend_resultado=resultado)
             log.error("FALLO item %s (error inmediato, etapa=%s NO reintentable): %s",
                       iid, etapa, res["detalle"])
