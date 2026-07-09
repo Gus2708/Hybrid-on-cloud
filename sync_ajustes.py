@@ -89,6 +89,18 @@ def insert_child_items(items) -> bool:
     """Realiza la inserción masiva de los detalles del movimiento en Supabase."""
     if not items:
         return True
+    # Estos items son ESPEJOS HISTÓRICOS de movimientos ya aplicados en HybridLite.
+    # `ordenes_cambio_items.backend_status` es también la cola del write-back
+    # (hybrid_writeback/listener_writeback.py): si nacieran 'pendiente' (el default
+    # de la columna), el listener los RE-aplicaría en HybridLite y se armaría un
+    # bucle de retroalimentación (re-aplicar -> se vuelve a espejar -> re-aplicar).
+    # Se insertan directamente 'completado' como segunda capa de defensa (la
+    # primera: el listener filtra por creado_por NOT NULL en la cabecera).
+    for item in items:
+        item.setdefault("backend_status", "completado")
+        item.setdefault("backend_resultado",
+                        "Espejo histórico sincronizado desde HybridLite por "
+                        "sync_ajustes; ya aplicado localmente, no procesar.")
     url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/ordenes_cambio_items"
     data = json.dumps(items).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=HEADERS, method="POST")
