@@ -9,6 +9,7 @@ del dueño (2026-07-07):
     → celda Conteo: teclear la cantidad deseada → ENTER (recalcula Diferencia)
     → [verificar código y diferencia leyendo las celdas]
     → commit: Totalizar → Confirmación '&SI' → cerrar comprobante (Vista Previa)
+    → Salir de la ventana de Ajustes (no dejar el comprobante nuevo abierto)
     → verificación final contra DBISAM (TExistenciaInv.EIN_EXISTENCIA)
 
 MODELO: el 'Conteo' es la cantidad ABSOLUTA que quedará. Con --delta, la cantidad
@@ -330,6 +331,53 @@ def _totalizar_y_guardar(aj):
     return confirmado
 
 
+def _salir_ajustes(aj):
+    """Cierra la ventana de Ajustes (botón 'Salir') al terminar el flujo.
+
+    Tras Cancelar o Totalizar, HybridLite deja un comprobante nuevo VACÍO abierto
+    (ej. 00000213*). Sin este paso esa ventana queda colgada y el próximo item
+    la reutiliza en un estado sucio. Se llama SIEMPRE después de cancelar o
+    totalizar, es decir cuando el documento actual ya no tiene cambios pendientes,
+    así 'Salir' no dispara un diálogo de "¿guardar cambios?".
+    """
+    ha = fp._find_hwnd(AJU_CLASS)
+    if not ha:
+        return  # ya cerrada
+    _focus(ha)
+    for titulo in ("&Salir", "Salir"):
+        try:
+            b = aj.child_window(title=titulo, class_name="TFlatButton")
+            r = b.rectangle()
+            ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+            time.sleep(0.8)
+            break
+        except Exception:
+            continue
+    # confirmar si preguntara (el doc visible está vacío -> se sale, no se guarda)
+    for _ in range(2):
+        h = fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm")
+        if not h:
+            break
+        m = fp._win(h)
+        for t in ("&SI", "SI", "Sí", "&Sí", "&Yes", "Yes", "Aceptar"):
+            try:
+                m.child_window(title=t).click_input(); break
+            except Exception:
+                continue
+        time.sleep(0.4)
+    # fallback: si el botón no cerró la ventana, forzar cierre por mensaje
+    import win32con
+    for _ in range(3):
+        h = fp._find_hwnd(AJU_CLASS)
+        if not h:
+            break
+        try:
+            win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
+        except Exception:
+            pass
+        time.sleep(0.4)
+
+
 # ── orquestador ──────────────────────────────────────────────────────────────
 def ajustar_stock(codigo, cantidad, commit=False, delta=False):
     cantidad = float(cantidad)
@@ -356,11 +404,13 @@ def ajustar_stock(codigo, cantidad, commit=False, delta=False):
         datos = cargar_y_fijar(aj, grid, codigo, target)
     except StockError as e:
         _cancelar(aj)
+        _salir_ajustes(aj)
         return {"ok": False, "etapa": "carga/conteo", "detalle": str(e), "db_antes": total_antes}
     existencia_ui = datos["existencia"] if datos["existencia"] is not None else total_antes
 
     if not commit:
         _cancelar(aj)
+        _salir_ajustes(aj)
         return {"ok": True, "etapa": "preview",
                 "detalle": f"Verificado en pantalla y DESCARTADO (sin --commit). "
                            f"Dejaría stock={target} (dif {datos['diferencia']}).",
@@ -371,6 +421,9 @@ def ajustar_stock(codigo, cantidad, commit=False, delta=False):
     if not _totalizar_y_guardar(aj):
         return {"ok": False, "etapa": "totalizar",
                 "detalle": "No pude confirmar el guardado (Totalizar/SÍ).", "db_antes": total_antes}
+
+    # cerrar la ventana de Ajustes (comprobante nuevo vacío) tras guardar
+    _salir_ajustes(aj)
 
     time.sleep(1.2)
     total_despues, _ = dbex.existencia(codigo)
