@@ -505,7 +505,9 @@ def procesar_pendientes(items):
             _AVISO_SIN_SAFETY_CONTROL = True
         _procesar_pendientes_impl(items)
     else:
-        with control_seguro() as banner:
+        # ocultar el widget del backend (topmost, tapa/come clics de los
+        # diálogos de HybridLite) mientras el bot trabaja; se restaura al salir.
+        with control_seguro(ocultar_scripts=["widget.pyw", "widget_recargo.pyw"]) as banner:
             _procesar_pendientes_impl(items, banner)
 
 

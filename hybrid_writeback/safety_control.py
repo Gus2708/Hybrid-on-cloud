@@ -203,12 +203,20 @@ class _Banner:
             WS_EX_LAYERED = 0x00080000
             WS_EX_TRANSPARENT = 0x00000020  # los clics ATRAVIESAN la ventana
             WS_EX_NOACTIVATE = 0x08000000   # nunca toma el foco
+            LWA_ALPHA = 0x00000002
 
             hwnd = ctypes.windll.user32.GetParent(root.winfo_id()) or root.winfo_id()
             estilo = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
             ctypes.windll.user32.SetWindowLongW(
                 hwnd, GWL_EXSTYLE,
                 estilo | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)
+
+            # CRÍTICO (bug confirmado: el banner salía INVISIBLE): al re-setear
+            # el exstyle con SetWindowLong, Windows descarta la opacidad que
+            # tkinter había puesto con -alpha, y la ventana layered queda 100%
+            # transparente aunque el click-through funcione. Hay que re-aplicar
+            # la opacidad a mano para que se vea. 245 ≈ 0.96*255 (el mismo -alpha).
+            ctypes.windll.user32.SetLayeredWindowAttributes(hwnd, 0, 245, LWA_ALPHA)
         except Exception as e:
             log.warning("No se pudo activar click-through en el banner "
                         "(los clics del bot podrían chocar con la barra): %s", e)
@@ -297,9 +305,84 @@ class _Banner:
                 log.warning("El hilo del banner de seguridad no terminó a tiempo")
 
 
+# ── ocultar ventanas que estorban (widget del backend) ──────────────────────
+def _pids_de_scripts(scripts):
+    """PIDs de procesos pythonw/python cuyo commandline contiene alguno de
+    `scripts` (ej. 'widget.pyw'). Vía WMI, mismo patrón que backend_watchdog."""
+    pids = set()
+    try:
+        import win32com.client
+        wmi = win32com.client.GetObject("winmgmts:")
+        for proc in wmi.ExecQuery(
+                "SELECT ProcessId, CommandLine FROM Win32_Process "
+                "WHERE Name = 'pythonw.exe' OR Name = 'python.exe'"):
+            cl = proc.CommandLine or ""
+            if any(s in cl for s in scripts):
+                pids.add(int(proc.ProcessId))
+    except Exception as e:
+        log.warning("No pude listar procesos para ocultar sus ventanas: %s", e)
+    return pids
+
+
+def _ocultar_ventanas_de_scripts(scripts):
+    """Oculta (SW_HIDE) todas las ventanas top-level visibles de los procesos
+    de `scripts`. Devuelve la lista de hwnds ocultados (para restaurarlos).
+
+    POR QUÉ ocultar y no minimizar: el widget (widget.pyw / widget_recargo.pyw)
+    es overrideredirect + topmost (sin barra de título), así que 'minimizar' se
+    comporta mal; ocultarlo es limpio y garantiza que no tape ni coma clics de
+    los diálogos de HybridLite mientras el bot trabaja.
+    """
+    ocultados = []
+    pids = _pids_de_scripts(scripts)
+    if not pids:
+        return ocultados
+    try:
+        import win32gui
+        import win32process
+        import win32con
+
+        def _cb(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            except Exception:
+                return
+            if pid in pids:
+                win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+                ocultados.append(hwnd)
+
+        win32gui.EnumWindows(_cb, None)
+    except Exception as e:
+        log.warning("No pude ocultar ventanas del widget: %s", e)
+    if ocultados:
+        log.info("Ocultadas %s ventana(s) de %s durante el flujo.", len(ocultados), scripts)
+    return ocultados
+
+
+def _restaurar_ventanas(hwnds):
+    """Vuelve a mostrar (SW_SHOW) y re-topmost las ventanas ocultadas."""
+    if not hwnds:
+        return
+    try:
+        import win32gui
+        import win32con
+    except Exception:
+        return
+    for hwnd in hwnds:
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                                  win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
+        except Exception:
+            pass
+
+
 # ── API pública ─────────────────────────────────────────────────────────────
 @contextmanager
-def control_seguro(mensaje="BOT ACTIVO — APLICANDO CAMBIOS EN HYBRIDLITE"):
+def control_seguro(mensaje="BOT ACTIVO — APLICANDO CAMBIOS EN HYBRIDLITE",
+                   ocultar_scripts=None):
     """Envuelve una sección donde el bot controla el equipo:
       1. Muestra un banner rojo topmost con `mensaje` (línea 1; la línea 2,
          fija, ya trae la advertencia de no tocar y la hotkey F12).
@@ -316,14 +399,23 @@ def control_seguro(mensaje="BOT ACTIVO — APLICANDO CAMBIOS EN HYBRIDLITE"):
     `set_texto` es inofensivo (solo guarda el texto; nadie lo lee) — no hace
     falta una clase separada de "no-op" para ese caso.
 
+    `ocultar_scripts` (opcional): lista de nombres de script (ej.
+    ["widget.pyw"]) cuyas ventanas se OCULTAN al empezar y se restauran al
+    salir — el widget del backend es topmost y tapa/come clics de los diálogos
+    de HybridLite mientras el bot trabaja.
+
     `with control_seguro():` sin `as` sigue funcionando igual que antes.
     """
     _abort_flag.clear()
     banner = _Banner(mensaje)
+    ventanas_ocultas = []
 
     try:
         banner.iniciar()
         _registrar_hotkey()
+
+        if ocultar_scripts:
+            ventanas_ocultas = _ocultar_ventanas_de_scripts(ocultar_scripts)
 
         if _es_admin():
             _bloquear_inputs(True)
@@ -337,6 +429,7 @@ def control_seguro(mensaje="BOT ACTIVO — APLICANDO CAMBIOS EN HYBRIDLITE"):
         # importante, así que BlockInput(False) va primero y siempre se llama
         _bloquear_inputs(False)
         _quitar_hotkey()
+        _restaurar_ventanas(ventanas_ocultas)
         try:
             banner.cerrar()
         except Exception as e:
@@ -348,12 +441,13 @@ if __name__ == "__main__":
     # Demo SEGURA: solo banner, ~6 segundos, SIN BlockInput y SIN os._exit,
     # para que el operador pueda probar visualmente el banner y el cambio de
     # texto en caliente (set_texto) a mano.
-    print("Demo de safety_control: mostrando banner ~6s (sin bloqueo de input)...")
+    print("Demo de safety_control: banner ~6s + ocultar widget (sin bloqueo de input)...")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    with control_seguro("DEMO — banner de prueba (sin bloqueo real)") as banner:
-        print("Banner visible. Esperando 3 segundos...")
+    with control_seguro("DEMO — banner de prueba (sin bloqueo real)",
+                        ocultar_scripts=["widget.pyw", "widget_recargo.pyw"]) as banner:
+        print("Banner visible arriba + widget oculto. Esperando 3 segundos...")
         time.sleep(3)
         print("Actualizando texto con set_texto()...")
         banner.set_texto("DEMO — set_texto() en caliente funcionando")
         time.sleep(3)
-    print(f"Demo terminada. fue_abortado() = {fue_abortado()}")
+    print(f"Demo terminada (widget restaurado). fue_abortado() = {fue_abortado()}")
