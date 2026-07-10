@@ -47,6 +47,7 @@ AJU_CLASS = "TFormHTransaccion_Ajustes"
 CONF_CLASS = "TFConfirmacion"
 PREVIEW_CLASS = "TfrxPreviewForm"
 TOL = 0.001
+ROW_H = 24  # alto de fila estándar de la grilla (según grabación del dueño)
 
 
 class StockError(Exception):
@@ -80,11 +81,44 @@ def _num(s):
 
 
 # ── apertura ─────────────────────────────────────────────────────────────────
+def _cerrar_ficha_si_abierta():
+    """Cierra la Ficha de items (TTConfigForm) si quedó abierta de un flujo de
+    precio/costo. CONFIRMADO EN VIVO (2026-07-09): con la Ficha delante, el
+    clic al menú 'Ajustes de inventario' no llega y abrir_ajustes() expira.
+    El flujo de precio siempre cierra su diálogo (Salir/Aceptar) antes de
+    terminar, así que la Ficha no tiene cambios pendientes y cerrarla es
+    seguro."""
+    hf = fp._find_hwnd(fp.FICHA_CLASS)
+    if not hf:
+        return
+    log.info("Cerrando la Ficha de items (quedó abierta de un flujo de precio) "
+             "antes de abrir Ajustes.")
+    try:
+        fi = fp._win(hf)
+        b = fi.child_window(title="&Salir", class_name="TFlatButton")
+        r = b.rectangle()
+        ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+        time.sleep(0.8)
+    except Exception:
+        pass
+    import win32con
+    for _ in range(3):
+        hf = fp._find_hwnd(fp.FICHA_CLASS)
+        if not hf:
+            return
+        try:
+            win32gui.PostMessage(hf, win32con.WM_CLOSE, 0, 0)
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+
 def abrir_ajustes():
     import json
     ha = fp._find_hwnd(AJU_CLASS)
     if ha:
         return ha
+    _cerrar_ficha_si_abierta()
     hmain = fp._find_hwnd(fp.MAIN_CLASS)
     if not hmain:
         raise StockError("HybridLiteOS no está abierto.")
@@ -121,17 +155,30 @@ def _grilla(aj):
     return max(grids, key=lambda c: (lambda r: (r.right - r.left) * (r.bottom - r.top))(c.rectangle()))
 
 
-def _celdas(aj, grid):
+def _celdas(aj, grid, fila=0):
     """Controles de la fila activa: {codigo, conteo, existencia, diferencia}.
     OJO: en la columna Código conviven un editor VACÍO superpuesto (x~17) y la
     celda con el valor (x~18); para 'codigo' se prefiere el que TIENE texto.
-    Los numéricos (Conteo/Existencia/Diferencia) están en x distintos y ordenados."""
+    Los numéricos (Conteo/Existencia/Diferencia) están en x distintos y ordenados.
+
+    'fila' (default 0) desplaza la ventana de búsqueda a la fila N-ésima de la
+    grilla (0 = primera fila de datos), para poder verificar lotes multi-fila.
+    Con fila=0 el comportamiento es IDÉNTICO al original (usado por el flujo
+    single vía cargar_y_fijar). Solo la fila ACTIVA (con foco) tiene editores
+    THybridEdit/THybridEditNumber vivos: si no se encuentran, reintenta hasta
+    3 veces (0.4s) antes de devolver celdas vacías."""
     gr = grid.rectangle()
-    y0, y1 = gr.top, gr.top + 46
-    edits = [c for c in aj.descendants(class_name="THybridEdit")
-             if y0 < c.rectangle().top < y1 and gr.left <= c.rectangle().left < gr.right]
-    nums = [c for c in aj.descendants(class_name="THybridEditNumber")
-            if y0 < c.rectangle().top < y1 and gr.left <= c.rectangle().left < gr.right]
+    y0, y1 = gr.top + fila * ROW_H, gr.top + fila * ROW_H + 46
+
+    for intento in range(3):
+        edits = [c for c in aj.descendants(class_name="THybridEdit")
+                 if y0 < c.rectangle().top < y1 and gr.left <= c.rectangle().left < gr.right]
+        nums = [c for c in aj.descendants(class_name="THybridEditNumber")
+                if y0 < c.rectangle().top < y1 and gr.left <= c.rectangle().left < gr.right]
+        if edits or nums:
+            break
+        if intento < 2:
+            time.sleep(0.4)
     edits.sort(key=lambda c: c.rectangle().left)
     nums.sort(key=lambda c: c.rectangle().left)
 
@@ -152,8 +199,8 @@ def _celdas(aj, grid):
             "diferencia": diferencia}
 
 
-def _leer(aj, grid):
-    c = _celdas(aj, grid)
+def _leer(aj, grid, fila=0):
+    c = _celdas(aj, grid, fila)
     def txt(x): return (x.window_text() if x else "") or ""
     return {
         "codigo": txt(c["codigo"]).strip(),
@@ -239,6 +286,68 @@ def cargar_y_fijar(aj, grid, codigo, target):
     ri.press("ENTER")
     time.sleep(0.6)
     datos["existencia"] = existencia_ui
+    return datos
+
+
+def cargar_y_fijar_fila(aj, grid, codigo, target, fila):
+    """Igual que cargar_y_fijar, pero para la fila N-ésima de un LOTE multi-fila
+    (fila=0 es idéntico al flujo single: mismo punto de clic, misma verificación).
+    Tras postear la fila 0 el cursor pasa a la fila 1 y así sucesivamente, por lo
+    que cada fila se carga clicando su propia celda Código:
+        clic (gr.left+196, gr.top+40+fila*ROW_H) → código LENTO → ENTER (carga,
+        salta a Conteo) → cantidad DIRECTO → verificar → ENTER, ENTER (postea).
+    Verifica código y conteo ANTES de postear, leyendo la ventana de la fila
+    'fila' (vía _leer(..., fila)). NO hace _borrar_items por residuo (el lote
+    limpia la grilla una única vez al inicio, en ajustar_stock_lote)."""
+    gr = grid.rectangle()
+    _focus(fp._find_hwnd(AJU_CLASS))
+    ri.click(gr.left + 196, gr.top + 40 + fila * ROW_H)   # celda Código, fila N
+    time.sleep(0.3)
+    ri.type_code(codigo)                       # LENTO (evita truncado/búsqueda)
+    time.sleep(0.4)
+    ri.press("ENTER")                          # carga el producto y salta a Conteo
+    time.sleep(1.2)
+
+    # verificar que cargó el producto correcto ANTES de tocar la cantidad
+    datos = None
+    for _ in range(6):
+        datos = _leer(aj, grid, fila)
+        if datos["codigo"].lower() == codigo.strip().lower():
+            break
+        time.sleep(0.4)
+    if not datos or datos["codigo"].lower() != codigo.strip().lower():
+        raise StockError(f"La grilla NO cargó {codigo} en la fila {fila} "
+                         f"(código en grilla={datos['codigo'] if datos else None!r}). "
+                         f"Abortando para no ajustar otro producto.")
+    existencia_ui = datos["existencia"]
+    log.info("Fila %s: %s cargado. Existencia=%s, Conteo actual=%s.",
+             fila, codigo, existencia_ui, datos["conteo"])
+
+    # el cursor ya está en Conteo: teclear el objetivo DIRECTO (reemplaza el auto-relleno)
+    ri.type_number(f"{target:g}")
+    time.sleep(0.3)
+
+    # VERIFICAR ANTES de postear (la fila aún es editable y sus celdas son legibles).
+    # Tras el 2º ENTER la fila se 'postea' y queda estática -> ya no se puede leer.
+    datos = _leer(aj, grid, fila)
+    log.info("Fila %s antes de postear: código=%s conteo=%s existencia=%s",
+             fila, datos["codigo"], datos["conteo"], datos["existencia"])
+    if datos["codigo"].lower() != codigo.strip().lower():
+        raise StockError(f"La grilla muestra {datos['codigo']!r} en la fila {fila}, no {codigo}. "
+                         f"Abortando (NADA se guarda).")
+    if datos["conteo"] is None or abs(datos["conteo"] - target) > TOL:
+        raise StockError(f"El Conteo no quedó en {target} en la fila {fila} "
+                         f"(quedó {datos['conteo']}). NADA se guarda.")
+    if existencia_ui is None:
+        existencia_ui = datos["existencia"]
+
+    # postear la fila: ENTER (confirma conteo) + ENTER (postea -> lista para la siguiente)
+    ri.press("ENTER")
+    time.sleep(0.5)
+    ri.press("ENTER")
+    time.sleep(0.6)
+    datos["existencia"] = existencia_ui
+    log.info("Fila %s: %s existencia=%s target=%s", fila, codigo, existencia_ui, target)
     return datos
 
 
@@ -391,9 +500,13 @@ def ajustar_stock(codigo, cantidad, commit=False, delta=False):
     total_antes, filas_antes = dbex.existencia(codigo)
     log.info("Existencia en DB ANTES: %s", total_antes)
 
-    ha = abrir_ajustes()
-    aj = fp._win(ha)
-    grid = _grilla(aj)
+    # fallo abriendo la ventana = 100% pre-commit -> etapa reintentable
+    try:
+        ha = abrir_ajustes()
+        aj = fp._win(ha)
+        grid = _grilla(aj)
+    except StockError as e:
+        return {"ok": False, "etapa": "carga/conteo", "detalle": str(e), "db_antes": total_antes}
 
     # objetivo: absoluto o (con --delta) existencia_DB + cantidad
     target = total_antes + cantidad if delta else cantidad
@@ -437,10 +550,190 @@ def ajustar_stock(codigo, cantidad, commit=False, delta=False):
             "db_antes": total_antes, "db_despues": total_despues, "target": target}
 
 
+def _lote_fallo_uniforme(items_lote, etapa, detalle):
+    """Arma el resultado de fallo para TODO el lote con el mismo motivo (usado
+    para duplicados, abrir_hybrid, lectura de existencia previa, y 'totalizar')."""
+    resultados = {it["item_id"]: {"ok": False, "etapa": etapa, "detalle": detalle}
+                  for it in items_lote}
+    return {"ok": False, "etapa": etapa, "detalle": detalle, "resultados": resultados}
+
+
+def ajustar_stock_lote(items_lote, commit=False):
+    """Ajusta N productos en UN documento de ajuste de HybridLite.
+
+    items_lote: list[dict] con claves:
+        "item_id" (int)  — id de ordenes_cambio_items (para el mapa de resultados)
+        "codigo"  (str)  — código del producto
+        "delta"   (float)— cambio RELATIVO de stock (target = existencia_DB + delta)
+
+    Return: {
+        "ok":     bool,   # True solo si TODO el lote quedó ok
+        "etapa":  str,    # "commit" | "preview" | "abrir_hybrid" | "carga/conteo"
+                          # | "totalizar" | "verificacion_db"
+        "detalle": str,   # resumen humano del lote
+        "resultados": dict[int, dict],  # item_id -> {"ok": bool, "etapa": str, "detalle": str}
+    }
+    """
+    if not items_lote:
+        return {"ok": False, "etapa": "carga/conteo", "detalle": "Lote vacío.", "resultados": {}}
+
+    # 1) duplicados de código -> abortar SIN tocar la UI
+    codigos_norm = [it["codigo"].strip().lower() for it in items_lote]
+    vistos, dups = set(), set()
+    for c in codigos_norm:
+        (dups if c in vistos else vistos).add(c)
+    if dups:
+        detalle = f"Códigos duplicados en el lote: {sorted(dups)}. Nada se tocó."
+        log.error(detalle)
+        return _lote_fallo_uniforme(items_lote, "carga/conteo", detalle)
+
+    # 2) asegurar que Hybrid esté abierto y logueado (lo lanza si está cerrado)
+    import abrir_hybrid
+    ok, msg = abrir_hybrid.asegurar_hybrid()
+    if not ok:
+        return _lote_fallo_uniforme(items_lote, "abrir_hybrid", msg)
+
+    # 3) leer existencia DB de TODOS los códigos ANTES de empezar (targets absolutos)
+    existencias_antes = {}
+    for it in items_lote:
+        codigo = it["codigo"]
+        try:
+            total_antes, _ = dbex.existencia(codigo)
+        except Exception:
+            total_antes = None
+        if total_antes is None:
+            detalle = f"No se pudo leer la existencia en DB de {codigo}. Nada se tocó."
+            log.error(detalle)
+            return _lote_fallo_uniforme(items_lote, "carga/conteo", detalle)
+        existencias_antes[it["item_id"]] = total_antes
+
+    targets = {it["item_id"]: existencias_antes[it["item_id"]] + float(it["delta"])
+               for it in items_lote}
+    for it in items_lote:
+        log.info("Lote: item_id=%s codigo=%s existencia_db=%s delta=%s target=%s",
+                 it["item_id"], it["codigo"], existencias_antes[it["item_id"]],
+                 it["delta"], targets[it["item_id"]])
+
+    # fallo abriendo la ventana = 100% pre-commit -> etapa reintentable
+    try:
+        ha = abrir_ajustes()
+        aj = fp._win(ha)
+        grid = _grilla(aj)
+    except StockError as e:
+        log.error("Lote: no se pudo abrir la ventana de Ajustes: %s", e)
+        return _lote_fallo_uniforme(items_lote, "carga/conteo", str(e))
+    _borrar_items(aj)   # grilla limpia UNA vez al inicio del lote
+
+    # 4) llenar y verificar fila por fila
+    detalle_por_item = {}
+    culpable = None
+    for fila, it in enumerate(items_lote):
+        codigo, target = it["codigo"], targets[it["item_id"]]
+        try:
+            datos = cargar_y_fijar_fila(aj, grid, codigo, target, fila)
+        except StockError as e:
+            culpable = it
+            detalle_por_item[it["item_id"]] = str(e)
+            break
+        detalle_por_item[it["item_id"]] = (
+            f"Verificado en pantalla: existencia_db={existencias_antes[it['item_id']]} "
+            f"target={target} (dif {datos['diferencia']}).")
+
+    if culpable is not None:
+        # CUALQUIER fila falló su verificación -> cancelar TODO, nada se aplicó
+        _cancelar(aj)
+        _salir_ajustes(aj)
+        resultados = {}
+        for it in items_lote:
+            if it["item_id"] == culpable["item_id"]:
+                detalle = detalle_por_item[it["item_id"]]
+            else:
+                detalle = f"lote cancelado por fallo en {culpable['codigo']}"
+            resultados[it["item_id"]] = {"ok": False, "etapa": "carga/conteo", "detalle": detalle}
+        detalle_global = (f"Lote CANCELADO (nada se aplicó): fallo en {culpable['codigo']} "
+                          f"- {detalle_por_item[culpable['item_id']]}")
+        log.error(detalle_global)
+        return {"ok": False, "etapa": "carga/conteo", "detalle": detalle_global,
+                "resultados": resultados}
+
+    # 5) preview: todas las filas verificadas -> cancelar (no crea documento)
+    if not commit:
+        _cancelar(aj)
+        _salir_ajustes(aj)
+        resultados = {it["item_id"]: {"ok": True, "etapa": "preview",
+                                       "detalle": detalle_por_item[it["item_id"]]}
+                      for it in items_lote}
+        detalle_global = (f"Preview de {len(items_lote)} ítem(s) verificado(s) en pantalla y "
+                          f"DESCARTADO (sin --commit).")
+        return {"ok": True, "etapa": "preview", "detalle": detalle_global, "resultados": resultados}
+
+    # 6) COMMIT: Totalizar UNA sola vez para todo el lote
+    if not _totalizar_y_guardar(aj):
+        detalle = "No pude confirmar el guardado (Totalizar/SÍ). Estado AMBIGUO, no reintentable."
+        log.error(detalle)
+        return _lote_fallo_uniforme(items_lote, "totalizar", detalle)
+
+    _salir_ajustes(aj)
+    time.sleep(1.2)
+
+    # 7) verificación DB por item
+    resultados = {}
+    todos_ok = True
+    for it in items_lote:
+        codigo, target = it["codigo"], targets[it["item_id"]]
+        total_despues, _ = dbex.existencia(codigo)
+        log.info("Lote verificación DB: item_id=%s codigo=%s despues=%s target=%s",
+                 it["item_id"], codigo, total_despues, target)
+        if total_despues is not None and abs(total_despues - target) <= 0.01:
+            resultados[it["item_id"]] = {"ok": True, "etapa": "commit",
+                "detalle": f"Stock ajustado y VERIFICADO en DB: {total_despues}"}
+        else:
+            todos_ok = False
+            resultados[it["item_id"]] = {"ok": False, "etapa": "verificacion_db",
+                "detalle": f"¡ALERTA! DB quedó en {total_despues}, no en {target}. Revisar."}
+
+    etapa_global = "commit" if todos_ok else "verificacion_db"
+    detalle_global = (f"Lote de {len(items_lote)} ítem(s) totalizado y guardado. "
+                      f"{'Todos verificados en DB.' if todos_ok else 'ALERTA: hay ítems que no cuadran en DB, revisar resultados.'}")
+    return {"ok": todos_ok, "etapa": etapa_global, "detalle": detalle_global, "resultados": resultados}
+
+
 if __name__ == "__main__":
+    if "--lote" in sys.argv:
+        idx = sys.argv.index("--lote")
+        try:
+            spec = sys.argv[idx + 1]
+        except IndexError:
+            print("Uso: python flujo_stock_real.py --lote \"COD1:delta1,COD2:delta2\" [--commit]")
+            sys.exit(1)
+        items_lote = []
+        for n, par in enumerate(spec.split(","), start=1):
+            codigo, _, delta = par.partition(":")
+            codigo = codigo.strip()
+            if not codigo or not delta:
+                print(f"Par inválido en --lote: {par!r} (formato codigo:delta)")
+                sys.exit(1)
+            try:
+                delta_val = float(delta)
+            except ValueError:
+                print(f"Delta inválido en --lote: {par!r}")
+                sys.exit(1)
+            items_lote.append({"item_id": n, "codigo": codigo, "delta": delta_val})
+        res = ajustar_stock_lote(items_lote, commit="--commit" in sys.argv)
+        print("\n=== RESULTADO LOTE ===")
+        for k, v in res.items():
+            if k == "resultados":
+                print("  resultados:")
+                for item_id, r in v.items():
+                    print(f"    item_id={item_id}: {r}")
+            else:
+                print(f"  {k}: {v}")
+        sys.exit(0)
+
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if len(args) < 2:
         print("Uso: python flujo_stock_real.py <codigo> <cantidad> [--commit] [--delta]")
+        print("     python flujo_stock_real.py --lote \"COD1:delta1,COD2:delta2\" [--commit]")
         sys.exit(1)
     res = ajustar_stock(args[0], args[1],
                         commit="--commit" in sys.argv, delta="--delta" in sys.argv)

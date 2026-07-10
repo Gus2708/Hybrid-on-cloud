@@ -142,6 +142,24 @@ def _db_precio_usd(codigo):
     return None
 
 
+def _db_costo_usd(codigo):
+    """Lee de DBISAM el TPC_COSTOACTUAL del registro TIPO=1 (USD), SOLO LECTURA.
+
+    Mismo registro/fila que _db_precio_usd (confirmado: odbc_test.py consulta
+    TPC_COSTOACTUAL y TPC_PVPCONIMPUESTO1 en el mismo SELECT). TPC_COSTOACTUAL
+    es el costo USD sin IVA que maneja la app (campo 'Costo Actual' visible en
+    campos_precio.png bajo 'Costos Moneda Referencial' = 6.06 para ese producto)."""
+    db = read_db_precio.pydbisam.PyDBISAM(read_db_precio.RUTA)
+    campos = db.fields()
+    idx = {n: i for i, n in enumerate(campos)}
+    if "TPC_COSTOACTUAL" not in idx:
+        return None
+    for row in db.rows():
+        if str(row[idx["TPC_CODIGOPRODUCTO"]]).strip() == codigo and row[idx["TPC_TIPO"]] == 1:
+            return float(row[idx["TPC_COSTOACTUAL"]])
+    return None
+
+
 def set_price(codigo, target, iva=0.16, commit=False):
     """Punto de entrada. Devuelve dict resultado."""
     target = float(target)

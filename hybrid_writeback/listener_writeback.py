@@ -1,14 +1,17 @@
 """
-listener_writeback.py — Canal App (El Serrucho Go) -> Local (write-back de stock).
+listener_writeback.py — Canal App (El Serrucho Go) -> Local (write-back de
+stock, precio y costo).
 
 Sondea `ordenes_cambio_items` (tabla que la app YA llena al emitir una Orden de
 Cambio, ver el-serrucho-go/src/hooks/useOrdenCambio.ts) y, por cada item de una
-orden con status='emitido' que todavía no fue aplicado, ajusta el stock en
-HybridLite vía flujo_stock_real.py (input real de hardware), usando el `delta`
-que la propia app ya calcula (nueva_existencia - existencia_actual). Marca el
-resultado en columnas nuevas `backend_*` (migración 018 en el-serrucho-go;
-vocabulario de estados `pendiente / aplicando / error / completado`, backfill
-en migración 019).
+orden con status='emitido' que todavía no fue aplicado, ajusta stock y/o
+precio/costo en HybridLite vía flujo_stock_real.py y flujo_precio_real.py
+(input real de hardware). El `delta` de stock ya viene calculado por la app
+(nueva_existencia - existencia_actual); el `costo` viene como snapshot en
+TODOS los items (haya cambiado o no) y se compara contra HybridLite antes de
+decidir si hay que escribirlo. Marca el resultado en columnas `backend_*`
+(migración 018 en el-serrucho-go; vocabulario de estados `pendiente /
+aplicando / error / completado`, backfill en migración 019).
 
 No toca `ordenes_cambio.status` ni el PDF: ese flujo lo sigue manejando la app
 igual que hoy. Este listener corre en paralelo, es independiente.
@@ -18,13 +21,44 @@ el backend necesita SUPABASE_SERVICE_KEY (config.py) para leer las filas de
 todos los usuarios. Con solo la anon key el listener vería siempre 0 filas —
 no es un error, es RLS filtrando en silencio.
 
+ORQUESTACIÓN por pasada (procesar_pendientes): los pendientes se agrupan por
+orden_id (preservando el orden por id asc de get_pendientes). Por cada orden:
+  1. FASE STOCK primero. Si la orden trae 2+ items con cambio de stock, se
+     aplican todos en UN SOLO documento de ajuste (flujo_stock_real.
+     ajustar_stock_lote: abre la ventana de HybridLite una vez, totaliza una
+     vez) en vez de un documento por item. Con 1 solo item se usa el flujo
+     individual de siempre (ajustar_stock).
+  2. FASE PRECIO/COSTO después, item por item (flujo_precio_real.
+     set_precio_costo: costo PRIMERO, precio después, en una sola sesión de
+     Ficha). Si un item tenía parte de stock y esa parte FALLÓ, su parte de
+     precio/costo NO se ejecuta esta pasada (se reintenta completa en la
+     próxima corrida; precio y costo son valores absolutos e idempotentes,
+     así que repetir la parte de stock ya aplicada junto con precio/costo no
+     hace daño).
+El estado final de cada item es la fusión de las partes que efectivamente se
+ejecutaron (stock y/o precio/costo): 'completado' solo si todas cerraron en
+etapa "commit"; '[PREVIEW] ...' si todas fueron ok pero sin commit real;
+si alguna parte falló, se aplica la política de reintentos de siempre sobre
+ESA parte (ver SEGURIDAD más abajo).
+
 SEGURIDAD:
   * Mientras HYBRID_WRITE_ENABLED no sea "1", cada item se procesa en modo
     PREVIEW (commit=False): navega y verifica en pantalla, pero cancela sin
     persistir nada en HybridLite.
-  * Procesa un item a la vez (sin concurrencia sobre la app).
+  * Todo el procesamiento de una pasada (si hay al menos un item pendiente)
+    corre dentro de `with control_seguro():` (safety_control.py): banner
+    rojo topmost + hotkey F12 de aborto + BlockInput si hay privilegios de
+    admin. Si el módulo no está disponible (import falla), se degrada con
+    gracia: procesa igual pero SIN overlay, con un log.warning una sola vez
+    (no por pasada, por vida del proceso).
   * `delta` NULL -> error inmediato (dato mal generado, no se reintenta).
     `delta` 0 -> se marca 'completado' sin tocar HybridLite (nada que aplicar).
+  * Detección de cambio de costo, fail-closed: se compara el `costo` del item
+    contra flujo_precio_real.db_costo_usd(codigo) (lectura directa de DBISAM,
+    sin abrir la ficha). Si esa lectura devuelve None (no se puede leer), NO
+    se asume que hay cambio de costo — abrir la ficha de cada item a ciegas
+    "por si acaso" sería más riesgoso que no tocar el costo esa pasada. Se
+    avisa con un log.warning una sola vez por proceso.
   * Guard de unidad `H:`: si `TExistenciaInv.Dat` no es accesible (caída de
     red / VPN), la pasada NO pide pendientes ni procesa nada (evita quemar
     intentos por un FileNotFoundError de arranque).
@@ -34,15 +68,21 @@ SEGURIDAD:
     Solo aplica al bucle continuo con HYBRID_WRITE_ENABLED=1; `--once` la
     ignora (corrida manual supervisada).
   * Reintentos limitados y conservadores: un fallo en una etapa PRE-commit
-    ("abrir_hybrid", "carga/conteo") reintenta hasta MAX_INTENTOS; un fallo en
-    cualquier etapa AMBIGUA (post-commit, o excepción) marca 'error' de
-    inmediato, sin reintentar — el ajuste es relativo (delta) y reintentar un
-    commit ambiguo puede aplicarlo dos veces y desajustar el inventario real.
+    ("abrir_hybrid", "carga/conteo", "escritura", "aceptar") reintenta hasta
+    MAX_INTENTOS; un fallo en cualquier etapa AMBIGUA (post-commit, o
+    excepción) marca 'error' de inmediato, sin reintentar — el ajuste de
+    stock es relativo (delta) y reintentar un commit ambiguo puede aplicarlo
+    dos veces y desajustar el inventario real.
   * Al arrancar, recupera huérfanos: items que quedaron en 'aplicando' por una
     corrida anterior interrumpida se marcan 'error' (mismo motivo: no se sabe
     si el commit llegó a aplicarse).
   * En bucle continuo (sin --once), si HYBRID_WRITE_ENABLED != 1 no se procesa
     nada (evita tomar el mouse en preview sin fin cada POLL_INTERVAL).
+  * Al arrancar, se loguea la fecha de modificación del propio archivo
+    (`codigo listener del ...`) — lección de un incidente real donde un
+    proceso viejo quedó corriendo en memoria y procesó pendientes con código
+    stale sin que nadie lo notara; ahora queda en writeback.log para cruzar
+    contra el historial de git.
 
 Uso:
     python listener_writeback.py            # bucle continuo
@@ -72,6 +112,11 @@ import flujo_stock_real
 import flujo_precio_real
 import read_db_existencia
 
+try:
+    from safety_control import control_seguro
+except Exception:  # pragma: no cover
+    control_seguro = None
+
 HYBRID_WRITE_ENABLED = os.environ.get("HYBRID_WRITE_ENABLED") == "1"
 
 # force=True: los módulos importados arriba (flujo_stock_real, etc.) ya llamaron
@@ -94,10 +139,10 @@ TABLE = "ordenes_cambio_items"
 POLL_INTERVAL = 8          # segundos entre sondeos
 MAX_INTENTOS = 3
 
-# Etapas de flujo_stock_real.ajustar_stock() y flujo_precio_real.set_precio() anteriores
-# a cualquier commit en HybridLite: un fallo ahí es reintentable sin riesgo. Cualquier
-# otra etapa (post-commit, ambigua) o una excepción se tratan como error inmediato en
-# procesar() — ver comentario ahí (F5).
+# Etapas de flujo_stock_real.ajustar_stock[_lote]() y flujo_precio_real.
+# set_precio_costo() anteriores a cualquier commit en HybridLite: un fallo ahí
+# es reintentable sin riesgo. Cualquier otra etapa (post-commit, ambigua) o
+# una excepción se tratan como error inmediato — ver _politica_resultado (F5).
 ETAPAS_REINTENTABLES = ("abrir_hybrid", "carga/conteo", "escritura", "aceptar")
 
 API_KEY = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
@@ -201,7 +246,7 @@ def get_pendientes():
         path = (f"{TABLE}?backend_status=eq.pendiente"
                 f"&select=id,orden_id,codigo_producto,descripcion,delta,"
                 f"existencia_actual,nueva_existencia,backend_intentos,"
-                f"precio_actual,nuevo_precio,"
+                f"precio_actual,nuevo_precio,costo,"
                 f"ordenes_cambio!inner(status,creado_por)"
                 f"&ordenes_cambio.status=eq.emitido"
                 f"&ordenes_cambio.creado_por=not.is.null"
@@ -251,88 +296,302 @@ def recuperar_huerfanos():
         log.warning("No pude chequear/recuperar huérfanos 'aplicando' (sigo igual): %r", e)
 
 
-# ─── Procesamiento de un item ──────────────────────────────────────────────────
-def procesar(item):
-    iid = item["id"]
-    codigo = item.get("codigo_producto")
+# ─── Detección de cambios por item ─────────────────────────────────────────────
+_AVISO_SIN_SAFETY_CONTROL = False
+_AVISO_SIN_COSTO_DB = False
+
+
+def _tiene_stock_cambio(item):
     delta = item.get("delta")
     nueva_existencia = item.get("nueva_existencia")
+    return nueva_existencia is not None and delta is not None and float(delta) != 0
+
+
+def _tiene_precio_cambio(item):
     precio_actual = item.get("precio_actual")
     nuevo_precio = item.get("nuevo_precio")
-    intentos = (item.get("backend_intentos") or 0) + 1
+    return nuevo_precio is not None and precio_actual is not None and float(nuevo_precio) != float(precio_actual)
 
-    log.info("Procesando item %s (orden %s): codigo=%s delta=%s nueva_existencia=%s precio_actual=%s nuevo_precio=%s intento=%s",
-              iid, item.get("orden_id"), codigo, delta, nueva_existencia, precio_actual, nuevo_precio, intentos)
 
-    tiene_stock_cambio = nueva_existencia is not None and delta is not None and float(delta) != 0
-    tiene_precio_cambio = nuevo_precio is not None and precio_actual is not None and float(nuevo_precio) != float(precio_actual)
+def _tiene_costo_cambio(item, cache_costo_db):
+    """F9 — costo vía DBISAM, fail-closed.
 
-    if not tiene_stock_cambio and not tiene_precio_cambio:
-        # Nada que cambiar (o delta es 0 y el precio es igual)
-        update_item(iid, backend_status="completado",
-                    backend_resultado="Sin cambios de stock ni de precio a realizar.",
-                    backend_aplicado_en=datetime.datetime.now(datetime.timezone.utc).isoformat())
-        log.info("Item %s sin cambios reales -> 'completado' sin tocar HybridLite.", iid)
-        return
+    La app manda `costo` como snapshot en TODOS los items (haya cambiado o
+    no), así que no alcanza con "item trae costo": hay que comparar contra lo
+    que hoy tiene HybridLite (flujo_precio_real.db_costo_usd, lectura directa
+    de DBISAM, sin abrir la ficha). Si esa lectura falla (None), NO asumimos
+    que hay cambio — abrir la ficha de cada item a ciegas para "ver si acaso"
+    sería más riesgoso que no tocar el costo esta pasada. Se avisa una sola
+    vez por proceso (no una vez por item) para no inundar el log.
+    """
+    global _AVISO_SIN_COSTO_DB
+    costo = item.get("costo")
+    if costo is None:
+        return False
+    codigo = item.get("codigo_producto")
+    if codigo not in cache_costo_db:
+        try:
+            cache_costo_db[codigo] = flujo_precio_real.db_costo_usd(codigo)
+        except Exception as e:
+            log.warning("db_costo_usd(%s) lanzó excepción, tratando como no legible: %r", codigo, e)
+            cache_costo_db[codigo] = None
+    db_costo = cache_costo_db[codigo]
+    if db_costo is None:
+        if not _AVISO_SIN_COSTO_DB:
+            log.warning("no puedo leer costo de DBISAM; cambios de costo no se aplicarán "
+                        "automáticamente esta pasada.")
+            _AVISO_SIN_COSTO_DB = True
+        return False
+    return abs(float(costo) - float(db_costo)) > 0.01
 
-    # Marca 'aplicando' (lock optimista)
-    if not update_item(iid, backend_status="aplicando", backend_intentos=intentos):
-        return
 
-    res = {"ok": True, "etapa": "inicio", "detalle": "Iniciando proceso"}
-    try:
-        # 1. Aplicar cambio de precio si corresponde
-        if tiene_precio_cambio:
-            log.info("Aplicando cambio de precio a %s: %s -> %s", codigo, precio_actual, nuevo_precio)
-            res = flujo_precio_real.set_precio(codigo, float(nuevo_precio), commit=HYBRID_WRITE_ENABLED)
-            if not res["ok"]:
-                log.error("Fallo aplicando precio a %s: %s", codigo, res["detalle"])
-
-        # 2. Aplicar cambio de stock si corresponde y el precio fue exitoso (o no había cambio de precio)
-        if res["ok"] and tiene_stock_cambio:
-            log.info("Aplicando cambio de stock a %s: delta=%s", codigo, delta)
-            res_stock = flujo_stock_real.ajustar_stock(codigo, float(delta),
-                                                       commit=HYBRID_WRITE_ENABLED, delta=True)
-            if tiene_precio_cambio:
-                # Combinamos detalles
-                res["detalle"] = f"Precio: {res['detalle']} | Stock: {res_stock['detalle']}"
-                res["ok"] = res_stock["ok"]
-                res["etapa"] = res_stock["etapa"]
-            else:
-                res = res_stock
-
-    except Exception as e:
-        res = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
-
-    # Con HYBRID_WRITE_ENABLED apagado, todo queda en preview
+# ─── Política de reintentos / traducción resultado -> estado ──────────────────
+def _politica_resultado(res, intentos):
+    """Traduce un resultado {"ok","etapa","detalle"} de un flujo a
+    (status, resultado) según la política conservadora de F5:
+    commit real -> 'completado'; ok pero sin commit -> preview, sigue
+    'pendiente'; fallo en etapa reintentable -> 'pendiente'/'error' según
+    MAX_INTENTOS; fallo en etapa ambigua -> 'error' inmediato."""
     if res["ok"] and HYBRID_WRITE_ENABLED and res.get("etapa") == "commit":
-        update_item(iid, backend_status="completado", backend_resultado=res["detalle"],
+        return "completado", res["detalle"]
+    if res["ok"]:
+        return "pendiente", f"[PREVIEW] {res['detalle']}"
+    etapa = res.get("etapa")
+    if etapa in ETAPAS_REINTENTABLES:
+        final = "error" if intentos >= MAX_INTENTOS else "pendiente"
+        return final, res["detalle"]
+    resultado = (f"{res['detalle']} | ATENCIÓN: fallo en etapa ambigua "
+                 f"(etapa={etapa!r}) — verificar en HybridLite si el ajuste "
+                 f"se aplicó ANTES de reencolar manualmente (riesgo de "
+                 f"ajuste doble/precio parcial).")
+    return "error", resultado
+
+
+def _aplicar_resultado_final(iid, partes, intentos):
+    """Fusiona 1 o 2 partes ({"nombre": str, "res": dict}) en el estado final
+    de un item y persiste con update_item(). `partes` solo trae las fases que
+    realmente se ejecutaron (una fase salteada por F10 no aparece acá)."""
+    combinados = []
+    peor_status_rank = {"completado": 0, "pendiente": 1, "error": 2}
+    status_final = "completado"
+    for parte in partes:
+        status, resultado = _politica_resultado(parte["res"], intentos)
+        combinados.append(f"{parte['nombre']}: {resultado}")
+        if peor_status_rank[status] > peor_status_rank[status_final]:
+            status_final = status
+
+    resultado_final = " | ".join(combinados)
+    if status_final == "completado":
+        update_item(iid, backend_status="completado", backend_resultado=resultado_final,
                     backend_aplicado_en=datetime.datetime.now(datetime.timezone.utc).isoformat())
-        log.info("OK item %s: %s", iid, res["detalle"])
-    elif res["ok"]:
-        update_item(iid, backend_status="pendiente", backend_resultado=f"[PREVIEW] {res['detalle']}")
-        log.info("PREVIEW item %s (HYBRID_WRITE_ENABLED=0, no se aplicó): %s", iid, res["detalle"])
+        log.info("OK item %s: %s", iid, resultado_final)
+    elif status_final == "pendiente":
+        update_item(iid, backend_status="pendiente", backend_resultado=resultado_final)
+        log.info("PENDIENTE/PREVIEW item %s: %s", iid, resultado_final)
     else:
-        # Política de reintentos conservadora.
-        etapa = res.get("etapa")
-        if etapa in ETAPAS_REINTENTABLES:
-            final = "error" if intentos >= MAX_INTENTOS else "pendiente"
-            update_item(iid, backend_status=final, backend_resultado=res["detalle"])
-            log.warning("FALLO item %s (%s, etapa=%s reintentable): %s",
-                        iid, final, etapa, res["detalle"])
-        else:
-            resultado = (f"{res['detalle']} | ATENCIÓN: fallo en etapa ambigua "
-                         f"(etapa={etapa!r}) — verificar en HybridLite si el ajuste "
-                         f"se aplicó ANTES de reencolar manualmente (riesgo de "
-                         f"ajuste doble/precio parcial).")
-            update_item(iid, backend_status="error", backend_resultado=resultado)
-            log.error("FALLO item %s (error inmediato, etapa=%s NO reintentable): %s",
-                      iid, etapa, res["detalle"])
+        update_item(iid, backend_status="error", backend_resultado=resultado_final)
+        log.error("FALLO item %s (status=error): %s", iid, resultado_final)
+
+
+# ─── Fase STOCK de una orden (F10 — lote si hay >=2 items) ─────────────────────
+_LOCK_FALLIDO = {"ok": False, "etapa": "carga/conteo",
+                  "detalle": "No pude marcar 'aplicando' en Supabase (fallo de red/API); "
+                             "no se tocó HybridLite para este item, reintentable."}
+
+
+def _fase_stock_orden(items_con_stock):
+    """Aplica la parte de stock de una orden. Devuelve dict[item_id -> dict con
+    resultado de flujo_stock_real] SOLO para los items con cambio de stock."""
+    resultados = {}
+    if not items_con_stock:
+        return resultados
+
+    if len(items_con_stock) >= 2:
+        lote = []
+        for item in items_con_stock:
+            iid = item["id"]
+            intentos = (item.get("backend_intentos") or 0) + 1
+            if not update_item(iid, backend_status="aplicando", backend_intentos=intentos):
+                # No se pudo tomar el lock optimista: fuera del lote, no se
+                # toca Hybrid para este item esta pasada (reintentable).
+                resultados[iid] = dict(_LOCK_FALLIDO)
+                continue
+            lote.append({"item_id": iid, "codigo": item.get("codigo_producto"),
+                         "delta": float(item["delta"])})
+        if lote:
+            log.info("Fase stock en LOTE: %s item(s) -> ajustar_stock_lote", len(lote))
+            try:
+                res_lote = flujo_stock_real.ajustar_stock_lote(lote, commit=HYBRID_WRITE_ENABLED)
+            except Exception as e:
+                res_lote = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}", "resultados": {}}
+            resultados_por_id = res_lote.get("resultados") or {}
+            for entrada in lote:
+                iid = entrada["item_id"]
+                if iid in resultados_por_id:
+                    resultados[iid] = resultados_por_id[iid]
+                else:
+                    # El lote entero falló antes de poder discriminar por fila
+                    # (p.ej. excepción o fallo abriendo Hybrid): todos heredan
+                    # el resultado global del lote.
+                    resultados[iid] = {"ok": res_lote["ok"], "etapa": res_lote["etapa"],
+                                        "detalle": res_lote["detalle"]}
+    else:
+        item = items_con_stock[0]
+        iid = item["id"]
+        intentos = (item.get("backend_intentos") or 0) + 1
+        if not update_item(iid, backend_status="aplicando", backend_intentos=intentos):
+            resultados[iid] = dict(_LOCK_FALLIDO)
+            return resultados
+        codigo = item.get("codigo_producto")
+        delta = float(item["delta"])
+        log.info("Fase stock INDIVIDUAL: item %s codigo=%s delta=%s", iid, codigo, delta)
+        try:
+            resultados[iid] = flujo_stock_real.ajustar_stock(codigo, delta,
+                                                              commit=HYBRID_WRITE_ENABLED, delta=True)
+        except Exception as e:
+            resultados[iid] = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
+
+    return resultados
+
+
+# ─── Fase PRECIO/COSTO de un item ──────────────────────────────────────────────
+def _fase_precio_costo_item(item, ya_estaba_aplicando):
+    """Aplica la parte de precio/costo de UN item. `ya_estaba_aplicando`
+    indica si el item ya venía marcado 'aplicando' por la fase de stock (para
+    no reescribir backend_intentos dos veces)."""
+    iid = item["id"]
+    codigo = item.get("codigo_producto")
+    nuevo_precio = item.get("nuevo_precio")
+    costo = item.get("costo")
+    tiene_precio = _tiene_precio_cambio(item)
+    tiene_costo = item.get("_tiene_costo_cambio", False)
+
+    if not ya_estaba_aplicando:
+        intentos = (item.get("backend_intentos") or 0) + 1
+        if not update_item(iid, backend_status="aplicando", backend_intentos=intentos):
+            return dict(_LOCK_FALLIDO)
+
+    log.info("Fase precio/costo: item %s codigo=%s nuevo_precio=%s nuevo_costo=%s",
+              iid, codigo, nuevo_precio if tiene_precio else None, costo if tiene_costo else None)
+    try:
+        return flujo_precio_real.set_precio_costo(
+            codigo,
+            nuevo_precio=float(nuevo_precio) if tiene_precio else None,
+            nuevo_costo=float(costo) if tiene_costo else None,
+            commit=HYBRID_WRITE_ENABLED,
+        )
+    except Exception as e:
+        return {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
+
+
+# ─── Orquestación de una pasada completa ───────────────────────────────────────
+def procesar_pendientes(items):
+    """Agrupa `items` (ya ordenados por id asc, ver get_pendientes) por orden,
+    y por cada orden corre FASE STOCK (lote si hay >=2 items con cambio de
+    stock) y luego FASE PRECIO/COSTO item por item. Ver docstring del módulo
+    (sección ORQUESTACIÓN) para la política completa."""
+    global _AVISO_SIN_SAFETY_CONTROL
+    if not items:
+        return
+
+    if control_seguro is None:
+        if not _AVISO_SIN_SAFETY_CONTROL:
+            log.warning("safety_control no disponible: procesando SIN overlay/F12/BlockInput "
+                        "(degradado, ver import al inicio del módulo).")
+            _AVISO_SIN_SAFETY_CONTROL = True
+        _procesar_pendientes_impl(items)
+    else:
+        with control_seguro():
+            _procesar_pendientes_impl(items)
+
+
+def _procesar_pendientes_impl(items):
+    ordenes = {}
+    for item in items:
+        ordenes.setdefault(item.get("orden_id"), []).append(item)
+
+    cache_costo_db = {}
+
+    for orden_id, items_orden in ordenes.items():
+        log.info("=== Orden %s: %s item(s) pendiente(s) ===", orden_id, len(items_orden))
+
+        items_sin_cambios = []
+        items_con_stock = []
+        items_con_precio_o_costo = []
+        for item in items_orden:
+            item["_tiene_stock_cambio"] = _tiene_stock_cambio(item)
+            item["_tiene_precio_cambio"] = _tiene_precio_cambio(item)
+            item["_tiene_costo_cambio"] = _tiene_costo_cambio(item, cache_costo_db)
+            if not item["_tiene_stock_cambio"] and not item["_tiene_precio_cambio"] and not item["_tiene_costo_cambio"]:
+                items_sin_cambios.append(item)
+            else:
+                if item["_tiene_stock_cambio"]:
+                    items_con_stock.append(item)
+                if item["_tiene_precio_cambio"] or item["_tiene_costo_cambio"]:
+                    items_con_precio_o_costo.append(item)
+
+        for item in items_sin_cambios:
+            iid = item["id"]
+            update_item(iid, backend_status="completado",
+                        backend_resultado="Sin cambios de stock, precio ni costo a realizar.",
+                        backend_aplicado_en=datetime.datetime.now(datetime.timezone.utc).isoformat())
+            log.info("Item %s sin cambios reales -> 'completado' sin tocar HybridLite.", iid)
+
+        # FASE STOCK primero.
+        try:
+            resultados_stock = _fase_stock_orden(items_con_stock)
+        except Exception as e:
+            resultados_stock = {item["id"]: {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
+                                 for item in items_con_stock}
+
+        # FASE PRECIO/COSTO después, item por item.
+        partes_por_item = {}
+        for item in items_con_stock:
+            partes_por_item.setdefault(item["id"], []).append(
+                {"nombre": "Stock", "res": resultados_stock[item["id"]]})
+
+        for item in items_con_precio_o_costo:
+            iid = item["id"]
+            stock_res = resultados_stock.get(iid)
+            if stock_res is not None and not stock_res["ok"]:
+                # F10 — el item tenía parte de stock y falló: no tocamos su
+                # parte de precio/costo esta pasada (el reintento re-corre
+                # todo; precio/costo son valores absolutos e idempotentes).
+                log.warning("Item %s: se salta fase precio/costo esta pasada porque su "
+                            "parte de stock falló (etapa=%s).", iid, stock_res.get("etapa"))
+                continue
+            try:
+                res_pc = _fase_precio_costo_item(item, ya_estaba_aplicando=iid in resultados_stock)
+            except Exception as e:
+                res_pc = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
+            partes_por_item.setdefault(iid, []).append({"nombre": "Precio/Costo", "res": res_pc})
+
+        for iid, partes in partes_por_item.items():
+            item = next(i for i in items_orden if i["id"] == iid)
+            intentos = (item.get("backend_intentos") or 0) + 1
+            _aplicar_resultado_final(iid, partes, intentos)
+
+    # Higiene de cierre: el flujo de precio/costo deja la Ficha abierta a
+    # propósito (la reutiliza entre items de la misma pasada), pero no debe
+    # quedar abierta en el POS al terminar — un empleado podría encontrarla
+    # y guardar algo sin querer.
+    try:
+        flujo_stock_real._cerrar_ficha_si_abierta()
+    except Exception as e:
+        log.warning("No pude cerrar la Ficha al final de la pasada: %r", e)
 
 
 def loop(once=False):
     log.info("=== listener_writeback iniciado (HYBRID_WRITE_ENABLED=%s, tabla=%s) ===",
              HYBRID_WRITE_ENABLED, TABLE)
+    # F11 — lección de un incidente real: un proceso viejo quedó corriendo en
+    # memoria y procesó pendientes con código stale (una corrección ya
+    # publicada en el archivo nunca llegó a aplicarse) sin que nadie lo
+    # notara hasta después. Este log deja la fecha de modificación del
+    # archivo en cada arranque, para poder cruzar "¿qué versión corrió
+    # realmente esta noche?" contra el historial de git.
+    log.info("codigo listener del %s",
+             datetime.datetime.fromtimestamp(os.path.getmtime(__file__)).strftime("%Y-%m-%d %H:%M"))
     if not HYBRID_WRITE_ENABLED and not once:
         log.warning("HYBRID_WRITE_ENABLED != 1: en bucle continuo NO se procesan "
                      "items (evita tomar el mouse en preview sin fin). Usá --once "
@@ -385,8 +644,7 @@ def loop(once=False):
                     log.info("Vuelve a estado operativo: se procesan pendientes normalmente.")
                     ultimo_motivo_skip = None
                 if HYBRID_WRITE_ENABLED or once:
-                    for item in get_pendientes():
-                        procesar(item)
+                    procesar_pendientes(get_pendientes())
             else:
                 clave, mensaje = motivo_skip
                 if clave != ultimo_motivo_skip:
