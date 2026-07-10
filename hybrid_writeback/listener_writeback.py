@@ -22,19 +22,23 @@ todos los usuarios. Con solo la anon key el listener vería siempre 0 filas —
 no es un error, es RLS filtrando en silencio.
 
 ORQUESTACIÓN por pasada (procesar_pendientes): los pendientes se agrupan por
-orden_id (preservando el orden por id asc de get_pendientes). Por cada orden:
-  1. FASE STOCK primero. Si la orden trae 2+ items con cambio de stock, se
-     aplican todos en UN SOLO documento de ajuste (flujo_stock_real.
-     ajustar_stock_lote: abre la ventana de HybridLite una vez, totaliza una
-     vez) en vez de un documento por item. Con 1 solo item se usa el flujo
-     individual de siempre (ajustar_stock).
-  2. FASE PRECIO/COSTO después, item por item (flujo_precio_real.
-     set_precio_costo: costo PRIMERO, precio después, en una sola sesión de
-     Ficha). Si un item tenía parte de stock y esa parte FALLÓ, su parte de
+orden_id (preservando el orden por id asc de get_pendientes) y se procesan en
+DOS FASES GLOBALES (pedido del dueño: primero TODAS las cantidades, después
+TODOS los precios):
+  1. FASE STOCK GLOBAL. Para cada orden con items de stock, un documento de
+     ajuste: 2+ items -> flujo_stock_real.ajustar_stock_lote (abre la ventana
+     una vez, totaliza una vez; lotes largos se trocean en documentos de
+     MAX_FILAS_LOTE filas); 1 item -> ajustar_stock individual. Todas las
+     órdenes hacen su fase de stock ANTES de tocar ningún precio.
+  2. FASE PRECIO/COSTO GLOBAL después, item por item de todas las órdenes
+     (flujo_precio_real.set_precio_costo: costo PRIMERO, precio después, en
+     una sola sesión de Ficha, que se reutiliza entre items consecutivos).
+     Si un item tenía parte de stock y esa parte FALLÓ, su parte de
      precio/costo NO se ejecuta esta pasada (se reintenta completa en la
      próxima corrida; precio y costo son valores absolutos e idempotentes,
      así que repetir la parte de stock ya aplicada junto con precio/costo no
      hace daño).
+El banner de seguridad muestra el avance en vivo (orden/fase/ítem actual).
 El estado final de cada item es la fusión de las partes que efectivamente se
 ejecutaron (stock y/o precio/costo): 'completado' solo si todas cerraron en
 etapa "commit"; '[PREVIEW] ...' si todas fueron ok pero sin commit real;
@@ -250,7 +254,7 @@ def get_pendientes():
                 f"ordenes_cambio!inner(status,creado_por)"
                 f"&ordenes_cambio.status=eq.emitido"
                 f"&ordenes_cambio.creado_por=not.is.null"
-                f"&order=id.asc&limit=10")
+                f"&order=id.asc&limit=50")
         return _rest("GET", path) or []
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="ignore") if e.fp else ""
@@ -501,75 +505,97 @@ def procesar_pendientes(items):
             _AVISO_SIN_SAFETY_CONTROL = True
         _procesar_pendientes_impl(items)
     else:
-        with control_seguro():
-            _procesar_pendientes_impl(items)
+        with control_seguro() as banner:
+            _procesar_pendientes_impl(items, banner)
 
 
-def _procesar_pendientes_impl(items):
+def _procesar_pendientes_impl(items, banner=None):
+    """Dos FASES GLOBALES sobre todas las órdenes de la pasada (pedido del
+    dueño): primero TODAS las cantidades (un documento de ajuste por orden),
+    después TODOS los precios/costos. Además de respetar el orden natural del
+    trabajo, evita intercalar ventanas: la Ficha de precios se reutiliza entre
+    todos los items de la fase 2 sin que un ajuste de stock intermedio obligue
+    a cerrarla y reabrirla."""
+
+    def _avisar(texto):
+        # actualiza la línea principal del banner de seguridad (si existe)
+        if banner is None:
+            return
+        try:
+            banner.set_texto(texto)
+        except Exception:
+            pass
+
     ordenes = {}
     for item in items:
         ordenes.setdefault(item.get("orden_id"), []).append(item)
 
     cache_costo_db = {}
+    items_por_id = {}
+    partes_por_item = {}
+    stock_por_orden = []        # [(orden_id, [items_con_stock])] en orden de llegada
+    precio_costo_global = []    # items con cambio de precio/costo, todas las órdenes
 
+    # ── Clasificación global + completar los items sin cambios ────────────────
     for orden_id, items_orden in ordenes.items():
         log.info("=== Orden %s: %s item(s) pendiente(s) ===", orden_id, len(items_orden))
-
-        items_sin_cambios = []
         items_con_stock = []
-        items_con_precio_o_costo = []
         for item in items_orden:
+            items_por_id[item["id"]] = item
             item["_tiene_stock_cambio"] = _tiene_stock_cambio(item)
             item["_tiene_precio_cambio"] = _tiene_precio_cambio(item)
             item["_tiene_costo_cambio"] = _tiene_costo_cambio(item, cache_costo_db)
             if not item["_tiene_stock_cambio"] and not item["_tiene_precio_cambio"] and not item["_tiene_costo_cambio"]:
-                items_sin_cambios.append(item)
-            else:
-                if item["_tiene_stock_cambio"]:
-                    items_con_stock.append(item)
-                if item["_tiene_precio_cambio"] or item["_tiene_costo_cambio"]:
-                    items_con_precio_o_costo.append(item)
-
-        for item in items_sin_cambios:
-            iid = item["id"]
-            update_item(iid, backend_status="completado",
-                        backend_resultado="Sin cambios de stock, precio ni costo a realizar.",
-                        backend_aplicado_en=datetime.datetime.now(datetime.timezone.utc).isoformat())
-            log.info("Item %s sin cambios reales -> 'completado' sin tocar HybridLite.", iid)
-
-        # FASE STOCK primero.
-        try:
-            resultados_stock = _fase_stock_orden(items_con_stock)
-        except Exception as e:
-            resultados_stock = {item["id"]: {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
-                                 for item in items_con_stock}
-
-        # FASE PRECIO/COSTO después, item por item.
-        partes_por_item = {}
-        for item in items_con_stock:
-            partes_por_item.setdefault(item["id"], []).append(
-                {"nombre": "Stock", "res": resultados_stock[item["id"]]})
-
-        for item in items_con_precio_o_costo:
-            iid = item["id"]
-            stock_res = resultados_stock.get(iid)
-            if stock_res is not None and not stock_res["ok"]:
-                # F10 — el item tenía parte de stock y falló: no tocamos su
-                # parte de precio/costo esta pasada (el reintento re-corre
-                # todo; precio/costo son valores absolutos e idempotentes).
-                log.warning("Item %s: se salta fase precio/costo esta pasada porque su "
-                            "parte de stock falló (etapa=%s).", iid, stock_res.get("etapa"))
+                update_item(item["id"], backend_status="completado",
+                            backend_resultado="Sin cambios de stock, precio ni costo a realizar.",
+                            backend_aplicado_en=datetime.datetime.now(datetime.timezone.utc).isoformat())
+                log.info("Item %s sin cambios reales -> 'completado' sin tocar HybridLite.", item["id"])
                 continue
-            try:
-                res_pc = _fase_precio_costo_item(item, ya_estaba_aplicando=iid in resultados_stock)
-            except Exception as e:
-                res_pc = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
-            partes_por_item.setdefault(iid, []).append({"nombre": "Precio/Costo", "res": res_pc})
+            if item["_tiene_stock_cambio"]:
+                items_con_stock.append(item)
+            if item["_tiene_precio_cambio"] or item["_tiene_costo_cambio"]:
+                precio_costo_global.append(item)
+        if items_con_stock:
+            stock_por_orden.append((orden_id, items_con_stock))
 
-        for iid, partes in partes_por_item.items():
-            item = next(i for i in items_orden if i["id"] == iid)
-            intentos = (item.get("backend_intentos") or 0) + 1
-            _aplicar_resultado_final(iid, partes, intentos)
+    # ── FASE 1 GLOBAL: todas las CANTIDADES (un documento por orden) ──────────
+    resultados_stock = {}
+    for orden_id, items_con_stock in stock_por_orden:
+        _avisar(f"AJUSTANDO STOCK — ORDEN OC-{orden_id} ({len(items_con_stock)} PRODUCTO/S)")
+        try:
+            res_orden = _fase_stock_orden(items_con_stock)
+        except Exception as e:
+            res_orden = {item["id"]: {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
+                         for item in items_con_stock}
+        resultados_stock.update(res_orden)
+    for iid, res in resultados_stock.items():
+        partes_por_item.setdefault(iid, []).append({"nombre": "Stock", "res": res})
+
+    # ── FASE 2 GLOBAL: todos los PRECIOS/COSTOS, item por item ───────────────
+    total_pc = len(precio_costo_global)
+    for n, item in enumerate(precio_costo_global, start=1):
+        iid = item["id"]
+        stock_res = resultados_stock.get(iid)
+        if stock_res is not None and not stock_res["ok"]:
+            # F10 — el item tenía parte de stock y falló: no tocamos su
+            # parte de precio/costo esta pasada (el reintento re-corre
+            # todo; precio/costo son valores absolutos e idempotentes).
+            log.warning("Item %s: se salta fase precio/costo esta pasada porque su "
+                        "parte de stock falló (etapa=%s).", iid, stock_res.get("etapa"))
+            continue
+        _avisar(f"CAMBIANDO PRECIO/COSTO {n}/{total_pc} — {item.get('codigo_producto')}")
+        try:
+            res_pc = _fase_precio_costo_item(item, ya_estaba_aplicando=iid in resultados_stock)
+        except Exception as e:
+            res_pc = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
+        partes_por_item.setdefault(iid, []).append({"nombre": "Precio/Costo", "res": res_pc})
+
+    # ── Estados finales por item ───────────────────────────────────────────────
+    _avisar("GUARDANDO RESULTADOS…")
+    for iid, partes in partes_por_item.items():
+        item = items_por_id[iid]
+        intentos = (item.get("backend_intentos") or 0) + 1
+        _aplicar_resultado_final(iid, partes, intentos)
 
     # Higiene de cierre: el flujo de precio/costo deja la Ficha abierta a
     # propósito (la reutiliza entre items de la misma pasada), pero no debe

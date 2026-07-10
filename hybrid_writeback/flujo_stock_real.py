@@ -48,6 +48,9 @@ CONF_CLASS = "TFConfirmacion"
 PREVIEW_CLASS = "TfrxPreviewForm"
 TOL = 0.001
 ROW_H = 24  # alto de fila estándar de la grilla (según grabación del dueño)
+MAX_FILAS_LOTE = 10  # filas por documento; 10*24px=240px cae holgado dentro del
+                      # área visible de la grilla (~15 filas sin scroll). Lotes
+                      # más largos se trocean en varios documentos consecutivos.
 
 
 class StockError(Exception):
@@ -558,8 +561,107 @@ def _lote_fallo_uniforme(items_lote, etapa, detalle):
     return {"ok": False, "etapa": etapa, "detalle": detalle, "resultados": resultados}
 
 
+def _lote_un_documento(items_chunk, targets, existencias_antes, commit):
+    """Procesa UN documento de ajuste para items_chunk (a lo sumo MAX_FILAS_LOTE
+    ítems). Abre la ventana de Ajustes, limpia la grilla, llena y verifica cada
+    fila, y cierra el documento (cancelado en preview/fallo, o totalizado y
+    verificado contra DB en commit).
+
+    targets / existencias_antes: dict[item_id -> float], ya calculados por
+    ajustar_stock_lote para el LOTE COMPLETO (no solo este chunk).
+
+    Return: mismo shape que ajustar_stock_lote, pero acotado a items_chunk:
+        {"ok": bool, "etapa": str, "detalle": str, "resultados": dict[item_id, dict]}
+    """
+    # fallo abriendo la ventana = 100% pre-commit -> etapa reintentable
+    try:
+        ha = abrir_ajustes()
+        aj = fp._win(ha)
+        grid = _grilla(aj)
+    except StockError as e:
+        log.error("Lote: no se pudo abrir la ventana de Ajustes: %s", e)
+        return _lote_fallo_uniforme(items_chunk, "carga/conteo", str(e))
+    _borrar_items(aj)   # grilla limpia al inicio de CADA documento
+
+    # 1) llenar y verificar fila por fila (fila = índice DENTRO del chunk)
+    detalle_por_item = {}
+    culpable = None
+    for fila, it in enumerate(items_chunk):
+        codigo, target = it["codigo"], targets[it["item_id"]]
+        try:
+            datos = cargar_y_fijar_fila(aj, grid, codigo, target, fila)
+        except StockError as e:
+            culpable = it
+            detalle_por_item[it["item_id"]] = str(e)
+            break
+        detalle_por_item[it["item_id"]] = (
+            f"Verificado en pantalla: existencia_db={existencias_antes[it['item_id']]} "
+            f"target={target} (dif {datos['diferencia']}).")
+
+    if culpable is not None:
+        # CUALQUIER fila falló su verificación -> cancelar este documento, nada se aplicó
+        _cancelar(aj)
+        _salir_ajustes(aj)
+        resultados = {}
+        for it in items_chunk:
+            if it["item_id"] == culpable["item_id"]:
+                detalle = detalle_por_item[it["item_id"]]
+            else:
+                detalle = f"lote cancelado por fallo en {culpable['codigo']}"
+            resultados[it["item_id"]] = {"ok": False, "etapa": "carga/conteo", "detalle": detalle}
+        detalle_global = (f"Lote CANCELADO (nada se aplicó): fallo en {culpable['codigo']} "
+                          f"- {detalle_por_item[culpable['item_id']]}")
+        log.error(detalle_global)
+        return {"ok": False, "etapa": "carga/conteo", "detalle": detalle_global,
+                "resultados": resultados}
+
+    # 2) preview: todas las filas verificadas -> cancelar (no crea documento)
+    if not commit:
+        _cancelar(aj)
+        _salir_ajustes(aj)
+        resultados = {it["item_id"]: {"ok": True, "etapa": "preview",
+                                       "detalle": detalle_por_item[it["item_id"]]}
+                      for it in items_chunk}
+        detalle_global = (f"Preview de {len(items_chunk)} ítem(s) verificado(s) en pantalla y "
+                          f"DESCARTADO (sin --commit).")
+        return {"ok": True, "etapa": "preview", "detalle": detalle_global, "resultados": resultados}
+
+    # 3) COMMIT: Totalizar UNA sola vez para este documento
+    if not _totalizar_y_guardar(aj):
+        detalle = "No pude confirmar el guardado (Totalizar/SÍ). Estado AMBIGUO, no reintentable."
+        log.error(detalle)
+        return _lote_fallo_uniforme(items_chunk, "totalizar", detalle)
+
+    _salir_ajustes(aj)
+    time.sleep(1.2)
+
+    # 4) verificación DB por item
+    resultados = {}
+    todos_ok = True
+    for it in items_chunk:
+        codigo, target = it["codigo"], targets[it["item_id"]]
+        total_despues, _ = dbex.existencia(codigo)
+        log.info("Lote verificación DB: item_id=%s codigo=%s despues=%s target=%s",
+                 it["item_id"], codigo, total_despues, target)
+        if total_despues is not None and abs(total_despues - target) <= 0.01:
+            resultados[it["item_id"]] = {"ok": True, "etapa": "commit",
+                "detalle": f"Stock ajustado y VERIFICADO en DB: {total_despues}"}
+        else:
+            todos_ok = False
+            resultados[it["item_id"]] = {"ok": False, "etapa": "verificacion_db",
+                "detalle": f"¡ALERTA! DB quedó en {total_despues}, no en {target}. Revisar."}
+
+    etapa_global = "commit" if todos_ok else "verificacion_db"
+    detalle_global = (f"Lote de {len(items_chunk)} ítem(s) totalizado y guardado. "
+                      f"{'Todos verificados en DB.' if todos_ok else 'ALERTA: hay ítems que no cuadran en DB, revisar resultados.'}")
+    return {"ok": todos_ok, "etapa": etapa_global, "detalle": detalle_global, "resultados": resultados}
+
+
 def ajustar_stock_lote(items_lote, commit=False):
-    """Ajusta N productos en UN documento de ajuste de HybridLite.
+    """Ajusta N productos en HybridLite, troceando en documentos de a lo sumo
+    MAX_FILAS_LOTE ítems (la grilla de Ajustes solo muestra ~15 filas sin
+    scroll, que no se maneja). Con len(items_lote) <= MAX_FILAS_LOTE el
+    comportamiento es IDÉNTICO a un único documento (mismo caso validado en vivo).
 
     items_lote: list[dict] con claves:
         "item_id" (int)  — id de ordenes_cambio_items (para el mapa de resultados)
@@ -567,17 +669,24 @@ def ajustar_stock_lote(items_lote, commit=False):
         "delta"   (float)— cambio RELATIVO de stock (target = existencia_DB + delta)
 
     Return: {
-        "ok":     bool,   # True solo si TODO el lote quedó ok
-        "etapa":  str,    # "commit" | "preview" | "abrir_hybrid" | "carga/conteo"
-                          # | "totalizar" | "verificacion_db"
-        "detalle": str,   # resumen humano del lote
+        "ok":     bool,   # True solo si TODOS los items de TODOS los documentos quedaron ok
+        "etapa":  str,    # "commit" | "preview" si todos ok; si no, la etapa del PRIMER
+                          # item fallido ("abrir_hybrid" | "carga/conteo" | "totalizar"
+                          # | "verificacion_db")
+        "detalle": str,   # resumen humano del lote completo (todos los documentos)
         "resultados": dict[int, dict],  # item_id -> {"ok": bool, "etapa": str, "detalle": str}
     }
+
+    Política de fallo entre documentos: si un documento falla en cualquier etapa,
+    los documentos restantes NO se intentan (sus items quedan como "no intentado,
+    reintentable"). Los documentos ya commiteados ANTES del fallo quedan aplicados
+    (no se deshacen) — un reintento posterior solo reprocesará los items pendientes,
+    sin duplicar lo ya aplicado.
     """
     if not items_lote:
         return {"ok": False, "etapa": "carga/conteo", "detalle": "Lote vacío.", "resultados": {}}
 
-    # 1) duplicados de código -> abortar SIN tocar la UI
+    # 1) duplicados de código -> abortar SIN tocar la UI (sobre el LOTE COMPLETO)
     codigos_norm = [it["codigo"].strip().lower() for it in items_lote]
     vistos, dups = set(), set()
     for c in codigos_norm:
@@ -587,13 +696,15 @@ def ajustar_stock_lote(items_lote, commit=False):
         log.error(detalle)
         return _lote_fallo_uniforme(items_lote, "carga/conteo", detalle)
 
-    # 2) asegurar que Hybrid esté abierto y logueado (lo lanza si está cerrado)
+    # 2) asegurar que Hybrid esté abierto y logueado (lo lanza si está cerrado) — UNA vez
     import abrir_hybrid
     ok, msg = abrir_hybrid.asegurar_hybrid()
     if not ok:
         return _lote_fallo_uniforme(items_lote, "abrir_hybrid", msg)
 
-    # 3) leer existencia DB de TODOS los códigos ANTES de empezar (targets absolutos)
+    # 3) leer existencia DB de TODOS los códigos ANTES de empezar (targets absolutos) — UNA vez.
+    #    Los targets quedan fijos antes de tocar cualquier documento: como los duplicados ya
+    #    están vetados, ningún chunk commiteado puede alterar el target de otro.
     existencias_antes = {}
     for it in items_lote:
         codigo = it["codigo"]
@@ -614,88 +725,66 @@ def ajustar_stock_lote(items_lote, commit=False):
                  it["item_id"], it["codigo"], existencias_antes[it["item_id"]],
                  it["delta"], targets[it["item_id"]])
 
-    # fallo abriendo la ventana = 100% pre-commit -> etapa reintentable
-    try:
-        ha = abrir_ajustes()
-        aj = fp._win(ha)
-        grid = _grilla(aj)
-    except StockError as e:
-        log.error("Lote: no se pudo abrir la ventana de Ajustes: %s", e)
-        return _lote_fallo_uniforme(items_lote, "carga/conteo", str(e))
-    _borrar_items(aj)   # grilla limpia UNA vez al inicio del lote
+    # 4) trocear en chunks de MAX_FILAS_LOTE, preservando el orden, y procesar
+    #    los documentos EN SECUENCIA.
+    chunks = [items_lote[i:i + MAX_FILAS_LOTE]
+              for i in range(0, len(items_lote), MAX_FILAS_LOTE)]
+    total_chunks = len(chunks)
 
-    # 4) llenar y verificar fila por fila
-    detalle_por_item = {}
-    culpable = None
-    for fila, it in enumerate(items_lote):
-        codigo, target = it["codigo"], targets[it["item_id"]]
-        try:
-            datos = cargar_y_fijar_fila(aj, grid, codigo, target, fila)
-        except StockError as e:
-            culpable = it
-            detalle_por_item[it["item_id"]] = str(e)
-            break
-        detalle_por_item[it["item_id"]] = (
-            f"Verificado en pantalla: existencia_db={existencias_antes[it['item_id']]} "
-            f"target={target} (dif {datos['diferencia']}).")
-
-    if culpable is not None:
-        # CUALQUIER fila falló su verificación -> cancelar TODO, nada se aplicó
-        _cancelar(aj)
-        _salir_ajustes(aj)
-        resultados = {}
-        for it in items_lote:
-            if it["item_id"] == culpable["item_id"]:
-                detalle = detalle_por_item[it["item_id"]]
-            else:
-                detalle = f"lote cancelado por fallo en {culpable['codigo']}"
-            resultados[it["item_id"]] = {"ok": False, "etapa": "carga/conteo", "detalle": detalle}
-        detalle_global = (f"Lote CANCELADO (nada se aplicó): fallo en {culpable['codigo']} "
-                          f"- {detalle_por_item[culpable['item_id']]}")
-        log.error(detalle_global)
-        return {"ok": False, "etapa": "carga/conteo", "detalle": detalle_global,
-                "resultados": resultados}
-
-    # 5) preview: todas las filas verificadas -> cancelar (no crea documento)
-    if not commit:
-        _cancelar(aj)
-        _salir_ajustes(aj)
-        resultados = {it["item_id"]: {"ok": True, "etapa": "preview",
-                                       "detalle": detalle_por_item[it["item_id"]]}
-                      for it in items_lote}
-        detalle_global = (f"Preview de {len(items_lote)} ítem(s) verificado(s) en pantalla y "
-                          f"DESCARTADO (sin --commit).")
-        return {"ok": True, "etapa": "preview", "detalle": detalle_global, "resultados": resultados}
-
-    # 6) COMMIT: Totalizar UNA sola vez para todo el lote
-    if not _totalizar_y_guardar(aj):
-        detalle = "No pude confirmar el guardado (Totalizar/SÍ). Estado AMBIGUO, no reintentable."
-        log.error(detalle)
-        return _lote_fallo_uniforme(items_lote, "totalizar", detalle)
-
-    _salir_ajustes(aj)
-    time.sleep(1.2)
-
-    # 7) verificación DB por item
     resultados = {}
-    todos_ok = True
-    for it in items_lote:
-        codigo, target = it["codigo"], targets[it["item_id"]]
-        total_despues, _ = dbex.existencia(codigo)
-        log.info("Lote verificación DB: item_id=%s codigo=%s despues=%s target=%s",
-                 it["item_id"], codigo, total_despues, target)
-        if total_despues is not None and abs(total_despues - target) <= 0.01:
-            resultados[it["item_id"]] = {"ok": True, "etapa": "commit",
-                "detalle": f"Stock ajustado y VERIFICADO en DB: {total_despues}"}
-        else:
-            todos_ok = False
-            resultados[it["item_id"]] = {"ok": False, "etapa": "verificacion_db",
-                "detalle": f"¡ALERTA! DB quedó en {total_despues}, no en {target}. Revisar."}
+    detalles_doc = []
+    detenido = False
+    motivo_detencion = None
+    primera_etapa_fallo = None
+    primer_res_doc = None
+    for i, chunk in enumerate(chunks, start=1):
+        if detenido:
+            for it in chunk:
+                resultados[it["item_id"]] = {
+                    "ok": False, "etapa": "carga/conteo",
+                    "detalle": f"lote detenido: fallo en un documento anterior "
+                               f"({motivo_detencion}); este item no se intentó (reintentable)."}
+            continue
 
-    etapa_global = "commit" if todos_ok else "verificacion_db"
-    detalle_global = (f"Lote de {len(items_lote)} ítem(s) totalizado y guardado. "
-                      f"{'Todos verificados en DB.' if todos_ok else 'ALERTA: hay ítems que no cuadran en DB, revisar resultados.'}")
-    return {"ok": todos_ok, "etapa": etapa_global, "detalle": detalle_global, "resultados": resultados}
+        log.info("Lote: documento %s/%s con %s item(s)", i, total_chunks, len(chunk))
+        res_doc = _lote_un_documento(chunk, targets, existencias_antes, commit)
+        if primer_res_doc is None:
+            primer_res_doc = res_doc
+        resultados.update(res_doc["resultados"])
+        detalles_doc.append(f"documento {i}/{total_chunks} ({res_doc['etapa']}): {res_doc['detalle']}")
+
+        if not res_doc["ok"]:
+            detenido = True
+            motivo_detencion = res_doc["detalle"]
+            if primera_etapa_fallo is None:
+                primera_etapa_fallo = res_doc["etapa"]
+
+    # caso corto (un solo documento): comportamiento IDÉNTICO al flujo previo a trocear
+    # (mismos "etapa"/"detalle", validados en vivo) — el agregado del punto 5 solo aplica
+    # cuando el lote realmente se dividió en más de un documento.
+    if total_chunks == 1:
+        return {"ok": primer_res_doc["ok"], "etapa": primer_res_doc["etapa"],
+                "detalle": primer_res_doc["detalle"], "resultados": resultados}
+
+    # 5) agregado global (lote troceado en 2+ documentos)
+    todos_ok = all(r["ok"] for r in resultados.values())
+    n_ok = sum(1 for r in resultados.values() if r["ok"])
+    n_no_intentados = sum(1 for r in resultados.values() if "no se intentó" in r.get("detalle", ""))
+    n_fallidos = len(items_lote) - n_ok - n_no_intentados
+
+    if todos_ok:
+        etapa_global = "commit" if commit else "preview"
+    else:
+        etapa_global = primera_etapa_fallo
+
+    resumen = f"Lote de {len(items_lote)} ítem(s) en {total_chunks} documento(s): {n_ok} ok"
+    if n_fallidos > 0:
+        resumen += f", {n_fallidos} fallido(s)"
+    if n_no_intentados > 0:
+        resumen += f", {n_no_intentados} no intentado(s)"
+    resumen += ". " + " | ".join(detalles_doc)
+
+    return {"ok": todos_ok, "etapa": etapa_global, "detalle": resumen, "resultados": resultados}
 
 
 if __name__ == "__main__":

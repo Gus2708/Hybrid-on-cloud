@@ -255,14 +255,39 @@ def cargar_producto(codigo):
 
 
 def abrir_costos_precios():
+    """Abre el diálogo Costos y Precios desde la Ficha, con REINTENTO.
+
+    CONFIRMADO EN VIVO (2026-07-10, lote largo): tras una fase de stock pesada
+    la Ficha puede no estar realmente al frente cuando cae el clic real, así
+    que el clic no registra y el diálogo no abre. Un solo intento con timeout
+    de 10s fallaba. Ahora: re-enfoca y re-clickea hasta 3 veces, esperando el
+    diálogo con timeout corto entre intentos."""
     hf = fp._find_hwnd(fp.FICHA_CLASS)
-    _focus(hf); time.sleep(0.2)
+    if not hf:
+        raise fp.FlujoError("La Ficha de inventario no está abierta.")
     fi = fp._win(hf)
-    btn = fi.child_window(title="Costos &y Precios", class_name="TFlatButton")
-    btn.wait("exists visible", timeout=fp.T_WAIT)
-    r = btn.rectangle()
-    ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-    return fp._wait_for(fp.PRECIOS_CLASS, desc="Costos y Precios")
+    for intento in range(1, 4):
+        try:
+            _focus(hf)
+            time.sleep(0.4)
+            btn = fi.child_window(title="Costos &y Precios", class_name="TFlatButton")
+            btn.wait("exists visible", timeout=fp.T_WAIT)
+            r = btn.rectangle()
+            ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+        except Exception as e:
+            log.warning("Intento %s de abrir Costos y Precios: no pude clickear el botón: %s",
+                        intento, e)
+            continue
+        # esperar el diálogo con timeout corto; si no aparece, re-enfocar y reintentar
+        t0 = time.time()
+        while time.time() - t0 < 4:
+            h = fp._find_hwnd(fp.PRECIOS_CLASS)
+            if h:
+                return h
+            time.sleep(0.3)
+        log.warning("Intento %s: el diálogo Costos y Precios no apareció, reintento.", intento)
+    raise fp.FlujoError(f"No apareció la ventana {fp.PRECIOS_CLASS} (Costos y Precios) "
+                        f"tras 3 intentos.")
 
 
 def escribir_precio(target, iva):
@@ -523,9 +548,20 @@ def set_precio_costo(codigo, nuevo_precio=None, nuevo_costo=None, iva=IVA_DEF, c
         precio_pin = db_precio_antes
     precio_a_escribir = target if target is not None else precio_pin
 
-    _cerrar_residuales()
-    cargar_producto(codigo)
-    abrir_costos_precios()
+    # Navegación PRE-escritura (buscar producto + abrir el diálogo): si algo
+    # falla aquí NADA se tocó, así que es 100% reintentable ("escritura" está
+    # en ETAPAS_REINTENTABLES). Sin este try, un FlujoError de abrir_costos_precios
+    # subía como excepción y el listener lo trataba como etapa AMBIGUA (error
+    # inmediato + "riesgo de ajuste doble"), que es incorrecto: no se escribió nada.
+    try:
+        _cerrar_residuales()
+        cargar_producto(codigo)
+        abrir_costos_precios()
+    except (PrecioError, fp.FlujoError) as e:
+        _click_boton_dialogo("Salir")   # por si quedó algún diálogo/búsqueda a medias
+        return {"ok": False, "etapa": "escritura",
+                "detalle": f"No pude llegar al diálogo de Costos y Precios (nada se tocó): {e}",
+                "db_precio_antes": db_precio_antes, "db_costo_antes": db_costo_antes}
 
     preview_costo = None
     preview_precio = None
