@@ -30,7 +30,7 @@ Ejecutar en el orden de la tabla salvo que las dependencias indiquen otra cosa. 
 | [018](018-extraer-listener-base.md) | Extraer núcleo común de listeners a `listener_base.py` | P1 | M | — | DONE (rama `improve/018-listener-base`, commit db98f2e; revisado y validado --once en vivo 2026-07-12; pendiente de merge) |
 | [019](019-unificar-carga-fila-stock.md) | Unificar `cargar_y_fijar` con `cargar_y_fijar_fila` | P2 | S | — | DONE (rama `improve/019-unificar-carga-fila-stock`, commit 6c5f0cf; preview single validado en vivo 2026-07-12; pendiente de merge) |
 | [020](020-mover-scripts-diagnostico.md) | Mover scripts de diagnóstico a `diagnostico/` | P2 | S | — | DONE (rama `improve/020-mover-diagnostico`, commit 32abce0; 56 renames puros; pendiente de merge) |
-| [021](021-readme-arquitectura-writeback.md) | README de arquitectura de `hybrid_writeback/` | P3 | S | 018, 019, 020 | TODO (despachar tras mergear 018-020) |
+| [021](021-readme-arquitectura-writeback.md) | README de arquitectura de `hybrid_writeback/` | P3 | S | 018, 019, 020 | DONE (commit 842b70c, revisado y mergeado 2026-07-12) |
 
 Status values: `DONE` | `IN PROGRESS` | `DONE` | `BLOCKED: <razón>` | `REJECTED: <razón>`
 
