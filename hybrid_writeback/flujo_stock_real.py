@@ -295,17 +295,21 @@ def cargar_y_fijar(aj, grid, codigo, target):
 def cargar_y_fijar_fila(aj, grid, codigo, target, fila):
     """Igual que cargar_y_fijar, pero para la fila N-ésima de un LOTE multi-fila
     (fila=0 es idéntico al flujo single: mismo punto de clic, misma verificación).
-    Tras postear la fila 0 el cursor pasa a la fila 1 y así sucesivamente, por lo
-    que cada fila se carga clicando su propia celda Código:
-        clic (gr.left+196, gr.top+40+fila*ROW_H) → código LENTO → ENTER (carga,
-        salta a Conteo) → cantidad DIRECTO → verificar → ENTER, ENTER (postea).
+    Tras postear una fila (ENTER,ENTER) HybridLite deja el cursor en la celda
+    Código de la fila SIGUIENTE ya seleccionada (confirmado por el dueño
+    2026-07-12), así que SOLO la fila 0 clica/enfoca: las filas siguientes se
+    tipean directo sobre ese cursor auto-posicionado -- clicar/re-enfocar lo
+    perturbaría.
+        (fila 0) clic celda Código → código LENTO → ENTER (carga, salta a
+        Conteo) → cantidad DIRECTO → verificar → ENTER, ENTER (postea).
     Verifica código y conteo ANTES de postear, leyendo la ventana de la fila
     'fila' (vía _leer(..., fila)). NO hace _borrar_items por residuo (el lote
     limpia la grilla una única vez al inicio, en ajustar_stock_lote)."""
-    gr = grid.rectangle()
-    _focus(fp._find_hwnd(AJU_CLASS))
-    ri.click(gr.left + 196, gr.top + 40 + fila * ROW_H)   # celda Código, fila N
-    time.sleep(0.3)
+    if fila == 0:
+        gr = grid.rectangle()
+        _focus(fp._find_hwnd(AJU_CLASS))
+        ri.click(gr.left + 196, gr.top + 40)   # celda Código, fila 0 (la única que se clica)
+        time.sleep(0.3)
     ri.type_code(codigo)                       # LENTO (evita truncado/búsqueda)
     time.sleep(0.4)
     ri.press("ENTER")                          # carga el producto y salta a Conteo
