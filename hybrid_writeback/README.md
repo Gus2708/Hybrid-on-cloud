@@ -9,6 +9,70 @@ el backend lo aplique en el sistema local HybridLite **sin corromper la base de 
 
 ---
 
+## Arquitectura del paquete
+
+> Sección agregada tras los planes 018–020 (base de listeners, paquete limpio,
+> diagnóstico separado). El resto del documento (debajo) es el registro histórico
+> del descubrimiento del write-back; se conserva tal cual.
+
+### Mapa de módulos
+
+| Archivo | Rol |
+|---|---|
+| `realinput.py` | Motor de input real (`SendInput`): clic/tecla de hardware. |
+| `flujo_precio.py` | Base compartida de ventanas: `_find_hwnd`, filtro de PID objetivo (`set_target_pid`), constantes de clase de ventana. |
+| `hybrid_price_writer.py` | Lectura DBISAM (`_db_precio_usd`, `_db_costo_usd`) y localización de campos/diálogos. |
+| `read_db_precio.py` / `read_db_existencia.py` | Lectura DBISAM de precio/existencia para verificación. |
+| `flujo_precio_real.py` | Coreografía de precio/costo en la Ficha. |
+| `flujo_stock_real.py` | Coreografía de ajustes de stock (single y lote; la carga de fila vive en `cargar_y_fijar_fila`, el single delega con fila=0). |
+| `flujo_compra_real.py` | Coreografía de compras + alta de producto nuevo. |
+| `abrir_hybrid.py` | Instancia AISLADA de HybridLite: launch, login, `cerrar_aislada()` (solo mata el PID propio). |
+| `safety_control.py` | Banner topmost, F12 aborto, mutex del mouse (`Local\SerruchoBotMouseLock`) que serializa los dos listeners. |
+| `listener_base.py` | Núcleo común de listeners (config, logging, guards, REST, bucle `correr_loop`). |
+| `listener_writeback.py` / `listener_compras.py` | Pipelines 24/7 (`ordenes_cambio_items` / `compras_app`), lanzados por `backend_watchdog.py`. |
+| `grabar_flujo.py` | Grabadora de coreografías (sesiones con el dueño). |
+| `diagnostico/` | Scripts desechables (ver su propio README). |
+
+### Flujo de datos
+
+1. La app (El Serrucho Go) escribe un pendiente en Supabase: `ordenes_cambio_items`
+   (stock) o `compras_app` (compras), con `backend_status='pendiente'`.
+2. El listener correspondiente sondea esa tabla cada 8 s (`POLL_INTERVAL` en
+   `listener_base.py`), usando `SUPABASE_SERVICE_KEY` (la RLS de esas tablas exige
+   dueño autenticado; con la anon key el listener vería 0 filas, sin error).
+3. Se ejecuta la coreografía de input real sobre una instancia AISLADA de
+   HybridLite (levantada/logueada por `abrir_hybrid.py`), nunca sobre la sesión
+   del empleado.
+4. El resultado se verifica leyendo la DBISAM directamente (`read_db_precio.py` /
+   `read_db_existencia.py` / lectura equivalente embebida en cada flujo).
+5. El estado final (`completado` / `error`) y el detalle quedan en Supabase
+   (`backend_status`, `backend_resultado`, `backend_intentos`, `backend_aplicado_en`).
+6. La app muestra ese estado como chip en el item correspondiente.
+
+### Invariantes de seguridad (NUNCA romper)
+
+- Nunca cerrar la ventana de HybridLite del empleado; solo la instancia aislada
+  propia (`abrir_hybrid.cerrar_aislada()`, por PID verificado).
+- Nunca UPDATE crudo a la DBISAM ni parchear los `.DAT` (solo lectura).
+- Todo-o-nada pre-Totalizar: cualquier fallo cancela el documento entero.
+- Los timings, coordenadas y el orden de manejo de alertas de las coreografías
+  son COMPORTAMIENTO validado en vivo: no se "limpian".
+- La alerta "producto llegó al mínimo" (`TFConfirmacion`) se responde `&Ok` y se
+  continúa; es tardía/asíncrona en compras.
+- Etapas ambiguas (post-commit) NO son reintentables: riesgo de aplicación doble
+  (ver `ETAPAS_REINTENTABLES` en cada listener).
+- Tras cambiar código: reiniciar los procesos (`start_backend.vbs`) — un proceso
+  stale aplicando código viejo ya causó 2 incidentes.
+
+### Cómo probar sin escribir
+
+- `--once` sin `HYBRID_WRITE_ENABLED=1` corre una sola pasada en modo preview.
+- Los flujos de bajo nivel aceptan `commit=False` como default seguro.
+- Un preview igual **toma el mouse** si hay pendientes: no correr en horario de
+  atención ni mientras alguien usa HybridLite en la estación.
+
+---
+
 ## TL;DR — cómo se usa hoy
 
 ```powershell
