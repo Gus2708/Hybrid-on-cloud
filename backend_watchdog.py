@@ -178,6 +178,14 @@ SCRIPTS = [
         # sin restricción horaria (procesa a cualquier hora).
         "env": {"HYBRID_WRITE_ENABLED": "1"},
     }),
+    ("listener_compras.py", "Write-back compras", {
+        "subdir": "hybrid_writeback",
+        # Mismo criterio que listener_writeback: HYBRID_WRITE_ENABLED=1 sólo
+        # para este proceso, para que correrlo a mano siga siendo preview por
+        # defecto. Corre como proceso separado; ambos serializan el mouse
+        # entre sí vía el mutex de safety_control.control_seguro.
+        "env": {"HYBRID_WRITE_ENABLED": "1"},
+    }),
 ]
 
 # ─── Detección de procesos colgados (vivos pero congelados) ──────────────────
