@@ -40,10 +40,36 @@ Secuencia (registrar_compra, un solo documento de Compras):
      existencia_antes + cantidad (read_db_existencia), costo/precio esperados
      via hybrid_price_writer._db_costo_usd / _db_precio_usd, tolerancia 0.01/0.02.
 
+ALTA DE PRODUCTO NUEVO (crear_producto): cuando un ítem de la compra trae
+es_nuevo=True, ANTES de cargarlo en la grilla de Compras hay que darlo de alta
+en la Ficha de Inventario (TTConfigForm) — Hybrid no permite comprar un código
+que no existe en el maestro. Secuencia (ver FLUJO-NUEVO-PRODUCTO-CAPTURADO-v2.log,
+esqueleto con ruido, y los datos de inspección en vivo del 2026-07-11 que son la
+fuente de verdad real):
+  1. abrir_ficha() (reutilizado de flujo_precio_real).
+  2. Botón 'Incluir' (owner-drawn, IZQUIERDA de Modificar) -> nuevo registro vacío.
+  3. Header de la Ficha en modo alta: 3 THybridEdit (código/referencia/descripción),
+     localizados por franja de posición relativa con _campos_ficha() (mismo patrón
+     que _leer_header_compras). Se escriben con clic real + type_code/type_text y
+     se VERIFICAN leyendo window_text().
+  4. Costos y Precios (fpr.abrir_costos_precios) -> escribir COSTO primero
+     (_escribir_costo_alta, localización POR POSICIÓN porque no hay costo previo
+     en DBISAM para localizar por valor como hace fpr.escribir_costo) y luego
+     PRECIO (fpr.escribir_precio, campo con-impuesto) -- mismo orden costo->precio
+     que set_precio_costo, por el acople documentado en flujo_precio_real.
+  5. preview: Salir de Costos y Precios + Cancelar/descartar la Ficha SIN guardar
+     (nada queda creado). commit: Aceptar+Salir de Costos y Precios + Guardar de
+     la Ficha (fpr._guardar_ficha) + verificación contra DBISAM.
+  ASIMETRÍA preview/commit en registrar_compra: en preview el alta NO se guarda,
+  así que el código creado no existe todavía para cargar_item -- los ítems
+  es_nuevo se SALTAN de la carga a la grilla en preview (solo se valida el alta
+  en pantalla); en commit sí se crean de verdad y LUEGO se compran normalmente.
+
 SEGURIDAD: preview por defecto (llena y verifica en pantalla, NO guarda nada);
 --commit aplica de verdad y verifica contra la base. Todo-o-nada: la compra es
 UN documento, no una serie de cambios independientes -- ante cualquier fallo
-PRE-Totalizar se cancela el documento completo.
+PRE-Totalizar se cancela el documento completo (incluye fallos en el alta de
+productos nuevos, que corre ANTES de tocar la grilla de Compras).
 
 USO:
     python flujo_compra_real.py 01404 --items "01404:10:0.50:1.00" --doc 123456
@@ -102,6 +128,17 @@ PROVEEDOR_F1_REL = (296, 146)      # botón 'F1' de la fila Proveedor
 TOTALIZAR_REL = (644, 691)         # botón '&Totalizar' (barra inferior de Compras)
 TOTAL_OPERAR_REL = (584, 660)      # botón 'T&otalizar' de TFrmTotalOperacion
 
+# ── ALTA DE PRODUCTO NUEVO (crear_producto) ─────────────────────────────────
+# Barra superior de la Ficha de Inventario (owner-drawn, sin título): botones
+# Incluir · Modificar · Cancelar · Guardar · Borrar · Salir. Coordenadas de los
+# CENTROS confirmadas por captura de pantalla en vivo (2026-07-12); el clic va
+# sobre el texto/icono (y≈62). Referencias conocidas: fpr.MODIFICAR_REL=(122,62),
+# fpr.GUARDAR_REL=(240,60).
+INCLUIR_REL = (42, 62)     # 1er botón (nuevo registro)
+CANCELAR_REL = (175, 62)   # 3er botón (descarta el alta sin guardar)
+
+TOL_ALTA = 0.02   # misma tolerancia que TOL_COSTO_PRECIO, usada en la verificación de alta
+
 
 class CompraError(Exception):
     pass
@@ -124,12 +161,15 @@ def _focus(hwnd):
 
 
 def _confirmar_lo_que_pregunte(timeout=5):
-    """Responde afirmativamente a CUALQUIER diálogo de confirmación que
+    """Responde afirmativamente a CUALQUIER diálogo de confirmación/alerta que
     aparezca (TFConfirmacion o TMessageForm), probando una lista amplia de
-    títulos de botón. Usado por _cancelar_compra: 'Cancelar' en Compras
-    probablemente pregunta si se desea cancelar -> hay que responder SÍ (a
-    diferencia de flujo_stock_real._cancelar, que responde NO porque ahí
-    'Cancelar' descarta un documento nuevo vacío sin más preguntas)."""
+    títulos de botón. Cubre dos casos del flujo de compra:
+      - 'Cancelar' en Compras pregunta si se desea cancelar -> responder SÍ (a
+        diferencia de flujo_stock_real._cancelar, que responde NO).
+      - Alerta 'el producto llegó al mínimo' al Totalizar/agregar un producto
+        (típico de productos con existencia baja/nueva): solo hay que darle
+        OK/Aceptar y CONTINUAR (confirmado por el dueño 2026-07-12). Por eso se
+        incluyen 'Aceptar'/'OK'/'Continuar' en la lista."""
     t0 = time.time()
     respondido = False
     while time.time() - t0 < timeout:
@@ -141,7 +181,14 @@ def _confirmar_lo_que_pregunte(timeout=5):
             continue
         _focus(h)
         m = fp._win(h)
-        for titulo in ("&SI", "SI", "Sí", "&Sí", "&Yes", "Yes", "Aceptar"):
+        # ORDEN IMPORTANTE: '&Ok' PRIMERO. La alerta 'producto llegó al mínimo'
+        # (TFConfirmacion, confirmada en vivo 2026-07-12) tiene 3 botones
+        # &Ok/&NO/&SI y el que continúa el flujo es '&Ok' (k minúscula, título
+        # exacto). Los diálogos de cancelar/confirmar totalizar solo tienen
+        # &SI/&NO (sin &Ok), así que ahí se cae a '&SI'.
+        for titulo in ("&Ok", "Ok", "&OK", "OK", "&Aceptar", "Aceptar",
+                       "&Continuar", "Continuar",
+                       "&SI", "SI", "Sí", "&Sí", "&Yes", "Yes"):
             try:
                 b = m.child_window(title=titulo)
                 r = b.rectangle()
@@ -184,6 +231,283 @@ def _leer_header_compras(hcom):
         elif 125 <= rel_top < 160:
             res["proveedor"] = txt
     return res
+
+
+# ── ALTA DE PRODUCTO NUEVO (crear_producto) ─────────────────────────────────
+def _campos_ficha(hf):
+    """Localiza los 3 THybridEdit del header de la Ficha en modo alta (código /
+    referencia / descripción) por franja de posición relativa a la ventana,
+    igual patrón que _leer_header_compras. Datos de inspección en vivo
+    (2026-07-11, confirmados por el orquestador):
+        CÓDIGO:      rel_top≈150, rel_left≈44,  ancho≈121 (fila superior izq.)
+        REFERENCIA:  rel_top≈150, rel_left≈200, ancho≈270 (fila superior der.)
+        DESCRIPCIÓN: rel_top≈190, rel_left≈44,  ancho≈426 (fila de abajo, ancha)
+    Devuelve dict {"codigo": ctrl|None, "referencia": ctrl|None, "descripcion": ctrl|None}
+    (el control pywinauto, no su texto -- el llamador clickea/teclea/lee cada uno)."""
+    res = {"codigo": None, "referencia": None, "descripcion": None}
+    if not hf:
+        return res
+    fi = fp._win(hf)
+    L, T, _, _ = win32gui.GetWindowRect(hf)
+    for c in fi.descendants(class_name="THybridEdit"):
+        r = c.rectangle()
+        rel_top = r.top - T
+        rel_left = r.left - L
+        if 130 <= rel_top < 170:
+            if rel_left < 170:
+                res["codigo"] = c
+            else:
+                res["referencia"] = c
+        elif 170 <= rel_top < 210:
+            res["descripcion"] = c
+    return res
+
+
+def _escribir_campo_ficha(campo, valor, lento=False):
+    """Clic real en el centro del campo + borrado duro + teclear (type_code si
+    `lento`, igual que la grilla de Compras; type_text en caso contrario).
+    Devuelve el texto leído tras teclear (window_text), para que el llamador
+    verifique."""
+    r = campo.rectangle()
+    ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+    time.sleep(0.2)
+    try:
+        campo.set_focus()
+    except Exception:
+        pass
+    time.sleep(0.15)
+    ri.clear_hard()
+    if lento:
+        ri.type_code(valor)
+    else:
+        ri.type_text(valor)
+    time.sleep(0.3)
+    return (campo.window_text() or "").strip()
+
+
+def _escribir_costo_alta(nuevo_costo):
+    """Teclea el COSTO USD del diálogo TFHCostosPrecios para un producto NUEVO
+    (sin costo previo en DBISAM -- a diferencia de fpr.escribir_costo, que
+    localiza el campo por VALOR contra el costo actual leído de la base, acá
+    eso no existe: el producto todavía no tiene fila en la DBISAM).
+
+    # CALIBRAR EN VIVO: el campo de costo USD del groupbox 'Costos en moneda
+    # referencial'. Primer intento: localizar el TGroupBox por título
+    # ('Costos en moneda referencial', confirmado en los dumps de calibración
+    # calib_TFHCostosPrecios_*.txt) y tomar su único THybridEditNumber hijo
+    # directo con MAYOR `top` (el campo 'Costo Actual' bajo el caption owner-
+    # drawn 'Costos Moneda Referencial' -- el groupbox también contiene otros
+    # campos del panel, de ahí "mayor top" como heurística de POSICIÓN, no de
+    # valor). TODO: el orquestador debe confirmar en vivo cuál control es
+    # exactamente (podría haber más de un candidato); si hay ambigüedad, esta
+    # función debe fallar (PrecioError) en vez de arriesgar escribir en el
+    # campo equivocado (mismo criterio de seguridad que fpr.escribir_costo)."""
+    hd = fp._find_hwnd(fp.PRECIOS_CLASS)
+    if not hd:
+        raise fpr.PrecioError("El diálogo Costos y Precios no está abierto para escribir el costo de alta.")
+    fpr._focus(hd)
+    dlg = fp._win(hd)
+
+    try:
+        grupo = dlg.child_window(title="Costos en moneda referencial", class_name="TGroupBox")
+        candidatos = sorted(
+            grupo.descendants(class_name="THybridEditNumber"),
+            key=lambda c: c.rectangle().top,
+        )
+    except Exception as e:
+        raise fpr.PrecioError(
+            f"No pude localizar el groupbox 'Costos en moneda referencial' "
+            f"para el costo de alta: {e}. NO se escribe nada.")
+
+    if not candidatos:
+        raise fpr.PrecioError(
+            "El groupbox 'Costos en moneda referencial' no tiene ningún "
+            "THybridEditNumber hijo (calibración pendiente). NO se escribe nada.")
+    # heurística POR POSICIÓN (# CALIBRAR EN VIVO): el de mayor `top` es el
+    # candidato a 'Costo Actual' bajo 'Costos Moneda Referencial'.
+    campo = candidatos[-1]
+    log.info("Campo de costo de ALTA localizado por posición (mayor top del "
+             "groupbox 'Costos en moneda referencial'): %s", campo.rectangle())
+
+    r = campo.rectangle()
+    ri.click((r.left + r.right) // 2, r.bottom - 4)
+    time.sleep(0.2)
+    try:
+        campo.set_focus()
+    except Exception:
+        pass
+    time.sleep(0.2)
+    ri.clear_hard()
+    if (campo.window_text() or "").strip() not in ("", "0", "0.00", "0,00"):
+        ri.clear_hard()
+    ri.type_number(f"{float(nuevo_costo):.2f}")
+    time.sleep(0.2)
+    ri.press("ENTER")
+    time.sleep(0.6)
+
+    leido = hpw._num(campo.window_text())
+    log.info("Costo de ALTA en pantalla tras teclear: %s (target=%s)", leido, nuevo_costo)
+    if leido is None or abs(leido - float(nuevo_costo)) > TOL_ALTA:
+        raise fpr.PrecioError(f"El costo de alta en pantalla no cuadra (quedó {leido}, "
+                              f"esperado {nuevo_costo}). NO se compromete nada.")
+    return {"costo": leido}
+
+
+def _cancelar_ficha_alta(hf):
+    """Descarta el alta de producto SIN guardar nada (preview, o fallo antes de
+    Guardar): botón 'Cancelar' de la barra de la Ficha por coordenada (owner-
+    drawn, sin grabación de referencia -- ver CANCELAR_REL). Responde 'No' si
+    pregunta si desea guardar (a diferencia de _cancelar_compra, que responde
+    SÍ -- acá cancelar un alta NUEVA no debe guardar nada, mismo criterio que
+    flujo_stock_real._cancelar)."""
+    hf = hf or fp._find_hwnd(fp.FICHA_CLASS)
+    if not hf:
+        return
+    fpr._focus(hf)
+    L, T, _, _ = win32gui.GetWindowRect(hf)
+    ri.click(L + CANCELAR_REL[0], T + CANCELAR_REL[1])
+    time.sleep(0.6)
+    # responder 'No' si pregunta (no queremos guardar el alta descartada)
+    t0 = time.time()
+    while time.time() - t0 < 3:
+        h = fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm")
+        if not h:
+            break
+        m = fp._win(h)
+        for titulo in ("&NO", "No", "&No"):
+            try:
+                b = m.child_window(title=titulo)
+                r = b.rectangle()
+                ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+                break
+            except Exception:
+                continue
+        time.sleep(0.4)
+
+
+def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False):
+    """Da de alta un producto NUEVO en la Ficha de Inventario, para ítems de
+    compra con es_nuevo=True. Return: {"ok": bool, "etapa": str, "detalle": str}.
+
+    Etapas de fallo:
+      "abrir_ficha"  -- no se pudo abrir/localizar la Ficha (reintentable, nada tocado)
+      "campos"       -- código/descripción no quedaron en pantalla (reintentable,
+                        nada guardado -- se cancela el alta antes de salir)
+      "costos_precios" -- fallo escribiendo costo/precio (reintentable, se
+                        descarta con 'Salir' antes de salir, nada guardado)
+      "guardar" | "verificacion_db" -- AMBIGUAS: el Guardar pudo haberse
+                        aplicado ya en HybridLite aunque la verificación falle.
+
+    Etapas de éxito: "preview" (verificado en pantalla, NO guardado) | "commit"
+    (guardado y VERIFICADO contra DBISAM)."""
+    codigo = (codigo or "").strip()
+    descripcion = (descripcion or "").strip()
+    referencia = (referencia or "").strip() if referencia else ""
+    if not codigo or not descripcion:
+        return {"ok": False, "etapa": "campos",
+                "detalle": "código y descripción son obligatorios para el alta (nada se tocó)."}
+
+    try:
+        hf = fpr.abrir_ficha()
+    except (fpr.PrecioError, fp.FlujoError) as e:
+        return {"ok": False, "etapa": "abrir_ficha",
+                "detalle": f"No pude abrir la Ficha de Inventario para el alta de {codigo}: {e}"}
+
+    # botón 'Incluir' (nuevo registro, owner-drawn, IZQUIERDA de Modificar)
+    fpr._focus(hf)
+    L, T, _, _ = win32gui.GetWindowRect(hf)
+    ri.click(L + INCLUIR_REL[0], T + INCLUIR_REL[1])
+    time.sleep(1.0)
+
+    # localizar y llenar los 3 campos del header en modo alta
+    campos = _campos_ficha(fp._find_hwnd(fp.FICHA_CLASS))
+    if campos["codigo"] is None or campos["descripcion"] is None:
+        _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))
+        return {"ok": False, "etapa": "campos",
+                "detalle": f"No pude localizar los campos código/descripción del alta de "
+                           f"{codigo} (¿'Incluir' no abrió el modo alta? -- CALIBRAR "
+                           f"INCLUIR_REL). Nada se tocó."}
+
+    codigo_ui = _escribir_campo_ficha(campos["codigo"], codigo, lento=True)   # type_code, como la grilla
+    if codigo_ui != codigo:
+        _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))
+        return {"ok": False, "etapa": "campos",
+                "detalle": f"El código quedó en pantalla como {codigo_ui!r}, no {codigo!r}. "
+                           f"Nada se tocó."}
+
+    if referencia and campos["referencia"] is not None:
+        referencia_ui = _escribir_campo_ficha(campos["referencia"], referencia, lento=False)
+        if referencia_ui != referencia:
+            log.warning("La referencia quedó en pantalla como %r, no %r (no bloqueante).",
+                        referencia_ui, referencia)
+
+    descripcion_ui = _escribir_campo_ficha(campos["descripcion"], descripcion, lento=False)
+    if descripcion_ui != descripcion:
+        _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))
+        return {"ok": False, "etapa": "campos",
+                "detalle": f"La descripción quedó en pantalla como {descripcion_ui!r}, no "
+                           f"{descripcion!r}. Nada se tocó."}
+    log.info("Campos del alta de %s VERIFICADOS en pantalla (descripcion=%r, referencia=%r).",
+             codigo, descripcion_ui, referencia)
+
+    # Costos y Precios: costo PRIMERO (acople costo->precio, ver flujo_precio_real), luego precio
+    try:
+        fpr.abrir_costos_precios()
+    except fp.FlujoError as e:
+        _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))
+        return {"ok": False, "etapa": "costos_precios",
+                "detalle": f"No se abrió Costos y Precios para el alta de {codigo}: {e}"}
+
+    try:
+        _escribir_costo_alta(costo)
+        fpr.escribir_precio(float(precio), fpr.IVA_DEF)
+    except fpr.PrecioError as e:
+        fpr._click_boton_dialogo("Salir")        # descarta el diálogo, nada guardado
+        _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))
+        return {"ok": False, "etapa": "costos_precios",
+                "detalle": f"Costo/precio del alta de {codigo} no cuadraron en pantalla: {e}"}
+
+    if not commit:
+        fpr._click_boton_dialogo("Salir")        # descarta Costos y Precios
+        _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))   # descarta la Ficha, SIN guardar
+        return {"ok": True, "etapa": "preview",
+                "detalle": f"Alta de {codigo} ({descripcion}) verificada en pantalla "
+                           f"(costo={costo}, precio={precio}) y DESCARTADA (sin --commit; "
+                           f"el producto NO quedó creado, así que este ítem no se compra en preview)."}
+
+    # COMMIT: Aceptar+Salir de Costos y Precios, Guardar la Ficha, verificar en DBISAM
+    if not fpr._click_boton_dialogo("Aceptar"):
+        return {"ok": False, "etapa": "costos_precios",
+                "detalle": f"No pude pulsar 'Aceptar' en Costos y Precios para el alta de {codigo}."}
+    if fp._find_hwnd(fp.PRECIOS_CLASS):
+        fpr._click_boton_dialogo("Salir")
+
+    fpr._guardar_ficha()
+    time.sleep(1.5)
+
+    try:
+        existencia_db, _ = dbex.existencia(codigo)
+    except Exception:
+        existencia_db = None
+    costo_db = hpw._db_costo_usd(codigo)
+    precio_db = hpw._db_precio_usd(codigo)
+    log.info("Verificación DB del alta de %s: existencia=%s costo=%s precio=%s",
+             codigo, existencia_db, costo_db, precio_db)
+
+    fallos = []
+    if existencia_db is None:
+        fallos.append("el producto no aparece en la DBISAM tras Guardar (¿no se creó?)")
+    if costo_db is None or abs(costo_db - float(costo)) > TOL_ALTA:
+        fallos.append(f"costo en DB quedó en {costo_db}, esperaba {costo}")
+    if precio_db is None or abs(precio_db - float(precio)) > TOL_ALTA:
+        fallos.append(f"precio en DB quedó en {precio_db}, esperaba {precio}")
+
+    if fallos:
+        return {"ok": False, "etapa": "verificacion_db",
+                "detalle": f"¡ALERTA! Alta de {codigo}: " + "; ".join(fallos)}
+    return {"ok": True, "etapa": "commit",
+            "detalle": f"Producto {codigo} ({descripcion}) dado de alta y VERIFICADO en DB: "
+                       f"existencia={existencia_db} costo={costo_db} precio={precio_db}."}
 
 
 # ── apertura de la ventana de Compras ────────────────────────────────────────
@@ -399,6 +723,10 @@ def cargar_item(codigo, cantidad, costo, precio, commit):
     ri.press("ENTER")
     time.sleep(0.6)
 
+    # la alerta 'el producto llegó al mínimo' puede aparecer al agregar el
+    # producto a la grilla -> darle OK/Aceptar y continuar (no cancela nada).
+    _confirmar_lo_que_pregunte(timeout=1.0)
+
     try:
         _abrir_costos_precios_item(hcom)
     except fp.FlujoError as e:
@@ -482,18 +810,37 @@ def _totalizar_compra(hcom, doc_numero):
     flujo_stock_real._totalizar_y_guardar (ESC + WM_SYSCOMMAND SC_CLOSE +
     WM_CLOSE). Devuelve True si el flujo de totalización llegó hasta el final
     (no implica verificación en DB, eso lo hace el llamador)."""
-    _focus(hcom)
-    com = fp._win(hcom)
-    try:
-        b = com.child_window(title="&Totalizar", class_name="TFlatButton")
-        r = b.rectangle()
-        ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-    except Exception:
-        L, T, _, _ = win32gui.GetWindowRect(hcom)
-        ri.click(L + TOTALIZAR_REL[0], T + TOTALIZAR_REL[1])
-    time.sleep(1.0)
-
-    htot = fp._wait_for(TOTAL_CLASS, timeout=10, desc="Total Operación")
+    # Pulsar '&Totalizar' con REINTENTO: tras cargar los ítems la ventana de
+    # Compras puede no estar realmente al frente cuando cae el clic real y
+    # Total Operación no abre (mismo patrón que abrir_costos_precios,
+    # confirmado en vivo 2026-07-12). Re-enfoca y re-clickea hasta 3 veces.
+    htot = None
+    for intento in range(1, 4):
+        _focus(hcom)
+        time.sleep(0.4)
+        com = fp._win(hcom)
+        try:
+            b = com.child_window(title="&Totalizar", class_name="TFlatButton")
+            r = b.rectangle()
+            ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+        except Exception:
+            L, T, _, _ = win32gui.GetWindowRect(hcom)
+            ri.click(L + TOTALIZAR_REL[0], T + TOTALIZAR_REL[1])
+        # La alerta 'el producto llegó al mínimo' (u otra confirmación) puede
+        # aparecer tras Totalizar y BLOQUEAR la apertura de Total Operación:
+        # solo hay que darle OK/Aceptar para continuar (confirmado por el dueño).
+        _confirmar_lo_que_pregunte(timeout=2)
+        t0 = time.time()
+        while time.time() - t0 < 5:
+            htot = fp._find_hwnd(TOTAL_CLASS)
+            if htot:
+                break
+            time.sleep(0.3)
+        if htot:
+            break
+        log.warning("Intento %s: Total Operación no apareció tras Totalizar, reintento.", intento)
+    if not htot:
+        raise CompraError("No apareció Total Operación (TFrmTotalOperacion) tras 3 intentos de Totalizar.")
     _focus(htot)
     tot = fp._win(htot)
 
@@ -556,7 +903,9 @@ def _totalizar_compra(hcom, doc_numero):
 
 # ── orquestador ──────────────────────────────────────────────────────────────
 def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedor_nombre=None):
-    """items: list[dict] {"codigo": str, "cantidad": float, "costo": float, "precio": float}
+    """items: list[dict] {"codigo": str, "cantidad": float, "costo": float, "precio": float,
+    "es_nuevo": bool (opcional), "referencia": str|None (opcional), "descripcion": str
+    (opcional, solo requerida si es_nuevo)}.
     proveedor_nombre: opcional; si viene, se verifica contra el campo del header.
     doc_numero: str numérico para los dos campos de Total Operación (relleno).
     Return: {"ok": bool, "etapa": str, "detalle": str,
@@ -564,11 +913,26 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
              ...}
     etapas éxito: "commit" | "preview"
     etapas fallo PRE-commit (reintentables, NADA quedó a medias porque se canceló todo):
-      "abrir_hybrid" | "navegacion" (clase/proveedor) | "carga_item" | "precio_item"
-    etapas fallo AMBIGUAS: "totalizar" | "verificacion_db"
+      "abrir_hybrid" | "alta_producto:<etapa>" (ver crear_producto) | "navegacion"
+      (clase/proveedor) | "carga_item" | "precio_item"
+    etapas fallo AMBIGUAS: "totalizar" | "verificacion_db" | "alta_producto:guardar" |
+      "alta_producto:verificacion_db"
     REGLA DE ORO: ante CUALQUIER fallo antes de pulsar Totalizar -> Cancelar la
     compra completa + Salir de la ventana + devolver etapa pre-commit. La compra
-    es TODO-O-NADA (un documento)."""
+    es TODO-O-NADA (un documento). El alta de productos nuevos (es_nuevo) corre
+    ANTES de abrir Compras -- un fallo ahí también cancela la compra completa
+    (todavía no se tocó la grilla de Compras, así que no hay nada que cancelar
+    ahí, pero cualquier alta ya confirmada en commit queda hecha: ver ASIMETRÍA
+    preview/commit más abajo).
+
+    ASIMETRÍA preview/commit para ítems es_nuevo (documentada en el módulo):
+    en preview, crear_producto NO guarda el alta (la descarta en pantalla), así
+    que el código NO existe todavía en HybridLite -- cargar_item de ese mismo
+    código fallaría ("no existe"). Por eso, en preview, los ítems es_nuevo se
+    SALTAN de la carga a la grilla (solo se valida el alta en pantalla) y se
+    marcan aparte en 'resultados'. En commit, el alta se guarda de verdad
+    ANTES del loop de ítems, así que luego se compran con cargar_item como
+    cualquier producto existente."""
     if not items:
         return {"ok": False, "etapa": "navegacion", "detalle": "La lista de items está vacía."}
 
@@ -580,13 +944,50 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
         return {"ok": False, "etapa": "navegacion",
                 "detalle": f"Códigos duplicados en la compra: {sorted(dups)}. Nada se tocó."}
 
+    for it in items:
+        if it.get("es_nuevo") and not (it.get("descripcion") or "").strip():
+            return {"ok": False, "etapa": "navegacion",
+                    "detalle": f"Ítem {it['codigo']} viene con es_nuevo=True pero sin "
+                               f"descripción. Nada se tocó."}
+
     # asegurar que Hybrid esté abierto y logueado (lo lanza si está cerrado)
     import abrir_hybrid
     ok, msg = abrir_hybrid.asegurar_hybrid()
     if not ok:
         return {"ok": False, "etapa": "abrir_hybrid", "detalle": msg}
 
-    # existencia ANTES de cada ítem (para la verificación post-commit)
+    # ALTA de productos nuevos: ANTES de tocar la grilla de Compras (usa la
+    # Ficha de Inventario, ventana distinta a Compras). Cualquier fallo acá
+    # cancela la compra completa -- todavía no se escribió nada en Compras.
+    altas_resultado = {}
+    for it in items:
+        if not it.get("es_nuevo"):
+            continue
+        codigo = it["codigo"]
+        # ROBUSTEZ ante reintentos: si el producto YA existe en el maestro
+        # (p.ej. una pasada anterior creó el alta pero falló al totalizar la
+        # compra), NO re-crearlo (duplicaría/fallaría) -> se compra como
+        # existente. Se detecta por _db_precio_usd (None = no existe).
+        if hpw._db_precio_usd(codigo) is not None:
+            log.info("Ítem %s viene es_nuevo pero YA existe en el maestro; se salta el "
+                     "alta y se compra como existente.", codigo)
+            it["es_nuevo"] = False
+            continue
+        res_alta = crear_producto(
+            codigo, it.get("descripcion"), it.get("referencia"),
+            it["costo"], it["precio"], commit=commit,
+        )
+        altas_resultado[codigo] = res_alta
+        if not res_alta["ok"]:
+            return {"ok": False, "etapa": f"alta_producto:{res_alta['etapa']}",
+                    "detalle": f"Alta de producto nuevo {codigo} falló, compra CANCELADA "
+                               f"(nada se tocó en Compras): {res_alta['detalle']}",
+                    "resultados": altas_resultado}
+        log.info("Alta de %s (es_nuevo): %s", codigo, res_alta["detalle"])
+
+    # existencia ANTES de cada ítem (para la verificación post-commit). Para
+    # ítems es_nuevo en preview el producto no existe todavía -> existencia
+    # ANTES no es legible (None), esperado y no bloqueante.
     existencias_antes = {}
     for it in items:
         try:
@@ -597,7 +998,9 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
         log.info("Existencia DB ANTES de %s: %s", it["codigo"], total_antes)
 
     # navegación PRE-escritura: abrir Compras + clasificación + proveedor.
-    # Cualquier fallo aquí es 100% reintentable -- nada se ha escrito todavía.
+    # Cualquier fallo aquí es 100% reintentable -- nada se ha escrito todavía
+    # en Compras (las altas de productos nuevos, si commit=True, ya quedaron
+    # hechas en la Ficha y NO se deshacen -- ver nota de ambigüedad arriba).
     try:
         hcom = abrir_compras()
         com = fp._win(hcom)
@@ -607,10 +1010,18 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
         _cancelar_compra(fp._find_hwnd(COMPRAS_CLASS))
         _salir_compras()
         return {"ok": False, "etapa": "navegacion",
-                "detalle": f"No pude llegar a la carga de ítems (nada se tocó): {e}"}
+                "detalle": f"No pude llegar a la carga de ítems (nada se tocó en Compras): {e}",
+                "resultados": altas_resultado}
 
-    # ítems: cualquier fallo cancela el DOCUMENTO COMPLETO (todo-o-nada)
+    # ítems: cualquier fallo cancela el DOCUMENTO COMPLETO (todo-o-nada).
+    # ASIMETRÍA preview: los ítems es_nuevo se SALTAN de cargar_item en preview
+    # (el alta no se guardó, el código no existe en HybridLite todavía).
     for it in items:
+        if it.get("es_nuevo") and not commit:
+            log.info("Ítem %s (es_nuevo, preview): alta ya validada en pantalla y "
+                     "descartada -- SALTANDO carga a la grilla de Compras (el producto "
+                     "no existe sin --commit).", it["codigo"])
+            continue
         try:
             cargar_item(it["codigo"], it["cantidad"], it["costo"], it["precio"], commit)
         except CompraError as e:
@@ -618,16 +1029,22 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
             _cancelar_compra(fp._find_hwnd(COMPRAS_CLASS))
             _salir_compras()
             return {"ok": False, "etapa": etapa,
-                    "detalle": f"Compra CANCELADA completa (todo-o-nada), fallo en {it['codigo']}: {e}"}
+                    "detalle": f"Compra CANCELADA completa (todo-o-nada), fallo en {it['codigo']}: {e}",
+                    "resultados": altas_resultado}
 
     if not commit:
         _cancelar_compra(fp._find_hwnd(COMPRAS_CLASS))
         _salir_compras()
-        resultados = {it["codigo"]: {"ok": True, "detalle": "Verificado en pantalla y descartado."}
-                      for it in items}
+        resultados = dict(altas_resultado)
+        for it in items:
+            if it.get("es_nuevo"):
+                continue   # ya está en altas_resultado (etapa "preview")
+            resultados[it["codigo"]] = {"ok": True, "detalle": "Verificado en pantalla y descartado."}
         return {"ok": True, "etapa": "preview",
                 "detalle": f"Preview de {len(items)} ítem(s) verificado(s) en pantalla y "
-                           f"DESCARTADO (sin --commit; documento cancelado completo).",
+                           f"DESCARTADO (sin --commit; documento cancelado completo). "
+                           f"Los ítems es_nuevo NO se cargaron en la grilla (ver asimetría "
+                           f"preview/commit en el docstring).",
                 "resultados": resultados}
 
     # COMMIT: Totalizar (etapa AMBIGUA si falla -- no sabemos si el documento
@@ -637,7 +1054,8 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
         _totalizar_compra(hcom, doc_numero)
     except (CompraError, fp.FlujoError) as e:
         return {"ok": False, "etapa": "totalizar",
-                "detalle": f"No pude confirmar la totalización de la compra: {e}"}
+                "detalle": f"No pude confirmar la totalización de la compra: {e}",
+                "resultados": altas_resultado}
 
     _salir_compras()
     time.sleep(1.5)
@@ -670,13 +1088,14 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
         elif abs(precio_despues - float(it["precio"])) > TOL_COSTO_PRECIO:
             fallos.append(f"precio quedó en {precio_despues}, esperaba {it['precio']}")
 
+        prefijo_alta = "[alta_producto] " if codigo in altas_resultado else ""
         if fallos:
             todos_ok = False
-            detalle = "¡ALERTA! " + "; ".join(fallos)
+            detalle = prefijo_alta + "¡ALERTA! " + "; ".join(fallos)
             log.error("Verificación %s: %s", codigo, detalle)
             resultados[codigo] = {"ok": False, "detalle": detalle}
         else:
-            detalle = (f"VERIFICADO en DB: existencia={existencia_despues} "
+            detalle = (f"{prefijo_alta}VERIFICADO en DB: existencia={existencia_despues} "
                       f"costo={costo_despues} precio={precio_despues}")
             log.info("Verificación %s: %s", codigo, detalle)
             resultados[codigo] = {"ok": True, "detalle": detalle}

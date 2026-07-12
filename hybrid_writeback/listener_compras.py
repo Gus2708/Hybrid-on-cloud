@@ -117,7 +117,16 @@ MAX_INTENTOS = 3
 # Etapas de flujo_compra_real.registrar_compra() anteriores a Totalizar: la
 # compra se cancela completa antes de devolver estas etapas (todo-o-nada), así
 # que un fallo acá es 100% reintentable sin riesgo de doble aplicación.
-ETAPAS_REINTENTABLES = ("abrir_hybrid", "navegacion", "carga_item", "precio_item")
+# "alta_producto:abrir_ficha" / "alta_producto:campos" / "alta_producto:costos_precios"
+# son las etapas reintentables de crear_producto (Ficha nueva descartada con
+# Cancelar/Salir ANTES de Guardar, nada persistido todavía -- ver ese docstring);
+# "alta_producto:guardar"/"alta_producto:verificacion_db" son AMBIGUAS (el
+# Guardar ya se pulsó, el alta pudo haber quedado creada en HybridLite) y por
+# eso NO están acá -- quedan fuera de esta tupla y caen en la rama "ambigua"
+# de _politica_resultado por descarte (no matchean ETAPAS_REINTENTABLES).
+ETAPAS_REINTENTABLES = ("abrir_hybrid", "navegacion", "carga_item", "precio_item",
+                        "alta_producto:abrir_ficha", "alta_producto:campos",
+                        "alta_producto:costos_precios")
 
 API_KEY = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
 if not SUPABASE_SERVICE_KEY:
@@ -227,11 +236,15 @@ def get_compras_pendientes():
 
 def get_items(compra_id):
     """Items de una compra, mapeados a la forma que espera
-    flujo_compra_real.registrar_compra: {"codigo","cantidad","costo","precio"}
-    (la tabla usa codigo_producto; el flujo usa "codigo")."""
+    flujo_compra_real.registrar_compra: {"codigo","cantidad","costo","precio",
+    "es_nuevo","referencia","descripcion"} (la tabla usa codigo_producto; el
+    flujo usa "codigo"). "es_nuevo"/"referencia" son opcionales en la tabla
+    (columnas todavía no migradas a la fecha de este cambio); se leen con
+    .get() defensivo, así que si no existen en compras_app_items simplemente
+    viajan como False/None y ningún ítem se trata como alta nueva."""
     try:
         path = (f"{TABLE_ITEMS}?compra_id=eq.{compra_id}"
-                f"&select=codigo_producto,descripcion,cantidad,costo,precio"
+                f"&select=codigo_producto,descripcion,referencia,es_nuevo,cantidad,costo,precio"
                 f"&order=id.asc")
         filas = _rest("GET", path) or []
     except urllib.error.HTTPError as e:
@@ -248,6 +261,9 @@ def get_items(compra_id):
             "cantidad": float(fila["cantidad"]),
             "costo": float(fila["costo"]),
             "precio": float(fila["precio"]),
+            "es_nuevo": bool(fila.get("es_nuevo")),
+            "referencia": fila.get("referencia"),
+            "descripcion": fila.get("descripcion"),
         }
         for fila in filas
     ]
