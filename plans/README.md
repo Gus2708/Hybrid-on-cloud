@@ -27,6 +27,10 @@ Ejecutar en el orden de la tabla salvo que las dependencias indiquen otra cosa. 
 | [015](015-add-sales-sync-safeguards.md) | Salvaguardas de calidad en sync de ventas | P2 | S | — | DONE |
 | [016](016-add-alert-webhook.md) | Alertas opcionales por webhook ante discrepancias | P3 | M | — | DONE |
 | [017](017-independent-rate-refresh.md) | Thread independiente para refrescar tasas c/15 min | P3 | S | 001 | DONE |
+| [018](018-extraer-listener-base.md) | Extraer núcleo común de listeners a `listener_base.py` | P1 | M | — | DONE (rama `improve/018-listener-base`, commit db98f2e; revisado y validado --once en vivo 2026-07-12; pendiente de merge) |
+| [019](019-unificar-carga-fila-stock.md) | Unificar `cargar_y_fijar` con `cargar_y_fijar_fila` | P2 | S | — | DONE (rama `improve/019-unificar-carga-fila-stock`, commit 6c5f0cf; preview single validado en vivo 2026-07-12; pendiente de merge) |
+| [020](020-mover-scripts-diagnostico.md) | Mover scripts de diagnóstico a `diagnostico/` | P2 | S | — | DONE (rama `improve/020-mover-diagnostico`, commit 32abce0; 56 renames puros; pendiente de merge) |
+| [021](021-readme-arquitectura-writeback.md) | README de arquitectura de `hybrid_writeback/` | P3 | S | 018, 019, 020 | TODO (despachar tras mergear 018-020) |
 
 Status values: `DONE` | `IN PROGRESS` | `DONE` | `BLOCKED: <razón>` | `REJECTED: <razón>`
 
@@ -48,6 +52,10 @@ Status values: `DONE` | `IN PROGRESS` | `DONE` | `BLOCKED: <razón>` | `REJECTED
 - **SEC: URL de Supabase en logs (`remote_listener.py:53`)**: By-design — el project ID de Supabase no es un secreto operacional. Rechazado.
 - **SEC: Inyección WMI en `backend_watchdog.py`**: El array `SCRIPTS` está hardcodeado en el fuente; riesgo práctico nulo con el deployment actual. Downgradeado a informativo, no planificado.
 - **PERF: Búsqueda lineal en `/api/v1/productos`**: El catálogo de una ferretería raramente supera 10k productos; la búsqueda in-memory es adecuada. Rechazado por ahora.
+- **(2026-07-12, ronda write-back) Renombrar `flujo_precio.py`→`hybrid_base.py`** (el nombre no refleja su rol de base compartida): rechazado — alto riesgo (imports en 5 módulos, procesos 24/7, docs/memoria referencian los nombres) por valor puramente estético. Documentado en el README de arquitectura (plan 021) en su lugar.
+- **(2026-07-12) Unificar `ajustar_stock` con `ajustar_stock_lote`**: rechazado — contratos de retorno distintos consumidos por el listener y la CLI; unificarlos cambia mensajes/shape en la ruta caliente por ganancia marginal.
+- **(2026-07-12) Dedup de `_focus` (flujo_stock_real / flujo_compra_real)**: rechazado por ahora — 12 líneas duplicadas; moverlo a `flujo_precio` toca 3 módulos de coreografía viva. Valor marginal, riesgo desproporcionado.
+- **(2026-07-12) Sweep de type hints/docstrings en los flujos**: rechazado — churn masivo en código validado en vivo sin beneficio funcional.
 
 ---
 
