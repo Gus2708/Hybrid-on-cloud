@@ -35,6 +35,8 @@ import json
 import time
 import logging
 
+import pywintypes
+
 import win32gui
 import win32process
 from pywinauto import Application, Desktop
@@ -61,8 +63,77 @@ class FlujoError(Exception):
 
 
 # ─── utilidades de ventanas ──────────────────────────────────────────────────
+# PID objetivo opcional: cuando está seteado, _find_hwnd() y sus llamadores
+# (todo el resto de flujo_precio.py, flujo_precio_real.py, flujo_stock_real.py)
+# ignoran ventanas de cualquier OTRO proceso HybridLiteOS.exe. Existe porque el
+# bot puede abrir una instancia de Hybrid AISLADA (ver abrir_hybrid.py) para no
+# tocar la ventana que un empleado ya tenga abierta trabajando; sin este filtro
+# EnumWindows encontraría la ventana del empleado primero (mismo class_name en
+# ambas instancias) y el bot terminaría clickeando ahí por error.
+_target_pid = None
+
+
+def set_target_pid(pid):
+    """Restringe _find_hwnd() (y todo lo que dependa de ella) a ventanas del
+    proceso `pid`. None = sin restricción (comportamiento histórico).
+
+    Propaga el filtro a hybrid_price_writer, que tiene su propia búsqueda de
+    ventanas (diálogo Costos y Precios / Ficha), para que TODO el flujo quede
+    aislado a la misma instancia."""
+    global _target_pid
+    _target_pid = pid
+    try:
+        hpw.set_target_pid(pid)
+    except Exception:
+        pass
+
+
+def clear_target_pid():
+    global _target_pid
+    _target_pid = None
+    try:
+        hpw.clear_target_pid()
+    except Exception:
+        pass
+
+
 def _find_hwnd(cls_name, visible=True):
-    """hwnd de la primera ventana top-level de esa clase (o None)."""
+    """hwnd de la primera ventana top-level de esa clase (o None).
+
+    Si `set_target_pid()` está activo, descarta ventanas de cualquier otro
+    proceso (ver comentario arriba de _target_pid)."""
+    out = []
+
+    def _cb(h, _):
+        if visible and not win32gui.IsWindowVisible(h):
+            return
+        if win32gui.GetClassName(h) != cls_name:
+            return
+        if _target_pid is not None:
+            try:
+                pid = win32process.GetWindowThreadProcessId(h)[1] & 0xFFFFFFFF
+            except Exception:
+                return
+            if pid != _target_pid:
+                return
+        out.append(h)
+
+    # Retry: EnumWindows can raise pywintypes.error(122) when a window is
+    # destroyed mid-enumeration (race condition). Safe to retry immediately.
+    for _ in range(3):
+        try:
+            win32gui.EnumWindows(_cb, None)
+            break
+        except pywintypes.error:
+            out.clear()
+            time.sleep(0.1)
+    return out[0] if out else None
+
+
+def _hwnds_de_clase(cls_name, visible=True):
+    """Set de TODOS los hwnd top-level visibles de `cls_name`, sin filtrar por
+    PID (para tomar una foto 'antes' y detectar ventanas NUEVAS tras lanzar un
+    proceso, ver abrir_hybrid._esperar_ventana_nueva)."""
     out = []
 
     def _cb(h, _):
@@ -71,8 +142,31 @@ def _find_hwnd(cls_name, visible=True):
         if win32gui.GetClassName(h) == cls_name:
             out.append(h)
 
-    win32gui.EnumWindows(_cb, None)
-    return out[0] if out else None
+    # Retry: same EnumWindows race condition as _find_hwnd (error 122).
+    for _ in range(3):
+        try:
+            win32gui.EnumWindows(_cb, None)
+            break
+        except pywintypes.error:
+            out.clear()
+            time.sleep(0.1)
+    return set(out)
+
+
+def _esperar_ventana_nueva(cls_name, hwnds_antes, timeout=T_WAIT, poll=POLL):
+    """Espera a que aparezca una ventana de `cls_name` que NO estuviera en
+    `hwnds_antes` (foto tomada antes de lanzar el proceso nuevo). Devuelve su
+    hwnd, o None si no aparece ninguna nueva en `timeout` segundos. Robusto a
+    que HybridLiteOS.exe relance/spawnee un proceso hijo real distinto del PID
+    devuelto por subprocess.Popen: no importa qué PID termine dueño de la
+    ventana, solo que sea una ventana que no existía antes."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        nuevas = _hwnds_de_clase(cls_name) - hwnds_antes
+        if nuevas:
+            return sorted(nuevas)[0]
+        time.sleep(poll)
+    return None
 
 
 def _wait_for(cls_name, timeout=T_WAIT, desc=""):
@@ -96,7 +190,7 @@ def _wait_gone(hwnd, timeout=T_WAIT):
 
 def _win(hwnd):
     """Wrapper pywinauto (win32) de un hwnd concreto."""
-    pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+    pid = win32process.GetWindowThreadProcessId(hwnd)[1] & 0xFFFFFFFF
     app = Application(backend="win32").connect(process=pid, timeout=5)
     return app.window(handle=hwnd)
 

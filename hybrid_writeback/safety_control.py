@@ -51,6 +51,63 @@ log = logging.getLogger("safety")
 _abort_flag = threading.Event()
 
 
+# ── capa 0: MUTEX de mouse entre procesos (listener_writeback / listener_compras) ──
+# listener_writeback.py y listener_compras.py corren como procesos SEPARADOS y
+# AMBOS toman el mouse/teclado real (SendInput vía realinput.py) dentro de
+# `control_seguro`. Si llegaran a pisarse (por ejemplo un sondeo de compras
+# arranca mientras un ajuste de stock sigue en curso), los dos bots clickearían
+# la misma pantalla a la vez -> input entreverado, alto riesgo de escribir en
+# el campo/documento equivocado de HybridLite. Un Mutex con nombre de Windows
+# ("Local\\...") es visible entre procesos (no solo entre hilos, a diferencia
+# de threading.Lock) y serializa el acceso: el segundo proceso que llegue
+# espera a que el primero libere el mouse antes de arrancar su propia pasada.
+_MOUSE_MUTEX_NAME = "Local\\SerruchoBotMouseLock"
+_MOUSE_MUTEX_TIMEOUT_MS = 5 * 60 * 1000  # 5 min: una pasada normal no debería tardar tanto
+
+
+def _adquirir_mutex_mouse():
+    """Crea/abre el mutex con nombre y espera a tenerlo. Degradación con
+    gracia: si ctypes/kernel32 falla por cualquier motivo, loguea warning y
+    sigue igual (no bloquear el bot para siempre por falta de esta capa).
+    Devuelve el handle (o None si no se pudo adquirir/crear)."""
+    try:
+        handle = ctypes.windll.kernel32.CreateMutexW(None, False, _MOUSE_MUTEX_NAME)
+        if not handle:
+            log.warning("No se pudo crear/abrir el mutex de mouse %r (GetLastError=%s)",
+                        _MOUSE_MUTEX_NAME, ctypes.windll.kernel32.GetLastError())
+            return None
+        WAIT_FAILED = 0xFFFFFFFF
+        WAIT_TIMEOUT = 0x00000102
+        resultado = ctypes.windll.kernel32.WaitForSingleObject(handle, _MOUSE_MUTEX_TIMEOUT_MS)
+        if resultado == WAIT_TIMEOUT:
+            log.warning("Timeout de %ss esperando el mutex de mouse %r (¿el otro listener "
+                        "quedó colgado sosteniéndolo?); sigo SIN el mutex para no bloquear "
+                        "este proceso para siempre.", _MOUSE_MUTEX_TIMEOUT_MS // 1000, _MOUSE_MUTEX_NAME)
+            return handle  # no se adquirió el lock, pero igual devolvemos el handle para poder CloseHandle
+        if resultado == WAIT_FAILED:
+            log.warning("WaitForSingleObject falló sobre el mutex de mouse %r (GetLastError=%s)",
+                        _MOUSE_MUTEX_NAME, ctypes.windll.kernel32.GetLastError())
+        return handle
+    except Exception as e:
+        log.warning("Mutex de mouse entre procesos no disponible (degradado, sin serializar "
+                    "con otros listeners): %s", e)
+        return None
+
+
+def _liberar_mutex_mouse(handle):
+    """Libera y cierra el handle del mutex. Nunca lanza."""
+    if handle is None:
+        return
+    try:
+        ctypes.windll.kernel32.ReleaseMutex(handle)
+    except Exception as e:
+        log.warning("No se pudo liberar el mutex de mouse (sigo cerrando el handle): %s", e)
+    try:
+        ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception as e:
+        log.warning("No se pudo cerrar el handle del mutex de mouse: %s", e)
+
+
 def fue_abortado():
     """True si F12 fue pulsado en esta corrida (flag en memoria)."""
     return _abort_flag.is_set()
@@ -145,6 +202,12 @@ class _Banner:
     _FG_LINEA2 = "#FFCDD2"
     _PARPADEO_S = 0.6  # período del parpadeo del icono, en segundos
 
+    # panel lateral de productos pendientes (a la derecha del banner)
+    _PANEL_BG = "#1B1B1B"
+    _PANEL_TITULO_FG = "#FFEB3B"
+    _PANEL_ANCHO = 320
+    _PANEL_ALTO_MAX = 640
+
     def __init__(self, mensaje):
         self._mensaje = mensaje
         self._cerrar_evt = threading.Event()
@@ -156,6 +219,10 @@ class _Banner:
         self._lock = threading.Lock()
         self._texto_actual = mensaje
         self._texto_aplicado = None
+        # lista de productos pendientes del panel lateral: [(texto, hecho)].
+        # Mismo patrón de lock que _texto_actual/set_texto.
+        self._lista_actual = []
+        self._lista_aplicada = None
 
     def iniciar(self, timeout=2.0):
         """Arranca el hilo del banner y espera (con timeout) a que la ventana
@@ -183,6 +250,24 @@ class _Banner:
     def _texto_pendiente(self):
         with self._lock:
             return self._texto_actual
+
+    def set_lista(self, items):
+        """Actualiza la lista de productos del panel lateral (a la derecha
+        del banner). `items`: iterable de (texto, hecho) — hecho=True tacha
+        ese renglón (ya aplicado en HybridLite). Pensada para llamarse una
+        vez por item a medida que el listener los va completando, para que
+        el operador vea en vivo qué falta y qué ya está.
+
+        Thread-safe: solo guarda la lista bajo lock; el hilo del banner
+        (_loop_tk) es quien redibuja los Labels reales. Si la ventana del
+        panel no llegó a existir (tkinter falló), esta llamada sigue siendo
+        inofensiva, igual que set_texto()."""
+        with self._lock:
+            self._lista_actual = list(items)
+
+    def _lista_pendiente(self):
+        with self._lock:
+            return list(self._lista_actual)
 
     def _aplicar_estilo_click_through(self, root):
         """Hace la ventana click-through y no-activable a nivel de Windows.
@@ -265,6 +350,30 @@ class _Banner:
 
             self._aplicar_estilo_click_through(root)
 
+            # ── panel lateral de productos pendientes (a la derecha) ──────
+            # Toplevel aparte (no cabe en la barra de 48px). Empieza oculto
+            # (withdraw) y solo se muestra cuando set_lista() trae algo —
+            # los usos del banner que no llaman set_lista() (flujos de
+            # precio/stock corridos a mano) no ven ningún panel.
+            panel = tk.Toplevel(root)
+            panel.overrideredirect(True)
+            panel.attributes("-topmost", True)
+            panel.attributes("-alpha", 0.96)
+            panel.configure(bg=self._PANEL_BG)
+            panel.geometry(f"{self._PANEL_ANCHO}x1+{ancho - self._PANEL_ANCHO}+{alto + 4}")
+
+            panel_titulo = tk.Label(
+                panel, text="PRODUCTOS DE ESTA ORDEN", bg=self._PANEL_BG,
+                fg=self._PANEL_TITULO_FG, font=("Segoe UI", 9, "bold"),
+                anchor="w")
+            panel_titulo.pack(fill="x", padx=10, pady=(8, 4))
+
+            panel_lista = tk.Frame(panel, bg=self._PANEL_BG)
+            panel_lista.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+            self._aplicar_estilo_click_through(panel)
+            panel.withdraw()
+
             self._listo_evt.set()
 
             icono_encendido = True
@@ -287,9 +396,35 @@ class _Banner:
                     label_principal.config(text=texto_pendiente)
                     self._texto_aplicado = texto_pendiente
 
+                lista_pendiente = self._lista_pendiente()
+                if lista_pendiente != self._lista_aplicada:
+                    for w in panel_lista.winfo_children():
+                        w.destroy()
+                    if lista_pendiente:
+                        for texto, hecho in lista_pendiente:
+                            prefijo = "✓ " if hecho else "• "
+                            estilo = ("Segoe UI", 10, "overstrike") if hecho else ("Segoe UI", 10)
+                            tk.Label(
+                                panel_lista, text=prefijo + texto,
+                                bg=self._PANEL_BG,
+                                fg="#4CAF50" if hecho else "white",
+                                font=estilo, anchor="w", justify="left",
+                                wraplength=self._PANEL_ANCHO - 24,
+                            ).pack(fill="x", anchor="w", pady=1)
+                        alto_panel = min(self._PANEL_ALTO_MAX,
+                                          44 + 22 * len(lista_pendiente))
+                        panel.geometry(
+                            f"{self._PANEL_ANCHO}x{alto_panel}"
+                            f"+{ancho - self._PANEL_ANCHO}+{alto + 4}")
+                        panel.deiconify()
+                    else:
+                        panel.withdraw()
+                    self._lista_aplicada = lista_pendiente
+
                 root.update()
                 time.sleep(0.05)
 
+            panel.destroy()
             root.destroy()
         except Exception as e:
             # cualquier fallo de Tk (sin display, sin tkinter, etc.) no debe
@@ -410,6 +545,12 @@ def control_seguro(mensaje="BOT ACTIVO — APLICANDO CAMBIOS EN HYBRIDLITE",
     banner = _Banner(mensaje)
     ventanas_ocultas = []
 
+    # Capa 0 (ver comentario junto a _adquirir_mutex_mouse): serializa el
+    # mouse entre listener_writeback y listener_compras ANTES de mostrar el
+    # banner o tocar nada más, para que nunca haya dos bots clickeando la
+    # pantalla al mismo tiempo.
+    mutex_handle = _adquirir_mutex_mouse()
+
     try:
         banner.iniciar()
         _registrar_hotkey()
@@ -434,6 +575,10 @@ def control_seguro(mensaje="BOT ACTIVO — APLICANDO CAMBIOS EN HYBRIDLITE",
             banner.cerrar()
         except Exception as e:
             log.warning("No se pudo cerrar el banner de seguridad con normalidad: %s", e)
+        # Liberar el mutex de mouse AL FINAL de todo (después de restaurar
+        # input/ventanas/banner): así el próximo proceso que lo esperaba no
+        # arranca a mover el mouse mientras este todavía está en su cleanup.
+        _liberar_mutex_mouse(mutex_handle)
 
 
 # ── demo manual (NO se ejecuta al importar; correr `python safety_control.py`) ──

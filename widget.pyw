@@ -128,6 +128,16 @@ class SerruchoPremiumWidget:
         self.status_label = self.canvas.create_text(25, 50, text="Sistema Activo", fill=self.colors["text"], font=("Inter", 10, "bold"), anchor="w")
         self.detail_label = self.canvas.create_text(25, 68, text="Monitoreando archivos...", fill=self.colors["subtext"], font=("Inter", 8), anchor="w")
 
+        # --- Switch de Writeback (estilo iOS) ---
+        self.settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "writeback_settings.json")
+        self.load_writeback_setting()
+        
+        self.canvas.create_text(235, 60, text="Writeback", fill=self.colors["subtext"], font=("Inter", 8, "bold"), anchor="e", tags="wb_toggle")
+        self.wb_switch_bg = self.draw_rounded_rect(245, 50, 285, 70, 10, self.colors["green"] if self.writeback_enabled else "#3A3A3C", tags="wb_toggle")
+        kx = 275 if self.writeback_enabled else 255
+        self.wb_switch_knob = self.canvas.create_oval(kx-8, 60-8, kx+8, 60+8, fill="#FFFFFF", outline="", tags="wb_toggle")
+        self.canvas.tag_bind("wb_toggle", "<Button-1>", lambda e: self.toggle_writeback())
+
         # --- Card de Tasas ---
         self.draw_rounded_rect(15, 85, 295, 135, 12, self.colors["card"])
         self.rate_label = self.canvas.create_text(155, 103, text="BCV: --.-- | BNB: --.--", fill=self.colors["text"], font=("Inter", 10, "bold"))
@@ -227,6 +237,31 @@ class SerruchoPremiumWidget:
                 self.last_synced_at = time.time()
         except Exception:
             self.last_synced_at = time.time()
+
+    def load_writeback_setting(self):
+        self.writeback_enabled = True
+        try:
+            if os.path.exists(self.settings_path):
+                with open(self.settings_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.writeback_enabled = data.get("enabled", True)
+        except Exception as e:
+            log_widget_error(f"Error cargando writeback_settings: {repr(e)}")
+
+    def save_writeback_setting(self):
+        try:
+            with open(self.settings_path, "w", encoding="utf-8") as f:
+                json.dump({"enabled": self.writeback_enabled}, f, indent=2)
+        except Exception as e:
+            log_widget_error(f"Error guardando writeback_settings: {repr(e)}")
+
+    def toggle_writeback(self):
+        self.writeback_enabled = not self.writeback_enabled
+        self.save_writeback_setting()
+        bg_color = self.colors["green"] if self.writeback_enabled else "#3A3A3C"
+        kx = 275 if self.writeback_enabled else 255
+        self.canvas.itemconfig(self.wb_switch_bg, fill=bg_color)
+        self.canvas.coords(self.wb_switch_knob, kx-8, 60-8, kx+8, 60+8)
 
     def load_calc_settings(self):
         self.last_discount = 0.0

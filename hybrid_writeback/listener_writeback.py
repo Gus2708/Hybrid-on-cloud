@@ -121,7 +121,24 @@ try:
 except Exception:  # pragma: no cover
     control_seguro = None
 
-HYBRID_WRITE_ENABLED = os.environ.get("HYBRID_WRITE_ENABLED") == "1"
+_last_known_enabled = None
+
+def check_hybrid_write_enabled():
+    global _last_known_enabled
+    default_enabled = os.environ.get("HYBRID_WRITE_ENABLED") == "1"
+    if _last_known_enabled is None:
+        _last_known_enabled = default_enabled
+    try:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "writeback_settings.json")
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                _last_known_enabled = data.get("enabled", default_enabled)
+    except Exception:
+        pass
+    return _last_known_enabled
+
+HYBRID_WRITE_ENABLED = check_hybrid_write_enabled()
 
 # force=True: los módulos importados arriba (flujo_stock_real, etc.) ya llamaron
 # logging.basicConfig con solo StreamHandler, y basicConfig es no-op si el root
@@ -395,6 +412,7 @@ def _aplicar_resultado_final(iid, partes, intentos):
     else:
         update_item(iid, backend_status="error", backend_resultado=resultado_final)
         log.error("FALLO item %s (status=error): %s", iid, resultado_final)
+    return status_final
 
 
 # ─── Fase STOCK de una orden (F10 — lote si hay >=2 items) ─────────────────────
@@ -511,6 +529,13 @@ def procesar_pendientes(items):
             _procesar_pendientes_impl(items, banner)
 
 
+def _texto_item(item):
+    """Etiqueta legible de un item para el panel lateral de pendientes."""
+    desc = (item.get("descripcion") or "").strip()
+    codigo = item.get("codigo_producto") or "?"
+    return f"{desc} ({codigo})" if desc else codigo
+
+
 def _procesar_pendientes_impl(items, banner=None):
     """Dos FASES GLOBALES sobre todas las órdenes de la pasada (pedido del
     dueño): primero TODAS las cantidades (un documento de ajuste por orden),
@@ -527,6 +552,23 @@ def _procesar_pendientes_impl(items, banner=None):
             banner.set_texto(texto)
         except Exception:
             pass
+
+    # panel lateral: lista completa de items de la pasada, tachando los que
+    # ya quedaron 'completado' (a medida que se van resolviendo). El orden
+    # de aparición es el de `items` (ya viene por id asc de get_pendientes).
+    orden_lista = [item["id"] for item in items]
+    textos_por_id = {item["id"]: _texto_item(item) for item in items}
+    hecho_por_id = {item["id"]: False for item in items}
+
+    def _refrescar_lista():
+        if banner is None:
+            return
+        try:
+            banner.set_lista([(textos_por_id[iid], hecho_por_id[iid]) for iid in orden_lista])
+        except Exception:
+            pass
+
+    _refrescar_lista()
 
     ordenes = {}
     for item in items:
@@ -552,6 +594,8 @@ def _procesar_pendientes_impl(items, banner=None):
                             backend_resultado="Sin cambios de stock, precio ni costo a realizar.",
                             backend_aplicado_en=datetime.datetime.now(datetime.timezone.utc).isoformat())
                 log.info("Item %s sin cambios reales -> 'completado' sin tocar HybridLite.", item["id"])
+                hecho_por_id[item["id"]] = True
+                _refrescar_lista()
                 continue
             if item["_tiene_stock_cambio"]:
                 items_con_stock.append(item)
@@ -597,7 +641,10 @@ def _procesar_pendientes_impl(items, banner=None):
     for iid, partes in partes_por_item.items():
         item = items_por_id[iid]
         intentos = (item.get("backend_intentos") or 0) + 1
-        _aplicar_resultado_final(iid, partes, intentos)
+        status_final = _aplicar_resultado_final(iid, partes, intentos)
+        if status_final == "completado":
+            hecho_por_id[iid] = True
+            _refrescar_lista()
 
     # Higiene de cierre: el flujo de precio/costo deja la Ficha abierta a
     # propósito (la reutiliza entre items de la misma pasada), pero no debe
@@ -608,8 +655,20 @@ def _procesar_pendientes_impl(items, banner=None):
     except Exception as e:
         log.warning("No pude cerrar la Ficha al final de la pasada: %r", e)
 
+    # La instancia de Hybrid usada es una AISLADA (ver abrir_hybrid.py), nunca
+    # la del empleado: minimizarla (no cerrarla) evita dejar una segunda
+    # ventana de Hybrid tapando la pantalla; se restaura sola en la próxima
+    # pasada que tenga trabajo pendiente.
+    try:
+        import abrir_hybrid
+        abrir_hybrid.minimizar_aislada()
+    except Exception as e:
+        log.warning("No pude minimizar la instancia aislada de Hybrid: %r", e)
+
 
 def loop(once=False):
+    global HYBRID_WRITE_ENABLED
+    HYBRID_WRITE_ENABLED = check_hybrid_write_enabled()
     log.info("=== listener_writeback iniciado (HYBRID_WRITE_ENABLED=%s, tabla=%s) ===",
              HYBRID_WRITE_ENABLED, TABLE)
     # F11 — lección de un incidente real: un proceso viejo quedó corriendo en
@@ -640,6 +699,7 @@ def loop(once=False):
     ultimo_motivo_skip = None
 
     while True:
+        HYBRID_WRITE_ENABLED = check_hybrid_write_enabled()
         if not (HYBRID_WRITE_ENABLED or once):
             # Nada que hacer y ya se avisó una vez arriba (fuera del bucle):
             # no tocar ultimo_motivo_skip para no disparar un "vuelve a

@@ -39,6 +39,34 @@ class PriceWriteError(Exception):
     pass
 
 
+# PID objetivo opcional (aislamiento multi-instancia). Cuando está seteado,
+# _find_dialog() y _click_guardar_ficha() ignoran ventanas de cualquier OTRA
+# instancia de HybridLite — p.ej. la que un empleado tenga abierta mientras el
+# bot trabaja en una instancia aparte. flujo_precio.set_target_pid() lo mantiene
+# en sync con su propio filtro (ver ese módulo). None = sin restricción.
+_target_pid = None
+
+
+def set_target_pid(pid):
+    global _target_pid
+    _target_pid = pid
+
+
+def clear_target_pid():
+    global _target_pid
+    _target_pid = None
+
+
+def _pid_ok(hwnd):
+    """True si `hwnd` pertenece al PID objetivo (o si no hay restricción)."""
+    if _target_pid is None:
+        return True
+    try:
+        return win32process.GetWindowThreadProcessId(hwnd)[1] == _target_pid
+    except Exception:
+        return False
+
+
 def _num(s):
     """Convierte '7,929.98' / '14.00' / '1,556.38%' -> float."""
     if s is None:
@@ -56,7 +84,8 @@ def _find_dialog():
     handles = []
     win32gui.EnumWindows(lambda h, _: handles.append(h), None)
     for h in handles:
-        if win32gui.GetClassName(h) == "TFHCostosPrecios" and win32gui.IsWindowVisible(h):
+        if (win32gui.GetClassName(h) == "TFHCostosPrecios"
+                and win32gui.IsWindowVisible(h) and _pid_ok(h)):
             pid = win32process.GetWindowThreadProcessId(h)[1]
             app = Application(backend="win32").connect(process=pid, timeout=5)
             return app, app.window(class_name="TFHCostosPrecios")
@@ -219,7 +248,7 @@ def _click_guardar_ficha():
     win32gui.EnumWindows(lambda h, _: handles.append(h), None)
     for h in handles:
         title = (win32gui.GetWindowText(h) or "")
-        if "Ficha de Inventario" in title and win32gui.IsWindowVisible(h):
+        if "Ficha de Inventario" in title and win32gui.IsWindowVisible(h) and _pid_ok(h):
             pid = win32process.GetWindowThreadProcessId(h)[1]
             app = Application(backend="win32").connect(process=pid, timeout=5)
             win = app.window(handle=h)
