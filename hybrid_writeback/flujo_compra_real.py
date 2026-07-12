@@ -687,7 +687,7 @@ def seleccionar_proveedor(com, proveedor_codigo, proveedor_nombre=None):
 
 
 # ── ítems de la grilla ──────────────────────────────────────────────────────
-def cargar_item(codigo, cantidad, costo, precio, commit):
+def cargar_item(codigo, cantidad, costo, precio, commit, es_primero=False):
     """Teclea un ítem completo en la grilla de Compras (el foco ya está en la
     celda Código, sin clic previo, replicando la grabación):
         código -> ENTER (carga)
@@ -696,14 +696,23 @@ def cargar_item(codigo, cantidad, costo, precio, commit):
         precio (escribir_precio, reutilizado de flujo_precio_real) -> Aceptar+Salir
         (commit) o solo Salir (preview, descarta el ítem)
     Lanza CompraError ante cualquier desviación; el llamador cancela TODO el
-    documento (política todo-o-nada)."""
+    documento (política todo-o-nada).
+
+    SOLO el PRIMER ítem (`es_primero`) activa la ventana de Compras. Al salir de
+    Costos y Precios, HybridLite deja el cursor en la celda Código del siguiente
+    ítem automáticamente (confirmado por el dueño 2026-07-12), así que los ítems
+    siguientes NO se re-enfocan ni se clickea celda alguna -- re-activar la
+    ventana perturbaría ese cursor auto-posicionado."""
     hcom = fp._find_hwnd(COMPRAS_CLASS)
-    _focus(hcom)
+    if es_primero:
+        _focus(hcom)
 
     # Un ítem que quedó en/bajo su mínimo dispara una alerta 'llegó al mínimo'
     # de forma ASÍNCRONA/TARDÍA, que puede aparecer ya empezado el siguiente
     # ítem. Drenarla ANTES de teclear este código evita que la del ítem previo
-    # se cuele en la bifurcación de éste (confirmado en vivo 2026-07-12).
+    # se cuele en la bifurcación de éste (confirmado en vivo 2026-07-12). Solo
+    # tras drenarla se re-enfoca (la alerta roba el foreground); si no hay
+    # alerta, se respeta el cursor que dejó auto-posicionado el ítem anterior.
     if fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm"):
         _confirmar_lo_que_pregunte(timeout=2)
         _focus(hcom)
@@ -1046,6 +1055,7 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
     # ítems: cualquier fallo cancela el DOCUMENTO COMPLETO (todo-o-nada).
     # ASIMETRÍA preview: los ítems es_nuevo se SALTAN de cargar_item en preview
     # (el alta no se guardó, el código no existe en HybridLite todavía).
+    primero = True
     for it in items:
         if it.get("es_nuevo") and not commit:
             log.info("Ítem %s (es_nuevo, preview): alta ya validada en pantalla y "
@@ -1053,7 +1063,9 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
                      "no existe sin --commit).", it["codigo"])
             continue
         try:
-            cargar_item(it["codigo"], it["cantidad"], it["costo"], it["precio"], commit)
+            cargar_item(it["codigo"], it["cantidad"], it["costo"], it["precio"],
+                        commit, es_primero=primero)
+            primero = False
         except CompraError as e:
             etapa = "precio_item" if "precio" in str(e).lower() else "carga_item"
             _cancelar_compra(fp._find_hwnd(COMPRAS_CLASS))
