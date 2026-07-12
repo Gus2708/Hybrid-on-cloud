@@ -235,61 +235,20 @@ def _borrar_items(aj):
 
 
 def cargar_y_fijar(aj, grid, codigo, target):
-    """Secuencia FIEL a la grabación del dueño (2026-07-08), que SÍ postea la fila:
-        clic celda Código → teclear código LENTO → ENTER (carga y el cursor SALTA a
-        la celda Conteo) → teclear la cantidad DIRECTO → ENTER → ENTER.
-    Verifica código (producto correcto) y conteo (cantidad correcta)."""
+    """Flujo single (UN producto): limpia residuo si la grilla trae otro código
+    cargado, y delega la coreografía de carga/verificación/posteo en
+    cargar_y_fijar_fila con fila=0 (clic inicial en la celda Código de la 1a
+    fila de datos + la misma verificación código/conteo antes de postear).
+    La coreografía en sí -- FIEL a la grabación del dueño (2026-07-08) que SÍ
+    postea la fila: clic celda Código → teclear código LENTO → ENTER (carga y
+    el cursor SALTA a la celda Conteo) → teclear la cantidad DIRECTO → ENTER →
+    ENTER -- vive únicamente en cargar_y_fijar_fila."""
     d = _leer(aj, grid)
     if d["codigo"] and d["codigo"].lower() != codigo.strip().lower():
         _borrar_items(aj)          # limpiar residuo/otro producto
         time.sleep(0.4)
 
-    gr = grid.rectangle()
-    _focus(fp._find_hwnd(AJU_CLASS))
-    ri.click(gr.left + 196, gr.top + 40)      # celda Código, 1a fila de datos
-    time.sleep(0.3)
-    ri.type_code(codigo)                       # LENTO (evita truncado/búsqueda)
-    time.sleep(0.4)
-    ri.press("ENTER")                          # carga el producto y salta a Conteo
-    time.sleep(1.2)
-
-    # verificar que cargó el producto correcto ANTES de tocar la cantidad
-    datos = None
-    for _ in range(6):
-        datos = _leer(aj, grid)
-        if datos["codigo"].lower() == codigo.strip().lower():
-            break
-        time.sleep(0.4)
-    if not datos or datos["codigo"].lower() != codigo.strip().lower():
-        raise StockError(f"La grilla NO cargó {codigo} (código en grilla={datos['codigo']!r}). "
-                         f"Abortando para no ajustar otro producto.")
-    existencia_ui = datos["existencia"]
-    log.info("Producto %s cargado. Existencia=%s, Conteo actual=%s.",
-             codigo, existencia_ui, datos["conteo"])
-
-    # el cursor ya está en Conteo: teclear el objetivo DIRECTO (reemplaza el auto-relleno)
-    ri.type_number(f"{target:g}")
-    time.sleep(0.3)
-
-    # VERIFICAR ANTES de postear (la fila aún es editable y sus celdas son legibles).
-    # Tras el 2º ENTER la fila se 'postea' y queda estática -> ya no se puede leer.
-    datos = _leer(aj, grid)
-    log.info("Antes de postear: código=%s conteo=%s existencia=%s",
-             datos["codigo"], datos["conteo"], datos["existencia"])
-    if datos["codigo"].lower() != codigo.strip().lower():
-        raise StockError(f"La grilla muestra {datos['codigo']!r}, no {codigo}. Abortando (NADA se guarda).")
-    if datos["conteo"] is None or abs(datos["conteo"] - target) > TOL:
-        raise StockError(f"El Conteo no quedó en {target} (quedó {datos['conteo']}). NADA se guarda.")
-    if existencia_ui is None:
-        existencia_ui = datos["existencia"]
-
-    # postear la fila: ENTER (confirma conteo) + ENTER (postea -> lista para Totalizar)
-    ri.press("ENTER")
-    time.sleep(0.5)
-    ri.press("ENTER")
-    time.sleep(0.6)
-    datos["existencia"] = existencia_ui
-    return datos
+    return cargar_y_fijar_fila(aj, grid, codigo, target, fila=0)
 
 
 def cargar_y_fijar_fila(aj, grid, codigo, target, fila):
