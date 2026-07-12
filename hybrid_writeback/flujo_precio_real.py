@@ -307,6 +307,16 @@ def escribir_precio(target, iva):
     log.info("Campo con-impuesto actual=%r ; sin-impuesto actual=%r",
              con_field.window_text(), sin_field.window_text())
 
+    # AHORRO (pedido del dueño 2026-07-12): si el precio con-impuesto YA está en
+    # el target (± TOL), NO lo reescribimos -- se evita teclear y el recálculo,
+    # y se sale más rápido. Típico al comprar un producto cuyo precio de venta no
+    # cambió. En un alta el campo arranca en 0, así que igual se escribe.
+    con_actual = hpw._num(con_field.window_text())
+    if con_actual is not None and abs(con_actual - target) <= TOL:
+        sin_actual = hpw._num(sin_field.window_text())
+        log.info("Precio con-impuesto ya está en %.2f (=target); no se reescribe.", con_actual)
+        return {"con": con_actual, "sin": sin_actual}
+
     # enfocar el campo con-impuesto: clic real en la parte baja del campo + set_focus
     r = con_field.rectangle()
     cx = (r.left + r.right) // 2

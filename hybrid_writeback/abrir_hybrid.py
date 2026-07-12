@@ -319,6 +319,53 @@ def minimizar_aislada():
             print(f"No pude minimizar la instancia aislada de Hybrid: {e}")
 
 
+def _pid_es_hybrid(pid):
+    """True si `pid` sigue siendo un proceso HybridLiteOS.exe (defensa contra
+    que el PID haya sido reciclado por el SO a otro proceso cualquiera)."""
+    try:
+        import win32api, win32con
+        h = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        try:
+            nombre = os.path.basename(win32process.GetModuleFileNameEx(h, 0)).lower()
+        finally:
+            win32api.CloseHandle(h)
+        return nombre == "hybridliteos.exe"
+    except Exception:
+        return False
+
+
+def cerrar_aislada():
+    """Cierra (mata) la instancia AISLADA que ESTE proceso abrió, por su PID
+    (_AISLADO_PID). SEGURO POR DISEÑO: solo toca el PID que asegurar_hybrid
+    lanzó como aislado, así que NUNCA cierra la ventana que un empleado tenga
+    abierta (esa es otra instancia, otro PID) ni le hace perder su trabajo.
+
+    Antes de matar verifica que el PID siga siendo HybridLiteOS.exe (por si el
+    SO recicló el número a otro proceso). Si no hay instancia aislada
+    registrada, no hace nada.
+
+    ⚠️ NUNCA hacer `taskkill /IM HybridLiteOS.exe` ni cerrar TODAS las
+    instancias: eso mataría también la del empleado. El cierre SIEMPRE es por
+    este PID puntual."""
+    global _AISLADO_PID
+    import win32con
+    pid = _AISLADO_PID
+    if pid is None:
+        return
+    if not _pid_es_hybrid(pid):
+        print(f"PID aislado {pid} ya no es HybridLiteOS (cerrado o reciclado); no se toca nada.")
+        _AISLADO_PID = None
+        fp.clear_target_pid()
+        return
+    try:
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, timeout=10)
+        print(f"Instancia aislada de Hybrid (PID {pid}) cerrada.")
+    except Exception as e:
+        print(f"No pude cerrar la instancia aislada (PID {pid}): {e}")
+    _AISLADO_PID = None
+    fp.clear_target_pid()
+
+
 if __name__ == "__main__":
     ok, msg = asegurar_hybrid()
     print(("OK: " if ok else "FALLO: ") + msg)

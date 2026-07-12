@@ -687,12 +687,6 @@ def seleccionar_proveedor(com, proveedor_codigo, proveedor_nombre=None):
 
 
 # ── ítems de la grilla ──────────────────────────────────────────────────────
-def _abrir_costos_precios_item(hcom):
-    """Espera a que TFHCostosPrecios aparezca tras teclear costo+ENTER en la
-    grilla (se abre SOLO, sin clic -- así lo muestra la grabación)."""
-    return fp._wait_for(fp.PRECIOS_CLASS, timeout=10, desc="Costos y Precios (ítem de compra)")
-
-
 def cargar_item(codigo, cantidad, costo, precio, commit):
     """Teclea un ítem completo en la grilla de Compras (el foco ya está en la
     celda Código, sin clic previo, replicando la grabación):
@@ -705,6 +699,14 @@ def cargar_item(codigo, cantidad, costo, precio, commit):
     documento (política todo-o-nada)."""
     hcom = fp._find_hwnd(COMPRAS_CLASS)
     _focus(hcom)
+
+    # Un ítem que quedó en/bajo su mínimo dispara una alerta 'llegó al mínimo'
+    # de forma ASÍNCRONA/TARDÍA, que puede aparecer ya empezado el siguiente
+    # ítem. Drenarla ANTES de teclear este código evita que la del ítem previo
+    # se cuele en la bifurcación de éste (confirmado en vivo 2026-07-12).
+    if fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm"):
+        _confirmar_lo_que_pregunte(timeout=2)
+        _focus(hcom)
 
     ri.type_code(codigo)
     time.sleep(0.3)
@@ -723,14 +725,37 @@ def cargar_item(codigo, cantidad, costo, precio, commit):
     ri.press("ENTER")
     time.sleep(0.6)
 
-    # la alerta 'el producto llegó al mínimo' puede aparecer al agregar el
-    # producto a la grilla -> darle OK/Aceptar y continuar (no cancela nada).
-    _confirmar_lo_que_pregunte(timeout=1.0)
+    # Tras confirmar el costo, HybridLite hace UNA de dos cosas (bifurcación,
+    # confirmada por el dueño 2026-07-12):
+    #   (a) el producto está EN/BAJO su mínimo -> alerta 'llegó al mínimo'
+    #       (TFConfirmacion). Se le da Ok y el producto YA QUEDA agregado a la
+    #       grilla con el costo tecleado; Costos y Precios NO se abre. El precio
+    #       queda por acople al costo. Se pasa directo al siguiente ítem.
+    #   (b) producto normal -> se abre Costos y Precios (TFHCostosPrecios) para
+    #       teclear el precio.
+    # CLAVE: NO se rompe el bucle al ver una alerta. La alerta 'llegó al mínimo'
+    # de un ítem previo (at-min) llega tarde/asíncrona y puede colarse aquí; se
+    # drena (Ok) pero se SIGUE esperando a que abra Costos y Precios de ESTE
+    # ítem. Solo si tras el timeout nunca abrió, se concluye caso (a).
+    precios_h = None
+    t0 = time.time()
+    while time.time() - t0 < 8:
+        precios_h = fp._find_hwnd(fp.PRECIOS_CLASS)
+        if precios_h:
+            break                                   # caso (b): abrió el diálogo
+        if fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm"):
+            _confirmar_lo_que_pregunte(timeout=3)    # Ok a 'llegó al mínimo'
+            _focus(hcom)
+        time.sleep(0.3)
 
-    try:
-        _abrir_costos_precios_item(hcom)
-    except fp.FlujoError as e:
-        raise CompraError(f"No se abrió Costos y Precios para el ítem {codigo}: {e}")
+    if not precios_h:
+        # caso (a): nunca abrió Costos y Precios -> ítem at-min agregado directo.
+        # (Si en realidad no se agregó, la verificación final contra la DBISAM
+        # lo detecta por existencia y aborta todo-o-nada.)
+        log.info("Ítem %s en el mínimo: agregado directo (costo=%s), Costos y "
+                 "Precios NO abre; se continúa (commit=%s).",
+                 codigo, costo, commit)
+        return
 
     try:
         fpr.escribir_precio(float(precio), fpr.IVA_DEF)
@@ -748,6 +773,11 @@ def cargar_item(codigo, cantidad, costo, precio, commit):
 
     if fp._find_hwnd(fp.PRECIOS_CLASS):
         raise CompraError(f"El diálogo Costos y Precios no se cerró para el ítem {codigo}.")
+
+    # Drenar la alerta TARDÍA 'llegó al mínimo' que este ítem (si quedó at-min)
+    # dispara tras agregarse, para que no se cuele en el siguiente ítem.
+    _confirmar_lo_que_pregunte(timeout=1.2)
+
     log.info("Ítem %s cargado (cant=%s costo=%s precio=%s, commit=%s).",
              codigo, cantidad, costo, precio, commit)
 
