@@ -81,6 +81,17 @@ def press(name, hold=0.02):
     press_vk(VK[name], hold)
 
 
+def press_shift(key, hold=0.02):
+    """SHIFT + tecla de texto (p.ej. press_shift('4') -> '$' en layout latam),
+    con input real (mismo patrón SHIFT down/up que select_all_field()). `key`
+    es un caracter simple de la fila superior de números (VK == ord(mayúscula))."""
+    vk = ord(key.upper())
+    _send(_key_input(vk=0x10))                      # SHIFT down
+    press_vk(vk, hold)
+    _send(_key_input(vk=0x10, flags=KEYEVENTF_KEYUP))  # SHIFT up
+    time.sleep(0.03)
+
+
 def type_text(text, per_char=0.05):
     """Teclea texto como UNICODE (independiente del layout). Ideal para códigos."""
     for ch in text:
