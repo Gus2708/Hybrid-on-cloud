@@ -130,3 +130,44 @@ def format_elapsed(seconds: float) -> str:
     if m:
         return f"{m}m{s:02d}s"
     return f"{s}s"
+
+
+def check_waha() -> dict:
+    """Verifica el estado de la sesión default en WAHA.
+    Retorna {'ok': bool, 'status': str, 'detail': str}.
+    """
+    env_path = r"C:\Proyect\whatsapp-agent\.env"
+    api_key = ""
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("WAHA_API_KEY="):
+                        api_key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        break
+        except Exception:
+            pass
+
+    if not api_key:
+        api_key = "REDACTED-API-KEY"
+
+    url = "http://localhost:3000/api/sessions/default"
+    headers = {
+        "X-Api-Key": api_key,
+        "Content-Type": "application/json"
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            data = json.loads(resp.read().decode())
+            status = data.get("status", "UNKNOWN")
+            ok = (status == "WORKING")
+            return {"ok": ok, "status": status, "detail": f"Status: {status}"}
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return {"ok": False, "status": "UNAUTHORIZED", "detail": "API Key inválida"}
+        return {"ok": False, "status": "ERROR", "detail": f"HTTP {e.code}"}
+    except Exception as e:
+        return {"ok": False, "status": "OFFLINE", "detail": "Servidor offline / puerto cerrado"}
+

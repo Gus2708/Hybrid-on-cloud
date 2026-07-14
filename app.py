@@ -276,7 +276,7 @@ def sync_status():
 def health():
     """Endpoint de diagnóstico completo con timeouts para no bloquear."""
     try:
-        from network_util import check_drive, check_supabase, get_local_ip
+        from network_util import check_drive, check_supabase, get_local_ip, check_waha
     except ImportError:
         return jsonify({"status": "error", "detail": "network_util no disponible"}), 500
     
@@ -295,6 +295,7 @@ def health():
         drive = False
     
     supabase = check_supabase()
+    waha = check_waha()
     ip = get_local_ip()
     
     mon_path = os.path.join(BASE_DIR, "last_monitor.json")
@@ -317,6 +318,7 @@ def health():
         "supabase": supabase,
         "monitor": {"ok": monitor_alive, "last_seen": last_mon},
         "is_syncing": locked,
+        "waha": waha,
     }
     all_ok = all(v.get("ok", False) if isinstance(v, dict) else True for v in checks.values())
     

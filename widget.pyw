@@ -71,6 +71,7 @@ class SerruchoPremiumWidget:
         self.height_full = 335
         self.height_compact = 230
         self.integrity_visible = True
+        self.waha_alert_shown = False
         
         # Estética iOS 17
         self.root.overrideredirect(True)
@@ -96,6 +97,11 @@ class SerruchoPremiumWidget:
         
         # Cabecera
         self.canvas.create_text(25, 22, text="El Serrucho", fill=self.colors["text"], font=("Inter", 12, "bold"), anchor="w", tags="title")
+        
+        # Indicador independiente de WhatsApp (WAHA)
+        self.waha_dot = self.canvas.create_oval(198, 17, 208, 27, fill=self.colors["green"], outline="")
+        self.canvas.create_text(188, 22, text="WA", fill=self.colors["subtext"], font=("Inter", 8, "bold"), anchor="e", tags="waha_label")
+
         self.status_dot = self.canvas.create_oval(260, 17, 270, 27, fill=self.colors["green"], outline="")
         # Anillo exterior del status_dot (se usa para drive/monitor status)
         self.status_ring = self.canvas.create_oval(258, 15, 272, 29, outline=self.colors["green"], width=1, state="hidden")
@@ -132,11 +138,50 @@ class SerruchoPremiumWidget:
         self.settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "writeback_settings.json")
         self.load_writeback_setting()
         
-        self.canvas.create_text(235, 60, text="Writeback", fill=self.colors["subtext"], font=("Inter", 8, "bold"), anchor="e", tags="wb_toggle")
-        self.wb_switch_bg = self.draw_rounded_rect(245, 50, 285, 70, 10, self.colors["green"] if self.writeback_enabled else "#3A3A3C", tags="wb_toggle")
+        self.wb_animation_running = False
+        self.wb_hovered = False
+        
+        self.wb_text_label = self.canvas.create_text(
+            235, 60, 
+            text="Writeback", 
+            fill="#FFFFFF" if self.writeback_enabled else self.colors["subtext"], 
+            font=("Inter", 8, "bold"), 
+            anchor="e", 
+            tags="wb_toggle"
+        )
+        
+        # Generate points for a smooth pill shape (switch background)
+        pill_points = []
+        steps = 16
+        for i in range(steps + 1):
+            angle = -math.pi / 2.0 + (math.pi * i / steps)
+            x = 275 + 10 * math.cos(angle)
+            y = 60 + 10 * math.sin(angle)
+            pill_points.extend([x, y])
+        for i in range(steps + 1):
+            angle = math.pi / 2.0 + (math.pi * i / steps)
+            x = 255 + 10 * math.cos(angle)
+            y = 60 + 10 * math.sin(angle)
+            pill_points.extend([x, y])
+
+        self.wb_switch_bg = self.canvas.create_polygon(
+            pill_points,
+            fill=self.colors["green"] if self.writeback_enabled else "#3A3A3C",
+            outline="",
+            tags="wb_toggle"
+        )
+        
         kx = 275 if self.writeback_enabled else 255
-        self.wb_switch_knob = self.canvas.create_oval(kx-8, 60-8, kx+8, 60+8, fill="#FFFFFF", outline="", tags="wb_toggle")
+        self.wb_switch_knob = self.canvas.create_oval(
+            kx-8, 60-8, kx+8, 60+8, 
+            fill="#FFFFFF", 
+            outline="", 
+            width=0,
+            tags="wb_toggle"
+        )
         self.canvas.tag_bind("wb_toggle", "<Button-1>", lambda e: self.toggle_writeback())
+        self.canvas.tag_bind("wb_toggle", "<Enter>", lambda e: self.on_wb_hover(True))
+        self.canvas.tag_bind("wb_toggle", "<Leave>", lambda e: self.on_wb_hover(False))
 
         # --- Card de Tasas ---
         self.draw_rounded_rect(15, 85, 295, 135, 12, self.colors["card"])
@@ -255,13 +300,80 @@ class SerruchoPremiumWidget:
         except Exception as e:
             log_widget_error(f"Error guardando writeback_settings: {repr(e)}")
 
+    def interpolate_color(self, color_start, color_end, t):
+        def hex_to_rgb(hex_str):
+            hex_str = hex_str.lstrip('#')
+            return tuple(int(hex_str[i:i+2], 16) for i in (0, 2, 4))
+        
+        def rgb_to_hex(rgb):
+            return '#{:02x}{:02x}{:02x}'.format(int(rgb[0]), int(rgb[1]), int(rgb[2]))
+
+        rgb1 = hex_to_rgb(color_start)
+        rgb2 = hex_to_rgb(color_end)
+        
+        r = rgb1[0] + (rgb2[0] - rgb1[0]) * t
+        g = rgb1[1] + (rgb2[1] - rgb1[1]) * t
+        b = rgb1[2] + (rgb2[2] - rgb1[2]) * t
+        
+        return rgb_to_hex((r, g, b))
+
+    def update_wb_appearance(self):
+        if self.wb_animation_running:
+            return
+        
+        if self.writeback_enabled:
+            bg_color = "#3AE359" if self.wb_hovered else self.colors["green"]
+            text_color = "#FFFFFF"
+            kx = 275
+        else:
+            bg_color = "#4A4A4C" if self.wb_hovered else "#3A3A3C"
+            text_color = self.colors["subtext"]
+            kx = 255
+            
+        self.canvas.itemconfig(self.wb_switch_bg, fill=bg_color)
+        self.canvas.itemconfig(self.wb_text_label, fill=text_color)
+        self.canvas.coords(self.wb_switch_knob, kx-8, 60-8, kx+8, 60+8)
+
+    def on_wb_hover(self, hovered):
+        self.wb_hovered = hovered
+        self.update_wb_appearance()
+
+    def animate_toggle(self, start_time, duration=0.18):
+        elapsed = time.time() - start_time
+        t = min(1.0, elapsed / duration)
+        t_eased = t * (2 - t) # ease-out-quad
+        
+        current_x = self.x_start + (self.x_end - self.x_start) * t_eased
+        current_color = self.interpolate_color(self.c_start, self.c_end, t_eased)
+        
+        self.canvas.itemconfig(self.wb_switch_bg, fill=current_color)
+        self.canvas.coords(self.wb_switch_knob, current_x-8, 60-8, current_x+8, 60+8)
+        
+        if t < 1.0:
+            self.root.after(15, lambda: self.animate_toggle(start_time, duration))
+        else:
+            self.wb_animation_running = False
+            self.update_wb_appearance()
+
     def toggle_writeback(self):
+        if self.wb_animation_running:
+            return
+            
         self.writeback_enabled = not self.writeback_enabled
         self.save_writeback_setting()
-        bg_color = self.colors["green"] if self.writeback_enabled else "#3A3A3C"
-        kx = 275 if self.writeback_enabled else 255
-        self.canvas.itemconfig(self.wb_switch_bg, fill=bg_color)
-        self.canvas.coords(self.wb_switch_knob, kx-8, 60-8, kx+8, 60+8)
+        
+        # Configurar animación
+        self.wb_animation_running = True
+        self.x_start = 255 if self.writeback_enabled else 275
+        self.x_end = 275 if self.writeback_enabled else 255
+        self.c_start = "#3A3A3C" if self.writeback_enabled else self.colors["green"]
+        self.c_end = self.colors["green"] if self.writeback_enabled else "#3A3A3C"
+        
+        # Cambiar el color de la etiqueta de texto inmediatamente para que se sienta responsivo
+        text_color = "#FFFFFF" if self.writeback_enabled else self.colors["subtext"]
+        self.canvas.itemconfig(self.wb_text_label, fill=text_color)
+        
+        self.animate_toggle(time.time(), duration=0.18)
 
     def load_calc_settings(self):
         self.last_discount = 0.0
@@ -451,9 +563,57 @@ class SerruchoPremiumWidget:
             drive_ok = checks.get("drive_h", {}).get("ok", False)
             mon_ok = checks.get("monitor", {}).get("ok", False)
             sup_ok = checks.get("supabase", {}).get("ok", False)
+            
+            # WAHA Check
+            waha_check = checks.get("waha", {})
+            waha_ok = waha_check.get("ok", False)
+            waha_status = waha_check.get("status", "UNKNOWN")
+            
+            # Mapear color del dot de WAHA independientemente
+            waha_color = self.colors["green"] if waha_ok else self.colors["red"]
+            self.canvas.itemconfig(self.waha_dot, fill=waha_color)
+            
+            # Alerta emergente del sistema (Popup no bloqueante) si se cae
+            if not waha_ok:
+                if not self.waha_alert_shown:
+                    self.waha_alert_shown = True
+                    if waha_status == "SCAN_QR_CODE":
+                        title_box = "Vincular WhatsApp (El Serrucho)"
+                        msg_box = "La sesión de WhatsApp del bot se cerró.\n\nPor favor, abre el panel de WAHA (http://localhost:3000) e inicia sesión con admin_serrucho para escanear el código QR."
+                    elif waha_status == "FAILED":
+                        title_box = "Sesión Fallida de WhatsApp"
+                        msg_box = "La sesión de WhatsApp (WAHA) falló.\n\nRevisa el panel de control de WAHA para reiniciar la sesión o re-vincular."
+                    elif waha_status == "OFFLINE":
+                        title_box = "Servidor WhatsApp Offline"
+                        msg_box = "El servidor de WhatsApp (WAHA) no responde.\n\nComprueba que Docker Desktop esté en ejecución y los contenedores estén activos."
+                    else:
+                        title_box = "WhatsApp Desconectado"
+                        msg_box = f"La sesión de WhatsApp del bot no está activa (Estado: {waha_status}).\n\nPor favor, verifica la conexión."
+                    
+                    def show_popup():
+                        try:
+                            messagebox.showwarning(title_box, msg_box)
+                        except: pass
+                    
+                    threading.Thread(target=show_popup, daemon=True).start()
+            else:
+                self.waha_alert_shown = False
+
+            # El anillo del backend/sistema mantiene sus propios checks originales
             ring_color = self.colors["green"] if (drive_ok and mon_ok and sup_ok) else self.colors["red"]
             self.canvas.itemconfig(self.status_ring, state="normal", outline=ring_color)
-            if not sup_ok:
+            
+            # Prioridad de mensajes en el label de detalle
+            if not waha_ok:
+                if waha_status == "SCAN_QR_CODE":
+                    self.canvas.itemconfig(self.detail_label, text="⚠️ WhatsApp: Escanear QR en panel")
+                elif waha_status == "FAILED":
+                    self.canvas.itemconfig(self.detail_label, text="⚠️ WhatsApp: Sesión fallida")
+                elif waha_status == "OFFLINE":
+                    self.canvas.itemconfig(self.detail_label, text="⚠️ WhatsApp: Servidor offline")
+                else:
+                    self.canvas.itemconfig(self.detail_label, text=f"⚠️ WhatsApp: Desconectado ({waha_status})")
+            elif not sup_ok:
                 self.canvas.itemconfig(self.detail_label, text="⚠️ Supabase no responde")
             elif not drive_ok:
                 self.canvas.itemconfig(self.detail_label, text="⚠️ Unidad H: desconectada")

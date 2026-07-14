@@ -19,6 +19,7 @@ def test_health_endpoint(client, mocker):
     # Mock check_drive, check_supabase, get_local_ip from network_util
     mocker.patch("network_util.check_drive", return_value=True)
     mocker.patch("network_util.check_supabase", return_value={"ok": True})
+    mocker.patch("network_util.check_waha", return_value={"ok": True, "status": "WORKING"})
     mocker.patch("network_util.get_local_ip", return_value="127.0.0.1")
     
     response = client.get("/health")
