@@ -10,3 +10,4 @@ pywin32==312
 watchdog==6.0.0
 pydbisam==1.2.1
 waitress==3.0.2
+msal==1.37.0

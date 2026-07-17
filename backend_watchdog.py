@@ -178,6 +178,7 @@ SCRIPTS = [
         # sin restricción horaria (procesa a cualquier hora).
         "env": {"HYBRID_WRITE_ENABLED": "1"},
     }),
+    ("zelle_listener.py",   "Listener Zelle"),
     ("listener_compras.py", "Write-back compras", {
         "subdir": "hybrid_writeback",
         # Mismo criterio que listener_writeback: HYBRID_WRITE_ENABLED=1 sólo

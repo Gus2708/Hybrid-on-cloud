@@ -81,3 +81,26 @@ RUTA_VENTAS_CABECERA = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TTransaccion
 RUTA_VENTAS_DETALLE  = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TDetalleVta.dat'
 RUTA_CLIENTES        = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TClientes.dat'
 
+# ─── Listener de Zelle (zelle_listener.py — correo Outlook via Microsoft Graph) ──
+# El puerto IMAP (993) esta bloqueado por el ISP de la tienda (confirmado con pruebas
+# de red); el listener usa Graph API por HTTPS/443 en su lugar (ver ZELLE-LISTENER.md).
+# ZELLE_EMAIL: cuenta personal de Outlook/Hotmail que recibe los avisos de Zelle
+#   (solo informativa/para logs — Graph identifica la cuenta via el login "/me").
+# ZELLE_CLIENT_ID: Application (client) ID del App Registration de Azure
+#   (cliente público con device-code flow; ver ZELLE-LISTENER.md).
+# ZELLE_TRUSTED_SENDERS: direcciones EXACTAS que cuentan como banco real
+#   (anti-spoofing). Los avisos de pago recibido vienen de customerservice@... y
+#   los de "en revisión" de onlinebanking@... (subdominio ealerts.bankofamerica.com).
+#   Un correo cuyo remitente no esté en esta lista se descarta aunque parezca Zelle.
+# ZELLE_REQUIRE_DMARC: exigir que el correo haya pasado DMARC (cabecera que agrega
+#   Outlook al recibir y el estafador no puede falsificar). Dejar en "1" salvo depuración.
+# ZELLE_POLL_INTERVAL_S: segundos entre cada consulta a Graph (polling, no push).
+ZELLE_EMAIL = os.environ.get("ZELLE_EMAIL", "")
+ZELLE_CLIENT_ID = os.environ.get("ZELLE_CLIENT_ID", "")
+ZELLE_TRUSTED_SENDERS = {s.strip().lower() for s in os.environ.get(
+    "ZELLE_TRUSTED_SENDERS",
+    "customerservice@ealerts.bankofamerica.com,onlinebanking@ealerts.bankofamerica.com",
+).split(",") if s.strip()}
+ZELLE_REQUIRE_DMARC = os.environ.get("ZELLE_REQUIRE_DMARC", "1") == "1"
+ZELLE_POLL_INTERVAL_S = float(os.environ.get("ZELLE_POLL_INTERVAL_S", "5"))
+
