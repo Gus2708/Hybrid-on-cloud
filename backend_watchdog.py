@@ -187,6 +187,17 @@ SCRIPTS = [
         # entre sí vía el mutex de safety_control.control_seguro.
         "env": {"HYBRID_WRITE_ENABLED": "1"},
     }),
+    ("listener_pedidos.py", "Write-back pedidos", {
+        "subdir": "hybrid_writeback",
+        # Registra los pedidos (documento Tipo 10) que la app emite en
+        # pedidos_app -> aparecen en caja para facturar. Mismo criterio que los
+        # otros write-back: HYBRID_WRITE_ENABLED=1 sólo para este proceso
+        # (correrlo a mano sigue siendo preview seguro). Es el TERCER listener
+        # que toma el mouse real; los tres se serializan vía el mutex de
+        # safety_control.control_seguro. Sin HYBRID_WRITE_WINDOW: un pedido debe
+        # registrarse pronto para que caja lo facture, no en una ventana horaria.
+        "env": {"HYBRID_WRITE_ENABLED": "1"},
+    }),
 ]
 
 # ─── Detección de procesos colgados (vivos pero congelados) ──────────────────
