@@ -19,7 +19,7 @@ if sys.executable.lower().endswith("pythonw.exe"):
 
 # Intentar cargar rutas desde config
 try:
-    from config import RUTA_INVENTARIO, RUTA_PRECIOS, RUTA_EXISTENCIA, RUTA_VENTAS_CABECERA, RUTA_VENTAS_DETALLE, RUTA_CLIENTES
+    from config import RUTA_INVENTARIO, RUTA_PRECIOS, RUTA_EXISTENCIA, RUTA_VENTAS_CABECERA, RUTA_VENTAS_DETALLE, RUTA_CLIENTES, RUTA_PROVEEDORES
 except ImportError:
     RUTA_INVENTARIO = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TInventario.dat'
     RUTA_PRECIOS    = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TCostoPrecioInv.Dat'
@@ -27,6 +27,7 @@ except ImportError:
     RUTA_VENTAS_CABECERA = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TTransaccionvta.dat'
     RUTA_VENTAS_DETALLE  = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TDetalleVta.dat'
     RUTA_CLIENTES        = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TClientes.dat'
+    RUTA_PROVEEDORES     = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TProveedores.Dat'
 
 # Archivos críticos a vigilar
 CRITICAL_FILES = {
@@ -35,7 +36,8 @@ CRITICAL_FILES = {
     os.path.basename(RUTA_EXISTENCIA).lower(): "inventario",
     os.path.basename(RUTA_VENTAS_CABECERA).lower(): "ventas",
     os.path.basename(RUTA_VENTAS_DETALLE).lower(): "ventas",
-    os.path.basename(RUTA_CLIENTES).lower(): "ventas"
+    os.path.basename(RUTA_CLIENTES).lower(): "ventas",
+    os.path.basename(RUTA_PROVEEDORES).lower(): "proveedores"
 }
 
 WATCH_DIR = os.path.dirname(RUTA_INVENTARIO)
@@ -46,16 +48,18 @@ class SyncTriggerHandler(FileSystemEventHandler):
         # Tiempos de debounce específicos por tipo
         self.debounce_seconds = {
             "inventario": 3.0,
-            "ventas": 1.5
+            "ventas": 1.5,
+            "proveedores": 2.0
         }
         # Tiempos de cooldown mínimos específicos por tipo (en segundos)
         self.min_interval = {
             "inventario": 15.0,
-            "ventas": 5.0
+            "ventas": 5.0,
+            "proveedores": 15.0
         }
-        self.last_sync_time = {"inventario": 0.0, "ventas": 0.0}
-        self.timers = {"inventario": None, "ventas": None}
-        self.pending_syncs = {"inventario": False, "ventas": False}
+        self.last_sync_time = {"inventario": 0.0, "ventas": 0.0, "proveedores": 0.0}
+        self.timers = {"inventario": None, "ventas": None, "proveedores": None}
+        self.pending_syncs = {"inventario": False, "ventas": False, "proveedores": False}
         self.lock = threading.Lock()
 
     def on_modified(self, event):
@@ -117,6 +121,11 @@ class SyncTriggerHandler(FileSystemEventHandler):
                         import importlib
                         importlib.reload(sync_ventas)
                         ok = sync_ventas.sync_incremental() is not False
+                    elif sync_type == "proveedores":
+                        import sync_proveedores
+                        import importlib
+                        importlib.reload(sync_proveedores)
+                        ok = sync_proveedores.main() == 0
                     else:
                         import sync
                         import importlib

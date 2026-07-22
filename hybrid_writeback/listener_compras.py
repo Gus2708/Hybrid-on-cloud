@@ -106,7 +106,7 @@ def get_compras_pendientes():
         path = (f"{TABLE_CAB}?backend_status=eq.pendiente"
                 f"&status=eq.emitido"
                 f"&creado_por=not.is.null"
-                f"&select=id,proveedor_codigo,proveedor_nombre,nota,backend_intentos"
+                f"&select=id,proveedor_codigo,proveedor_nombre,nota,backend_intentos,numero_documento"
                 f"&order=id.asc&limit=10")
         return lb.rest("GET", path) or []
     except urllib.error.HTTPError as e:
@@ -231,9 +231,20 @@ def procesar_compra(compra):
         log.info("Compra %s sin items -> 'completado' sin tocar HybridLite.", cid)
         return
 
-    doc_numero = str(cid)  # número de relleno para Total Operación (el usuario dijo que da igual)
-    log.info("Procesando compra %s: proveedor=%s (%s) %s item(s), doc_numero=%s",
-             cid, proveedor_codigo, proveedor_nombre, len(items), doc_numero)
+    # Número de orden/factura: si el usuario lo escribió en la app (columna
+    # numero_documento), se usa ese en los dos campos de Total Operación. Si
+    # lo dejó en blanco -- o solo tiene caracteres no numéricos, ya que
+    # _totalizar_compra exige al menos un dígito -- se cae al id de la compra
+    # (relleno, comportamiento previo).
+    numero_doc_app = compra.get("numero_documento")
+    if numero_doc_app and any(ch.isdigit() for ch in str(numero_doc_app)):
+        doc_numero = str(numero_doc_app)
+        origen_doc_numero = "numero_documento de la app"
+    else:
+        doc_numero = str(cid)
+        origen_doc_numero = "id de la compra (numero_documento vacío)"
+    log.info("Procesando compra %s: proveedor=%s (%s) %s item(s), doc_numero=%s (%s)",
+             cid, proveedor_codigo, proveedor_nombre, len(items), doc_numero, origen_doc_numero)
     try:
         res = flujo_compra_real.registrar_compra(
             proveedor_codigo, items, doc_numero,
@@ -289,4 +300,5 @@ def procesar_pendientes(compras):
 
 if __name__ == "__main__":
     lb.correr_loop(log, __file__, "listener_compras", get_compras_pendientes, procesar_pendientes,
-                    recuperar_huerfanos, once=("--once" in sys.argv), sujeto="compras")
+                    recuperar_huerfanos, once=("--once" in sys.argv), sujeto="compras",
+                    ceder_si=lb.hay_pendientes_prioritarios)

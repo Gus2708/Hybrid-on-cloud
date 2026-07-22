@@ -1,15 +1,17 @@
 """
 listener_writeback.py — Canal App (El Serrucho Go) -> Local (write-back de
-stock, precio y costo).
+stock, precio, costo y ficha (descripción/referencia)).
 
 Sondea `ordenes_cambio_items` (tabla que la app YA llena al emitir una Orden de
 Cambio, ver el-serrucho-go/src/hooks/useOrdenCambio.ts) y, por cada item de una
-orden con status='emitido' que todavía no fue aplicado, ajusta stock y/o
-precio/costo en HybridLite vía flujo_stock_real.py y flujo_precio_real.py
-(input real de hardware). El `delta` de stock ya viene calculado por la app
-(nueva_existencia - existencia_actual); el `costo` viene como snapshot en
-TODOS los items (haya cambiado o no) y se compara contra HybridLite antes de
-decidir si hay que escribirlo. Marca el resultado en columnas `backend_*`
+orden con status='emitido' que todavía no fue aplicado, ajusta stock, precio/
+costo y/o descripción/referencia en HybridLite vía flujo_stock_real.py,
+flujo_precio_real.py y flujo_ficha_real.py (input real de hardware). El
+`delta` de stock ya viene calculado por la app (nueva_existencia -
+existencia_actual); el `costo` viene como snapshot en TODOS los items (haya
+cambiado o no) y se compara contra HybridLite antes de decidir si hay que
+escribirlo; `nueva_descripcion`/`nueva_referencia` solo vienen cuando el
+usuario pidió ese cambio. Marca el resultado en columnas `backend_*`
 (migración 018 en el-serrucho-go; vocabulario de estados `pendiente /
 aplicando / error / completado`, backfill en migración 019).
 
@@ -23,8 +25,8 @@ no es un error, es RLS filtrando en silencio.
 
 ORQUESTACIÓN por pasada (procesar_pendientes): los pendientes se agrupan por
 orden_id (preservando el orden por id asc de get_pendientes) y se procesan en
-DOS FASES GLOBALES (pedido del dueño: primero TODAS las cantidades, después
-TODOS los precios):
+TRES FASES GLOBALES (pedido del dueño: primero TODAS las cantidades, después
+TODOS los precios, y por último TODOS los cambios de ficha):
   1. FASE STOCK GLOBAL. Para cada orden con items de stock, un documento de
      ajuste: 2+ items -> flujo_stock_real.ajustar_stock_lote (abre la ventana
      una vez, totaliza una vez; lotes largos se trocean en documentos de
@@ -38,12 +40,17 @@ TODOS los precios):
      próxima corrida; precio y costo son valores absolutos e idempotentes,
      así que repetir la parte de stock ya aplicada junto con precio/costo no
      hace daño).
+  3. FASE FICHA GLOBAL (descripción/referencia) al final, item por item, vía
+     flujo_ficha_real.set_ficha (Modificar + buscar + cargar, reutilizando la
+     misma Ficha que la fase 2). Descripción/referencia son valores absolutos
+     e idempotentes, así que no hay chequeo de "¿falló una fase anterior?":
+     se procesan siempre que el item tenga metadata pendiente.
 El banner de seguridad muestra el avance en vivo (orden/fase/ítem actual).
 El estado final de cada item es la fusión de las partes que efectivamente se
-ejecutaron (stock y/o precio/costo): 'completado' solo si todas cerraron en
-etapa "commit"; '[PREVIEW] ...' si todas fueron ok pero sin commit real;
-si alguna parte falló, se aplica la política de reintentos de siempre sobre
-ESA parte (ver SEGURIDAD más abajo).
+ejecutaron (Stock y/o Precio/Costo y/o Ficha): 'completado' solo si todas
+cerraron en etapa "commit"; '[PREVIEW] ...' si todas fueron ok pero sin commit
+real; si alguna parte falló, se aplica la política de reintentos de siempre
+sobre ESA parte (ver SEGURIDAD más abajo).
 
 SEGURIDAD:
   * Mientras HYBRID_WRITE_ENABLED no sea "1", cada item se procesa en modo
@@ -100,6 +107,7 @@ import listener_base as lb
 
 import flujo_stock_real
 import flujo_precio_real
+import flujo_ficha_real
 
 try:
     from safety_control import control_seguro
@@ -139,6 +147,7 @@ def get_pendientes():
                 f"&select=id,orden_id,codigo_producto,descripcion,delta,"
                 f"existencia_actual,nueva_existencia,backend_intentos,"
                 f"precio_actual,nuevo_precio,costo,"
+                f"nueva_descripcion,nueva_referencia,"
                 f"ordenes_cambio!inner(status,creado_por)"
                 f"&ordenes_cambio.status=eq.emitido"
                 f"&ordenes_cambio.creado_por=not.is.null"
@@ -235,6 +244,15 @@ def _tiene_costo_cambio(item, cache_costo_db):
             _AVISO_SIN_COSTO_DB = True
         return False
     return abs(float(costo) - float(db_costo)) > 0.01
+
+
+def _tiene_metadata_cambio(item):
+    """Descripción/referencia son valores ABSOLUTOS que la app manda solo
+    cuando el usuario pidió cambiarlos (a diferencia de `costo`, que viaja
+    siempre como snapshot): basta con que vengan no vacíos."""
+    nd = item.get("nueva_descripcion")
+    nr = item.get("nueva_referencia")
+    return (nd is not None and str(nd).strip() != "") or (nr is not None and str(nr).strip() != "")
 
 
 # ─── Política de reintentos / traducción resultado -> estado ──────────────────
@@ -377,6 +395,38 @@ def _fase_precio_costo_item(item, ya_estaba_aplicando):
         return {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
 
 
+# ─── Fase FICHA (descripción/referencia) de un item ────────────────────────────
+def _fase_metadata_item(item, ya_estaba_aplicando):
+    """Aplica la parte de descripción/referencia de UN item. `ya_estaba_aplicando`
+    indica si el item ya venía marcado 'aplicando' por una fase anterior (stock
+    o precio/costo) esta misma pasada, para no reescribir backend_intentos ni
+    volver a tomar el lock optimista dos veces."""
+    iid = item["id"]
+    codigo = item.get("codigo_producto")
+    nd = item.get("nueva_descripcion")
+    nr = item.get("nueva_referencia")
+    nd = str(nd).strip() if nd is not None and str(nd).strip() != "" else None
+    nr = str(nr).strip() if nr is not None and str(nr).strip() != "" else None
+
+    if not ya_estaba_aplicando:
+        intentos = (item.get("backend_intentos") or 0) + 1
+        if not update_item(iid, backend_status="aplicando", backend_intentos=intentos):
+            return dict(_LOCK_FALLIDO)
+
+    log.info("Fase Ficha (descripcion/referencia): item %s codigo=%s nueva_descripcion=%s "
+              "nueva_referencia=%s", iid, codigo, nd, nr)
+    try:
+        return flujo_ficha_real.set_ficha(
+            codigo, nueva_descripcion=nd, nueva_referencia=nr,
+            commit=lb.check_hybrid_write_enabled(),
+        )
+    except Exception as e:
+        # etapa reintentable: descripción/referencia son valores absolutos e
+        # idempotentes (ver docstring de flujo_ficha_real), así que incluso
+        # una excepción inesperada acá es segura de reintentar.
+        return {"ok": False, "etapa": "aceptar", "detalle": f"excepción: {e!r}"}
+
+
 # ─── Orquestación de una pasada completa ───────────────────────────────────────
 def procesar_pendientes(items):
     """Agrupa `items` (ya ordenados por id asc, ver get_pendientes) por orden,
@@ -408,12 +458,13 @@ def _texto_item(item):
 
 
 def _procesar_pendientes_impl(items, banner=None):
-    """Dos FASES GLOBALES sobre todas las órdenes de la pasada (pedido del
+    """TRES FASES GLOBALES sobre todas las órdenes de la pasada (pedido del
     dueño): primero TODAS las cantidades (un documento de ajuste por orden),
-    después TODOS los precios/costos. Además de respetar el orden natural del
-    trabajo, evita intercalar ventanas: la Ficha de precios se reutiliza entre
-    todos los items de la fase 2 sin que un ajuste de stock intermedio obligue
-    a cerrarla y reabrirla."""
+    después TODOS los precios/costos, y por último TODOS los cambios de
+    descripción/referencia. Además de respetar el orden natural del trabajo,
+    evita intercalar ventanas: la Ficha se reutiliza entre todos los items de
+    las fases 2 y 3 sin que un ajuste de stock intermedio obligue a cerrarla y
+    reabrirla."""
 
     def _avisar(texto):
         # actualiza la línea principal del banner de seguridad (si existe)
@@ -450,6 +501,7 @@ def _procesar_pendientes_impl(items, banner=None):
     partes_por_item = {}
     stock_por_orden = []        # [(orden_id, [items_con_stock])] en orden de llegada
     precio_costo_global = []    # items con cambio de precio/costo, todas las órdenes
+    metadata_global = []        # items con cambio de descripción/referencia, todas las órdenes
 
     # ── Clasificación global + completar los items sin cambios ────────────────
     for orden_id, items_orden in ordenes.items():
@@ -460,9 +512,12 @@ def _procesar_pendientes_impl(items, banner=None):
             item["_tiene_stock_cambio"] = _tiene_stock_cambio(item)
             item["_tiene_precio_cambio"] = _tiene_precio_cambio(item)
             item["_tiene_costo_cambio"] = _tiene_costo_cambio(item, cache_costo_db)
-            if not item["_tiene_stock_cambio"] and not item["_tiene_precio_cambio"] and not item["_tiene_costo_cambio"]:
+            item["_tiene_metadata_cambio"] = _tiene_metadata_cambio(item)
+            if (not item["_tiene_stock_cambio"] and not item["_tiene_precio_cambio"]
+                    and not item["_tiene_costo_cambio"] and not item["_tiene_metadata_cambio"]):
                 update_item(item["id"], backend_status="completado",
-                            backend_resultado="Sin cambios de stock, precio ni costo a realizar.",
+                            backend_resultado="Sin cambios de stock, precio, costo ni "
+                                               "descripción/referencia a realizar.",
                             backend_aplicado_en=datetime.datetime.now(datetime.timezone.utc).isoformat())
                 log.info("Item %s sin cambios reales -> 'completado' sin tocar HybridLite.", item["id"])
                 hecho_por_id[item["id"]] = True
@@ -472,6 +527,8 @@ def _procesar_pendientes_impl(items, banner=None):
                 items_con_stock.append(item)
             if item["_tiene_precio_cambio"] or item["_tiene_costo_cambio"]:
                 precio_costo_global.append(item)
+            if item["_tiene_metadata_cambio"]:
+                metadata_global.append(item)
         if items_con_stock:
             stock_por_orden.append((orden_id, items_con_stock))
 
@@ -507,6 +564,22 @@ def _procesar_pendientes_impl(items, banner=None):
             res_pc = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
         partes_por_item.setdefault(iid, []).append({"nombre": "Precio/Costo", "res": res_pc})
 
+    # ── FASE 3 GLOBAL: descripción/referencia (Ficha), item por item ──────────
+    # `aplicando_ids` acumula todo item ya marcado 'aplicando' en las fases 1 y
+    # 2 de ESTA pasada, para que _fase_metadata_item no vuelva a tomar el lock
+    # optimista ni a pisar backend_intentos por segunda/tercera vez.
+    aplicando_ids = set(resultados_stock.keys()) | {item["id"] for item in precio_costo_global}
+    total_meta = len(metadata_global)
+    for n, item in enumerate(metadata_global, start=1):
+        iid = item["id"]
+        ya_estaba_aplicando = iid in aplicando_ids
+        _avisar(f"EDITANDO DATOS {n}/{total_meta} — {item.get('codigo_producto')}")
+        try:
+            res_meta = _fase_metadata_item(item, ya_estaba_aplicando)
+        except Exception as e:
+            res_meta = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
+        partes_por_item.setdefault(iid, []).append({"nombre": "Ficha", "res": res_meta})
+
     # ── Estados finales por item ───────────────────────────────────────────────
     _avisar("GUARDANDO RESULTADOS…")
     for iid, partes in partes_por_item.items():
@@ -539,4 +612,5 @@ def _procesar_pendientes_impl(items, banner=None):
 
 if __name__ == "__main__":
     lb.correr_loop(log, __file__, "listener_writeback", get_pendientes, procesar_pendientes,
-                    recuperar_huerfanos, once=("--once" in sys.argv), sujeto="items")
+                    recuperar_huerfanos, once=("--once" in sys.argv), sujeto="items",
+                    ceder_si=lb.hay_pendientes_prioritarios)

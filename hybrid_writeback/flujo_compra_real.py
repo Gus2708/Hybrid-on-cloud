@@ -270,18 +270,18 @@ def _escribir_campo_ficha(campo, valor, lento=False):
     verifique."""
     r = campo.rectangle()
     ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-    time.sleep(0.2)
+    time.sleep(0.1)
     try:
         campo.set_focus()
     except Exception:
         pass
-    time.sleep(0.15)
+    time.sleep(0.08)
     ri.clear_hard()
     if lento:
         ri.type_code(valor)
     else:
         ri.type_text(valor)
-    time.sleep(0.3)
+    time.sleep(0.15)
     return (campo.window_text() or "").strip()
 
 
@@ -417,7 +417,7 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False)
     fpr._focus(hf)
     L, T, _, _ = win32gui.GetWindowRect(hf)
     ri.click(L + INCLUIR_REL[0], T + INCLUIR_REL[1])
-    time.sleep(1.0)
+    time.sleep(0.5)
 
     # localizar y llenar los 3 campos del header en modo alta
     campos = _campos_ficha(fp._find_hwnd(fp.FICHA_CLASS))
@@ -483,7 +483,7 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False)
         fpr._click_boton_dialogo("Salir")
 
     fpr._guardar_ficha()
-    time.sleep(1.5)
+    time.sleep(0.8)
 
     try:
         existencia_db, _ = dbex.existencia(codigo)
@@ -550,7 +550,7 @@ def abrir_compras():
     while time.time() - t0 < 15:
         ha = fp._find_hwnd(COMPRAS_CLASS)
         if ha:
-            time.sleep(1.0)
+            time.sleep(0.5)
             return ha
         time.sleep(0.3)
     raise CompraError("No abrió la ventana de Compras (TFormHTransaccion_Compras).")
@@ -591,7 +591,7 @@ def fijar_clasificacion(com):
     _focus(hbusq)
     time.sleep(0.3)
     ri.press("ENTER")            # selecciona la fila ya posicionada por el "5"
-    time.sleep(0.8)
+    time.sleep(0.4)
 
     if fp._find_hwnd(fp.BUSQ_CLASS) is not None:
         # fallback: doble-clic en la primera fila del grid (patrón cargar_producto)
@@ -600,7 +600,7 @@ def fijar_clasificacion(com):
             grid = busq.child_window(class_name="TDBGrid")
             gr = grid.rectangle()
             ri.click(gr.left + 60, gr.top + 34, double=True)
-            time.sleep(1.0)
+            time.sleep(0.5)
         except Exception:
             pass
 
@@ -641,16 +641,16 @@ def seleccionar_proveedor(com, proveedor_codigo, proveedor_nombre=None):
 
     hbusq = fp._wait_for(fp.BUSQ_CLASS, desc="Busqueda De Proveedores")
     busq = fp._win(hbusq)
-    time.sleep(0.5)
+    time.sleep(0.25)
     _focus(hbusq)
 
     ed = busq.child_window(class_name="THybridEdit", found_index=0)
     r = ed.rectangle()
     ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-    time.sleep(0.3)
+    time.sleep(0.15)
     ri.clear_field()
     ri.type_text(proveedor_codigo)
-    time.sleep(0.4)
+    time.sleep(0.2)
     ri.press("ENTER")                                    # ejecuta la búsqueda
 
     posicionado = fpr._esperar_refresco(busq, proveedor_codigo, timeout=6.0)
@@ -659,14 +659,14 @@ def seleccionar_proveedor(com, proveedor_codigo, proveedor_nombre=None):
     if fp._find_hwnd(fp.BUSQ_CLASS):
         _focus(hbusq)
         ri.press("ENTER")                                # selecciona la fila posicionada
-        time.sleep(1.2)
+        time.sleep(0.5)
 
     if fp._find_hwnd(fp.BUSQ_CLASS):
         # fallback: doble-clic en la fila posicionada (arriba del grid)
         grid = busq.child_window(class_name="TDBGrid")
         gr = grid.rectangle()
         ri.click(gr.left + 100, gr.top + 26, double=True)
-        time.sleep(1.2)
+        time.sleep(0.5)
 
     if fp._find_hwnd("TMessageForm"):
         raise CompraError(f"Apareció un diálogo de error buscando el proveedor {proveedor_codigo}.")
@@ -718,21 +718,21 @@ def cargar_item(codigo, cantidad, costo, precio, commit, es_primero=False):
         _focus(hcom)
 
     ri.type_code(codigo)
-    time.sleep(0.3)
-    ri.press("ENTER")
-    time.sleep(1.2)
-
-    ri.type_number(f"{float(cantidad):g}")
-    time.sleep(0.2)
+    time.sleep(0.15)
     ri.press("ENTER")
     time.sleep(0.6)
+
+    ri.type_number(f"{float(cantidad):g}")
+    time.sleep(0.15)
+    ri.press("ENTER")
+    time.sleep(0.3)
 
     ri.type_number(f"{float(costo):.2f}")
-    time.sleep(0.15)
+    time.sleep(0.08)
     ri.press_shift("4")            # '$' (layout latam) que cierra la columna de costo
-    time.sleep(0.15)
+    time.sleep(0.08)
     ri.press("ENTER")
-    time.sleep(0.6)
+    time.sleep(0.3)
 
     # Tras confirmar el costo, HybridLite hace UNA de dos cosas (bifurcación,
     # confirmada por el dueño 2026-07-12):
@@ -901,19 +901,19 @@ def _totalizar_compra(hcom, doc_numero):
     except Exception:
         L, T, _, _ = win32gui.GetWindowRect(htot)
         ri.click(L + TOTAL_OPERAR_REL[0], T + TOTAL_OPERAR_REL[1])
-    time.sleep(1.0)
+    time.sleep(0.5)
 
     # cerrar el comprobante (Vista Previa), patrón probado de _totalizar_y_guardar
     t0 = time.time()
     while time.time() - t0 < 10:
         h = fp._find_hwnd(PREVIEW_CLASS)
         if h:
-            time.sleep(0.5)
+            time.sleep(0.25)
             try:
                 win32gui.SetForegroundWindow(h)
                 time.sleep(0.3)
                 ri.press("ESC")
-                time.sleep(0.5)
+                time.sleep(0.25)
                 if fp._find_hwnd(PREVIEW_CLASS):
                     win32gui.PostMessage(h, win32con.WM_SYSCOMMAND, win32con.SC_CLOSE, 0)
                     time.sleep(0.5)
@@ -922,7 +922,7 @@ def _totalizar_compra(hcom, doc_numero):
                 log.info("Comprobante (Vista Previa) de la compra cerrado.")
             except Exception:
                 pass
-            time.sleep(0.8)
+            time.sleep(0.4)
             break
         time.sleep(0.3)
     for _ in range(3):
@@ -1100,7 +1100,7 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
                 "resultados": altas_resultado}
 
     _salir_compras()
-    time.sleep(1.5)
+    time.sleep(0.8)
 
     # verificación DB por ítem
     resultados = {}

@@ -195,7 +195,7 @@ def abrir_pedidos():
     while time.time() - t0 < 15:
         ha = fp._find_hwnd(PEDIDOS_CLASS)
         if ha:
-            time.sleep(1.0)
+            time.sleep(0.5)
             return ha
         time.sleep(0.3)
     raise PedidoError("No abrió la ventana de Pedidos (TFormHTransaccion_Pedidos).")
@@ -220,16 +220,16 @@ def seleccionar_cliente(ped, cliente_codigo, cliente_nombre=None):
 
     hbusq = fp._wait_for(fp.BUSQ_CLASS, desc="Busqueda De Clientes")
     busq = fp._win(hbusq)
-    time.sleep(0.5)
+    time.sleep(0.25)
     _focus(hbusq)
 
     ed = busq.child_window(class_name="THybridEdit", found_index=0)
     r = ed.rectangle()
     ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-    time.sleep(0.3)
+    time.sleep(0.15)
     ri.clear_field()
     ri.type_text(str(cliente_codigo))
-    time.sleep(0.4)
+    time.sleep(0.2)
     ri.press("ENTER")                                    # ejecuta la búsqueda
 
     posicionado = fpr._esperar_refresco(busq, str(cliente_codigo), timeout=6.0)
@@ -238,7 +238,7 @@ def seleccionar_cliente(ped, cliente_codigo, cliente_nombre=None):
     if fp._find_hwnd(fp.BUSQ_CLASS):
         _focus(hbusq)
         ri.press("ENTER")                                # selecciona la fila posicionada
-        time.sleep(1.2)
+        time.sleep(0.5)
 
     if fp._find_hwnd(fp.BUSQ_CLASS):
         # fallback: doble-clic en la fila posicionada (patrón grabado)
@@ -246,7 +246,7 @@ def seleccionar_cliente(ped, cliente_codigo, cliente_nombre=None):
             grid = busq.child_window(class_name="TDBGrid")
             gr = grid.rectangle()
             ri.click(gr.left + 100, gr.top + 26, double=True)
-            time.sleep(1.2)
+            time.sleep(0.5)
         except Exception:
             pass
 
@@ -291,7 +291,7 @@ def cargar_item(codigo, cantidad, es_primero=False):
         except Exception:
             L, T, _, _ = win32gui.GetWindowRect(hped)
             ri.click(L + ITEM_GRID_REL[0], T + ITEM_GRID_REL[1])
-        time.sleep(0.4)
+        time.sleep(0.2)
 
     # drenar cualquier alerta previa colgada antes de teclear este código
     if fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm"):
@@ -299,20 +299,20 @@ def cargar_item(codigo, cantidad, es_primero=False):
         _focus(hped)
 
     ri.type_code(str(codigo))
-    time.sleep(0.3)
+    time.sleep(0.15)
     ri.press("ENTER")                    # carga el producto; el cursor salta a Cantidad
-    time.sleep(1.0)
+    time.sleep(0.5)
 
     # un diálogo de error acá = código inexistente / producto no válido
     if fp._find_hwnd("TMessageForm"):
         raise PedidoError(f"Error al cargar el ítem {codigo} (¿código inexistente?).")
 
     ri.type_number(f"{float(cantidad):g}")
-    time.sleep(0.2)
+    time.sleep(0.1)
     ri.press("ENTER")                    # confirma la cantidad
-    time.sleep(0.4)
+    time.sleep(0.2)
     ri.press("ENTER")                    # postea la fila / baja a la siguiente  # CALIBRAR
-    time.sleep(0.6)
+    time.sleep(0.3)
 
     # drenar una alerta tardía (p.ej. 'llegó al mínimo') para que no se cuele al siguiente
     _confirmar_lo_que_pregunte(timeout=1.0)
@@ -420,7 +420,7 @@ def _totalizar_pedido(hped):
     except Exception:
         L, T, _, _ = win32gui.GetWindowRect(htot)
         ri.click(L + TOTAL_OPERAR_REL[0], T + TOTAL_OPERAR_REL[1])
-    time.sleep(1.2)
+    time.sleep(0.5)
 
     # esta PC no tiene impresora fiscal -> no debería abrir Vista Previa; por si
     # acaso, se cierra igual que en compras.
@@ -580,7 +580,7 @@ def registrar_pedido(cliente_codigo, items, commit=False, cliente_nombre=None):
                 "detalle": f"No pude confirmar la totalización del pedido: {e}"}
 
     _salir_pedidos()
-    time.sleep(1.5)
+    time.sleep(0.8)
 
     try:
         ok_db, detalle_db, documento = _verificar_pedido_db(cliente_codigo, items, cliente_nombre)

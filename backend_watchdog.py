@@ -198,6 +198,18 @@ SCRIPTS = [
         # registrarse pronto para que caja lo facture, no en una ventana horaria.
         "env": {"HYBRID_WRITE_ENABLED": "1"},
     }),
+    ("listener_directorio.py", "Write-back directorio", {
+        "subdir": "hybrid_writeback",
+        # Da de alta clientes/proveedores nuevos (registro_clientes_app /
+        # registro_proveedores_app) en HybridLite. CUARTO listener de mouse real;
+        # se serializa con los otros vía el mutex de safety_control.control_seguro.
+        # ACTIVADO 24/7 (validado end-to-end con --commit el 2026-07-22: fichas
+        # PRUEBA CLAUDE C2/P2 guardadas y verificadas en la DBISAM). Sin
+        # HYBRID_WRITE_WINDOW: un registro debe estar disponible pronto para
+        # facturar/comprar. HYBRID_WRITE_ENABLED=1 sólo para este proceso
+        # (correr el flujo a mano sigue siendo preview seguro por defecto).
+        "env": {"HYBRID_WRITE_ENABLED": "1"},
+    }),
 ]
 
 # ─── Detección de procesos colgados (vivos pero congelados) ──────────────────

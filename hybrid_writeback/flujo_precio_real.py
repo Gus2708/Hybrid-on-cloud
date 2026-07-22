@@ -166,9 +166,9 @@ def _esperar_refresco(busq, codigo, timeout=6.0):
             leible = True
             if prim.strip() == codigo.strip():
                 return True
-        time.sleep(0.3)
+        time.sleep(0.15)
     if not leible:
-        time.sleep(2.5)   # no pude leer la grilla: espera fija generosa
+        time.sleep(1.0)   # no pude leer la grilla: espera fija generosa
     return False
 
 
@@ -214,16 +214,16 @@ def cargar_producto(codigo):
     ri.click(L + MODIFICAR_REL[0], T + MODIFICAR_REL[1])          # Modificar
     hbusq = fp._wait_for(fp.BUSQ_CLASS, desc="Busqueda")
     busq = fp._win(hbusq)
-    time.sleep(0.5)
+    time.sleep(0.3)
 
     _focus(hbusq)
     ed = busq.child_window(class_name="THybridEdit", found_index=0)
     r = ed.rectangle()
     ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)    # Ed_Buscar
-    time.sleep(0.3)
+    time.sleep(0.15)
     ri.clear_field()
     ri.type_text(codigo)
-    time.sleep(0.4)
+    time.sleep(0.2)
     ri.press("ENTER")                                            # ejecuta la búsqueda
 
     # ESPERAR a que la lista se posicione en el código (el usuario avisó de esto)
@@ -234,14 +234,14 @@ def cargar_producto(codigo):
     if fp._find_hwnd(fp.BUSQ_CLASS):
         _focus(hbusq)
         ri.press("ENTER")
-        time.sleep(1.2)
+        time.sleep(0.6)
 
     # Fallback: si sigue abierta, doble-clic en la fila posicionada (arriba del grid)
     if fp._find_hwnd(fp.BUSQ_CLASS):
         grid = busq.child_window(class_name="TDBGrid")
         gr = grid.rectangle()
         ri.click(gr.left + 100, gr.top + 26, double=True)
-        time.sleep(1.2)
+        time.sleep(0.6)
 
     if fp._find_hwnd("TMessageForm"):
         _cerrar_residuales()
@@ -321,19 +321,19 @@ def escribir_precio(target, iva):
     r = con_field.rectangle()
     cx = (r.left + r.right) // 2
     ri.click(cx, r.bottom - 4)
-    time.sleep(0.2)
+    time.sleep(0.1)
     try:
         con_field.set_focus()
     except Exception:
         pass
-    time.sleep(0.2)
+    time.sleep(0.1)
 
     ri.clear_hard()                       # borra el valor anterior de verdad
     if (con_field.window_text() or "").strip() not in ("", "0", "0.00", "0,00"):
         # segundo intento de borrado si quedó algo
         ri.clear_hard()
     ri.type_number(f"{target:.2f}")       # teclea por el numérico (respeta el decimal)
-    time.sleep(0.2)
+    time.sleep(0.1)
     ri.press("ENTER")                     # commit + recalcula el sin-impuesto y el Bs
     time.sleep(0.6)
 
@@ -407,17 +407,17 @@ def escribir_costo(nuevo_costo, costo_actual_db):
     # mismo patrón probado de escribir_precio: clic bajo + set_focus + borrado duro
     r = campo.rectangle()
     ri.click((r.left + r.right) // 2, r.bottom - 4)
-    time.sleep(0.2)
+    time.sleep(0.1)
     try:
         campo.set_focus()
     except Exception:
         pass
-    time.sleep(0.2)
+    time.sleep(0.1)
     ri.clear_hard()
     if (campo.window_text() or "").strip() not in ("", "0", "0.00", "0,00"):
         ri.clear_hard()
     ri.type_number(f"{float(nuevo_costo):.2f}")
-    time.sleep(0.2)
+    time.sleep(0.1)
     ri.press("ENTER")
     time.sleep(0.6)
 

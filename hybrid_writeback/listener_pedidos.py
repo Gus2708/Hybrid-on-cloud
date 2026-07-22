@@ -245,4 +245,5 @@ def procesar_pendientes(pedidos):
 
 if __name__ == "__main__":
     lb.correr_loop(log, __file__, "listener_pedidos", get_pedidos_pendientes, procesar_pendientes,
-                   recuperar_huerfanos, once=("--once" in sys.argv), sujeto="pedidos")
+                   recuperar_huerfanos, once=("--once" in sys.argv), sujeto="pedidos",
+                   ceder_si=lb.hay_pendientes_prioritarios)

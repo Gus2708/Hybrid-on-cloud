@@ -80,6 +80,7 @@ RUTA_EXISTENCIA = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TExistenciaInv.Da
 RUTA_VENTAS_CABECERA = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TTransaccionvta.dat'
 RUTA_VENTAS_DETALLE  = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TDetalleVta.dat'
 RUTA_CLIENTES        = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TClientes.dat'
+RUTA_PROVEEDORES     = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TProveedores.Dat'
 
 # ─── Listener de Zelle (zelle_listener.py — correo Outlook via Microsoft Graph) ──
 # El puerto IMAP (993) esta bloqueado por el ISP de la tienda (confirmado con pruebas

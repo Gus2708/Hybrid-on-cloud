@@ -101,7 +101,7 @@ def _cerrar_ficha_si_abierta():
         b = fi.child_window(title="&Salir", class_name="TFlatButton")
         r = b.rectangle()
         ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-        time.sleep(0.8)
+        time.sleep(0.4)
     except Exception:
         pass
     import win32con
@@ -135,7 +135,7 @@ def abrir_ajustes():
         rel = puntos["menu_inventario"]["rel"]
         L, T, _, _ = win32gui.GetWindowRect(hmain)
         ri.click(L + rel[0], T + rel[1])
-        time.sleep(0.8)
+        time.sleep(0.4)
         b = main.child_window(title="Ajustes de inventario", class_name="TAdvGlassButton")
         b.wait("exists visible", timeout=6)
     r = b.rectangle()
@@ -144,7 +144,7 @@ def abrir_ajustes():
     while time.time() - t0 < 15:
         ha = fp._find_hwnd(AJU_CLASS)
         if ha:
-            time.sleep(1.0)
+            time.sleep(0.5)
             return ha
         time.sleep(0.3)
     raise StockError("No abrió la ventana de Ajustes de inventario.")
@@ -181,7 +181,7 @@ def _celdas(aj, grid, fila=0):
         if edits or nums:
             break
         if intento < 2:
-            time.sleep(0.4)
+            time.sleep(0.2)
     edits.sort(key=lambda c: c.rectangle().left)
     nums.sort(key=lambda c: c.rectangle().left)
 
@@ -218,7 +218,7 @@ def _borrar_items(aj):
     """Vacía la grilla (botón 'Borrar items'), confirmando si preguntara."""
     try:
         aj.child_window(title="&Borrar items", class_name="TFlatButton").click_input()
-        time.sleep(0.8)
+        time.sleep(0.4)
     except Exception:
         return
     for _ in range(2):
@@ -268,11 +268,11 @@ def cargar_y_fijar_fila(aj, grid, codigo, target, fila):
         gr = grid.rectangle()
         _focus(fp._find_hwnd(AJU_CLASS))
         ri.click(gr.left + 196, gr.top + 40)   # celda Código, fila 0 (la única que se clica)
-        time.sleep(0.3)
+        time.sleep(0.15)
     ri.type_code(codigo)                       # LENTO (evita truncado/búsqueda)
-    time.sleep(0.4)
+    time.sleep(0.2)
     ri.press("ENTER")                          # carga el producto y salta a Conteo
-    time.sleep(1.2)
+    time.sleep(0.6)
 
     # verificar que cargó el producto correcto ANTES de tocar la cantidad
     datos = None
@@ -280,7 +280,7 @@ def cargar_y_fijar_fila(aj, grid, codigo, target, fila):
         datos = _leer(aj, grid, fila)
         if datos["codigo"].lower() == codigo.strip().lower():
             break
-        time.sleep(0.4)
+        time.sleep(0.2)
     if not datos or datos["codigo"].lower() != codigo.strip().lower():
         raise StockError(f"La grilla NO cargó {codigo} en la fila {fila} "
                          f"(código en grilla={datos['codigo'] if datos else None!r}). "
@@ -291,7 +291,7 @@ def cargar_y_fijar_fila(aj, grid, codigo, target, fila):
 
     # el cursor ya está en Conteo: teclear el objetivo DIRECTO (reemplaza el auto-relleno)
     ri.type_number(f"{target:g}")
-    time.sleep(0.3)
+    time.sleep(0.15)
 
     # VERIFICAR ANTES de postear (la fila aún es editable y sus celdas son legibles).
     # Tras el 2º ENTER la fila se 'postea' y queda estática -> ya no se puede leer.
@@ -309,9 +309,9 @@ def cargar_y_fijar_fila(aj, grid, codigo, target, fila):
 
     # postear la fila: ENTER (confirma conteo) + ENTER (postea -> lista para la siguiente)
     ri.press("ENTER")
-    time.sleep(0.5)
+    time.sleep(0.25)
     ri.press("ENTER")
-    time.sleep(0.6)
+    time.sleep(0.3)
     datos["existencia"] = existencia_ui
     log.info("Fila %s: %s existencia=%s target=%s", fila, codigo, existencia_ui, target)
     return datos
@@ -322,7 +322,7 @@ def _cancelar(aj):
     for titulo in ("C&ancelar", "Cancelar"):
         try:
             aj.child_window(title=titulo, class_name="TFlatButton").click_input()
-            time.sleep(0.8)
+            time.sleep(0.4)
             break
         except Exception:
             continue
@@ -424,7 +424,7 @@ def _salir_ajustes(aj):
             b = aj.child_window(title=titulo, class_name="TFlatButton")
             r = b.rectangle()
             ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-            time.sleep(0.8)
+            time.sleep(0.4)
             break
         except Exception:
             continue

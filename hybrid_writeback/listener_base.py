@@ -156,12 +156,43 @@ def rest(method, path, body=None, extra_headers=None):
         return json.loads(raw) if raw else None
 
 
-POLL_INTERVAL = 8          # segundos entre sondeos
+# ─── Prioridad: altas de directorio (cliente/proveedor) primero que todo ──────
+DIRECTORIO_TABLAS = ("registro_clientes_app", "registro_proveedores_app")
+
+
+def hay_pendientes_prioritarios():
+    """True si hay altas de cliente/proveedor 'pendiente' esperando aplicarse.
+
+    Los otros listeners (compras / pedidos / ajustes) CEDEN el paso mientras esto
+    sea True: un cliente/proveedor nuevo debe existir en HybridLite ANTES de la
+    compra/pedido/ajuste que lo referencia. listener_directorio NO llama a esto
+    (es el prioritario y no cede ante nadie).
+
+    FAIL-OPEN: ante cualquier error de red/consulta devuelve False (no bloquea a
+    los demás por una falla ajena). Un registro que falla llega a 'error' tras
+    MAX_INTENTOS, así que un pendiente NUNCA bloquea de forma permanente.
+    """
+    for tabla in DIRECTORIO_TABLAS:
+        try:
+            path = (f"{tabla}?backend_status=eq.pendiente"
+                    f"&status=eq.emitido&creado_por=not.is.null&select=id&limit=1")
+            if rest("GET", path):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+POLL_INTERVAL = 5          # segundos entre sondeos (reducido de 8 para detección más rápida)
 
 
 # ─── Bucle principal ────────────────────────────────────────────────────────
 def correr_loop(log, listener_file, nombre, get_pendientes, procesar_pendientes,
-                 recuperar_huerfanos, once=False, sujeto="pendientes"):
+                 recuperar_huerfanos, once=False, sujeto="pendientes", ceder_si=None):
+    """`ceder_si`: callable opcional; si devuelve True, este listener CEDE el paso esta
+    pasada (no procesa nada). Se usa para que compras/pedidos/ajustes esperen a que las
+    altas de cliente/proveedor pendientes se apliquen primero. Solo aplica en bucle
+    continuo (un --once manual no se bloquea)."""
     HYBRID_WRITE_ENABLED = check_hybrid_write_enabled()
     log.info("=== %s iniciado (HYBRID_WRITE_ENABLED=%s) ===", nombre, HYBRID_WRITE_ENABLED)
     # F11 — lección de un incidente real: un proceso viejo quedó corriendo en
@@ -219,6 +250,12 @@ def correr_loop(log, listener_file, nombre, get_pendientes, procesar_pendientes,
                 motivo_skip = ("fuera_de_ventana",
                                 f"Fuera de HYBRID_WRITE_WINDOW ({HYBRID_WRITE_WINDOW_RAW}) "
                                 f"-> no se procesan {sujeto} esta pasada.")
+            elif ceder_si is not None and not once and ceder_si():
+                # Prioridad: hay altas de cliente/proveedor pendientes -> este listener
+                # cede el paso hasta que se apliquen (se registran primero que todo).
+                motivo_skip = ("ceder_prioridad",
+                                "Hay altas de cliente/proveedor pendientes; cedo el paso "
+                                f"hasta aplicarlas (no se procesan {sujeto} esta pasada).")
 
             if motivo_skip is None:
                 if ultimo_motivo_skip is not None:

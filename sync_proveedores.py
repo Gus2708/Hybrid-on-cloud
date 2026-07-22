@@ -22,15 +22,16 @@ import urllib.error
 from datetime import datetime, timezone
 
 try:
-    from config import SUPABASE_REST_URL, SUPABASE_ANON_KEY
+    from config import SUPABASE_REST_URL, SUPABASE_ANON_KEY, RUTA_PROVEEDORES
 except ImportError:
     SUPABASE_REST_URL = ""
     SUPABASE_ANON_KEY = ""
+    RUTA_PROVEEDORES = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TProveedores.Dat'
 
 # ==========================================
 #         CONFIGURACIÓN
 # ==========================================
-RUTA_PROVEEDORES = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TProveedores.Dat'
+# (RUTA_PROVEEDORES ahora se importa de config)
 
 _MAX_RETRIES = 3
 _RETRY_DELAY = 2  # segundos

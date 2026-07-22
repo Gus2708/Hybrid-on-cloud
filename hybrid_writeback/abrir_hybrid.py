@@ -87,7 +87,7 @@ def _wait(cls, timeout=60):
         h = fp._find_hwnd(cls)
         if h:
             return h
-        time.sleep(0.5)
+        time.sleep(0.25)
     return None
 
 
@@ -114,12 +114,12 @@ def _llenar_campo_login(edit, valor):
     comparando contra el placeholder inicial, no contra el valor."""
     r = edit.rectangle()
     cx, cy = (r.left + r.right) // 2, (r.top + r.bottom) // 2
-    ri.click(cx, cy); time.sleep(0.15)
-    ri.click(cx, cy); time.sleep(0.15)
-    ri.click(cx, cy); time.sleep(0.3)      # triple-clic: activa y selecciona todo
-    ri.select_all_field(); time.sleep(0.12)
-    ri.clear_hard(24); time.sleep(0.12)
-    ri.type_text(valor, per_char=0.06); time.sleep(0.25)
+    ri.click(cx, cy); time.sleep(0.08)
+    ri.click(cx, cy); time.sleep(0.08)
+    ri.click(cx, cy); time.sleep(0.15)     # triple-clic: activa y selecciona todo
+    ri.select_all_field(); time.sleep(0.06)
+    ri.clear_hard(24); time.sleep(0.06)
+    ri.type_text(valor, per_char=0.04); time.sleep(0.12)
     return (edit.window_text() or "").strip()
 
 
@@ -175,7 +175,7 @@ def hacer_login(hlogin=None, timeout_main=60, antes_main=None):
                        "placeholder). NO envío para no fallar el login.")
 
     ri.press("ENTER")                 # envía el login
-    time.sleep(1.0)
+    time.sleep(0.5)
 
     # a veces sale un mensaje (clave incorrecta u otro) -> reportar
     hmsg = fp._find_hwnd("TMessageForm")

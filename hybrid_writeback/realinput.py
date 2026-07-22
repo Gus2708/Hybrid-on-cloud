@@ -70,11 +70,14 @@ def _key_input(vk=0, scan=0, flags=0):
                  u=_INPUTunion(ki=KEYBDINPUT(vk, scan, flags, 0, 0)))
 
 
-def press_vk(vk, hold=0.02):
+def press_vk(vk, hold=0.015):
+    # hold/trailing recortados (0.02/0.03 -> 0.015/0.02): esto multiplica en cada
+    # tecla (incluye los 32 borrados de clear_hard). Sigue dando margen a que el OS
+    # registre el keyup. NO afecta a type_code (que mantiene su per_char lento).
     _send(_key_input(vk=vk, flags=0))
     time.sleep(hold)
     _send(_key_input(vk=vk, flags=KEYEVENTF_KEYUP))
-    time.sleep(0.03)
+    time.sleep(0.02)
 
 
 def press(name, hold=0.02):
@@ -92,8 +95,9 @@ def press_shift(key, hold=0.02):
     time.sleep(0.03)
 
 
-def type_text(text, per_char=0.05):
-    """Teclea texto como UNICODE (independiente del layout). Ideal para códigos."""
+def type_text(text, per_char=0.02):
+    """Teclea texto como UNICODE (independiente del layout). Ideal para nombres/textos.
+    per_char recortado 0.05->0.02 (el hold down/up de 0.01 se mantiene)."""
     for ch in text:
         code = ord(ch)
         _send(_key_input(scan=code, flags=KEYEVENTF_UNICODE))
@@ -120,7 +124,7 @@ def select_all_field():
     _send(_key_input(vk=0x10))                      # SHIFT down
     press("END")
     _send(_key_input(vk=0x10, flags=KEYEVENTF_KEYUP))  # SHIFT up
-    time.sleep(0.05)
+    time.sleep(0.03)
 
 
 def clear_hard(n=16):
@@ -132,7 +136,7 @@ def clear_hard(n=16):
     press("HOME")
     for _ in range(n):
         press_vk(VK["DELETE"], hold=0.01)
-    time.sleep(0.05)
+    time.sleep(0.03)
 
 
 def type_number(value):
@@ -142,24 +146,24 @@ def type_number(value):
     Acepta el separador como '.' o ',' en la cadena de entrada."""
     for ch in str(value):
         if ch.isdigit():
-            press_vk(VK_NUMPAD[ch], hold=0.02)
+            press_vk(VK_NUMPAD[ch], hold=0.015)
         elif ch in ".,":
-            press_vk(VK_DECIMAL, hold=0.02)
+            press_vk(VK_DECIMAL, hold=0.015)
         # cualquier otro carácter se ignora
-        time.sleep(0.02)
+        time.sleep(0.015)
 
 
 VK_SUBTRACT = 0x6D    # tecla '-' del teclado numérico
 
 
-def type_code(value, per_char=0.13):
+def type_code(value, per_char=0.08):
     """Teclea un CÓDIGO de producto por el numérico: dígitos por NUMPAD y el guion
     por la tecla '-' del numérico (como hace el usuario en la grilla/búsqueda).
     Las letras u otros caracteres se envían por Unicode.
 
-    IMPORTANTE: se teclea LENTO (per_char ~0.13s). Si se teclea rápido, el
-    autocompletado/lookup de código de la app se dispara a mitad y trunca el código
-    (o abre una búsqueda que bloquea)."""
+    IMPORTANTE: se teclea moderadamente lento (per_char ~0.08s). Si se teclea
+    demasiado rápido (<0.04s), el autocompletado/lookup de código de la app se
+    dispara a mitad y trunca el código (o abre una búsqueda que bloquea)."""
     for ch in str(value):
         if ch.isdigit():
             press_vk(VK_NUMPAD[ch], hold=0.03)
@@ -175,21 +179,24 @@ def type_code(value, per_char=0.13):
 # ── mouse ────────────────────────────────────────────────────────────────────
 def move(x, y):
     user32.SetCursorPos(int(x), int(y))
-    time.sleep(0.05)
+    time.sleep(0.03)
 
 
 def click(x, y, double=False):
+    # paddings recortados (0.06/0.03/0.12 -> 0.04/0.02/0.07): el down/up mantiene un
+    # margen mínimo para que la app registre el clic real; el trailing baja de 0.12 a
+    # 0.07 (los flujos ya tienen sus propias esperas explícitas tras cada clic).
     move(x, y)
-    time.sleep(0.06)
+    time.sleep(0.04)
     _send(INPUT(type=INPUT_MOUSE, u=_INPUTunion(mi=MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, 0))))
-    time.sleep(0.03)
+    time.sleep(0.02)
     _send(INPUT(type=INPUT_MOUSE, u=_INPUTunion(mi=MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, 0))))
     if double:
-        time.sleep(0.06)
+        time.sleep(0.04)
         _send(INPUT(type=INPUT_MOUSE, u=_INPUTunion(mi=MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, 0))))
-        time.sleep(0.03)
+        time.sleep(0.02)
         _send(INPUT(type=INPUT_MOUSE, u=_INPUTunion(mi=MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, 0))))
-    time.sleep(0.12)
+    time.sleep(0.07)
 
 
 def click_rect(rect, double=False, fx=0.5, fy=0.5):
