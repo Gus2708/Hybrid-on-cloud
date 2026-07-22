@@ -209,9 +209,9 @@ def _politica_resultado(res, intentos):
 
 
 # ─── Procesamiento de una compra ───────────────────────────────────────────────
-def procesar_compra(compra):
-    """Aplica UNA compra completa (cabecera + items) contra HybridLite. El
-    estado backend_* vive en la cabecera (compras_app), no por item."""
+def procesar_compra(compra, n=1, total=1):
+    """Aplica UNA compra completa (cabecera + items) contra HybridLite. El estado
+    backend_* vive en la cabecera (compras_app), no por item."""
     cid = compra["id"]
     proveedor_codigo = compra.get("proveedor_codigo")
     proveedor_nombre = compra.get("proveedor_nombre")
@@ -245,11 +245,20 @@ def procesar_compra(compra):
         origen_doc_numero = "id de la compra (numero_documento vacío)"
     log.info("Procesando compra %s: proveedor=%s (%s) %s item(s), doc_numero=%s (%s)",
              cid, proveedor_codigo, proveedor_nombre, len(items), doc_numero, origen_doc_numero)
+
+    txt_banner = f"REGISTRANDO COMPRA {n}/{total} — OC-{cid} ({proveedor_nombre or proveedor_codigo})"
     try:
-        res = flujo_compra_real.registrar_compra(
-            proveedor_codigo, items, doc_numero,
-            commit=lb.check_hybrid_write_enabled(), proveedor_nombre=proveedor_nombre,
-        )
+        if control_seguro is not None:
+            with control_seguro(txt_banner, ocultar_scripts=["widget.pyw", "widget_recargo.pyw"]):
+                res = flujo_compra_real.registrar_compra(
+                    proveedor_codigo, items, doc_numero,
+                    commit=lb.check_hybrid_write_enabled(), proveedor_nombre=proveedor_nombre,
+                )
+        else:
+            res = flujo_compra_real.registrar_compra(
+                proveedor_codigo, items, doc_numero,
+                commit=lb.check_hybrid_write_enabled(), proveedor_nombre=proveedor_nombre,
+            )
     except Exception as e:
         res = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
 
@@ -275,27 +284,14 @@ def procesar_pendientes(compras):
     if not compras:
         return
 
-    if control_seguro is None:
-        if not _AVISO_SIN_SAFETY_CONTROL:
-            log.warning("safety_control no disponible: procesando SIN overlay/F12/BlockInput "
-                        "(degradado, ver import al inicio del módulo).")
-            _AVISO_SIN_SAFETY_CONTROL = True
-        for compra in compras:
-            procesar_compra(compra)
-    else:
-        # ocultar el widget del backend (topmost, tapa/come clics de los
-        # diálogos de HybridLite) mientras el bot trabaja; se restaura al salir.
-        with control_seguro("REGISTRANDO COMPRAS EN HYBRIDLITE",
-                            ocultar_scripts=["widget.pyw", "widget_recargo.pyw"]) as banner:
-            total = len(compras)
-            for n, compra in enumerate(compras, start=1):
-                try:
-                    banner.set_texto(
-                        f"REGISTRANDO COMPRA {n}/{total} — "
-                        f"OC-{compra['id']} ({compra.get('proveedor_nombre') or compra.get('proveedor_codigo')})")
-                except Exception:
-                    pass
-                procesar_compra(compra)
+    if control_seguro is None and not _AVISO_SIN_SAFETY_CONTROL:
+        log.warning("safety_control no disponible: procesando SIN overlay/F12/BlockInput "
+                    "(degradado, ver import al inicio del módulo).")
+        _AVISO_SIN_SAFETY_CONTROL = True
+
+    total = len(compras)
+    for n, compra in enumerate(compras, start=1):
+        procesar_compra(compra, n=n, total=total)
 
 
 if __name__ == "__main__":

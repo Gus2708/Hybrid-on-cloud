@@ -169,7 +169,7 @@ def _politica_resultado(res, intentos):
 
 
 # ─── Procesamiento de un pedido ───────────────────────────────────────────────
-def procesar_pedido(pedido):
+def procesar_pedido(pedido, n=1, total=1):
     """Aplica UN pedido completo (cabecera + items) contra HybridLite. El estado
     backend_* vive en la cabecera (pedidos_app), no por item."""
     pid = pedido["id"]
@@ -191,14 +191,27 @@ def procesar_pedido(pedido):
 
     log.info("Procesando pedido %s: cliente=%s (%s) %s item(s)",
              pid, cliente_codigo, cliente_nombre, len(items))
+
+    # El banner y el bloqueo de mouse sólo deben durar mientras el bot interactúa con la UI.
+    # Al cerrar la forma en HybridLite, el banner se cierra INMEDIATAMENTE y libera el mouse.
+    txt_banner = f"REGISTRANDO PEDIDO {n}/{total} — PED-{pid} ({cliente_nombre or cliente_codigo})"
     try:
-        res = flujo_pedido_real.registrar_pedido(
-            cliente_codigo, items,
-            commit=lb.check_hybrid_write_enabled(), cliente_nombre=cliente_nombre,
-        )
+        if control_seguro is not None:
+            with control_seguro(txt_banner, ocultar_scripts=["widget.pyw", "widget_recargo.pyw"]):
+                res = flujo_pedido_real.registrar_pedido(
+                    cliente_codigo, items,
+                    commit=lb.check_hybrid_write_enabled(), cliente_nombre=cliente_nombre,
+                )
+        else:
+            res = flujo_pedido_real.registrar_pedido(
+                cliente_codigo, items,
+                commit=lb.check_hybrid_write_enabled(), cliente_nombre=cliente_nombre,
+            )
     except Exception as e:
         res = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
 
+    # Tras salir de control_seguro, el mouse YA ESTÁ LIBRE.
+    # La actualización a Supabase ('completado') ocurre en segundo plano de inmediato.
     status_final, resultado_final = _politica_resultado(res, intentos)
     if status_final == "completado":
         update_pedido(pid, backend_status="completado", backend_resultado=resultado_final,
@@ -222,25 +235,14 @@ def procesar_pendientes(pedidos):
     if not pedidos:
         return
 
-    if control_seguro is None:
-        if not _AVISO_SIN_SAFETY_CONTROL:
-            log.warning("safety_control no disponible: procesando SIN overlay/F12/BlockInput "
-                        "(degradado, ver import al inicio del módulo).")
-            _AVISO_SIN_SAFETY_CONTROL = True
-        for pedido in pedidos:
-            procesar_pedido(pedido)
-    else:
-        with control_seguro("REGISTRANDO PEDIDOS EN HYBRIDLITE",
-                            ocultar_scripts=["widget.pyw", "widget_recargo.pyw"]) as banner:
-            total = len(pedidos)
-            for n, pedido in enumerate(pedidos, start=1):
-                try:
-                    banner.set_texto(
-                        f"REGISTRANDO PEDIDO {n}/{total} — "
-                        f"PED-{pedido['id']} ({pedido.get('cliente_nombre') or pedido.get('cliente_codigo')})")
-                except Exception:
-                    pass
-                procesar_pedido(pedido)
+    if control_seguro is None and not _AVISO_SIN_SAFETY_CONTROL:
+        log.warning("safety_control no disponible: procesando SIN overlay/F12/BlockInput "
+                    "(degradado, ver import al inicio del módulo).")
+        _AVISO_SIN_SAFETY_CONTROL = True
+
+    total = len(pedidos)
+    for n, pedido in enumerate(pedidos, start=1):
+        procesar_pedido(pedido, n=n, total=total)
 
 
 if __name__ == "__main__":

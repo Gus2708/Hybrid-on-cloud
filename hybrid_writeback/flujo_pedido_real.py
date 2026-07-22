@@ -452,12 +452,25 @@ def _ultimo_pedido_db():
     dbv = pydbisam.PyDBISAM(RUTA_VTA)
     cols_v = dbv.fields()
     iv = {n: i for i, n in enumerate(cols_v)}
+    total_v = dbv.total_rows
+
+    # Optimización: buscar primero en la cola (últimas 200 filas) marcha atrás
     mejor = None
-    for row in dbv.rows():
-        if row[iv["THT_TIPO"]] != TIPO_PEDIDO:
-            continue
-        if mejor is None or row[iv["THT_AUTOINCREMENT"]] > mejor[iv["THT_AUTOINCREMENT"]]:
+    start_v = max(0, total_v - 200)
+    for i in range(total_v - 1, start_v - 1, -1):
+        row = dbv.row(i)
+        if row and row[iv["THT_TIPO"]] == TIPO_PEDIDO:
             mejor = row
+            break
+
+    # Fallback a recorrido completo si la cola no arrojó ningún pedido
+    if mejor is None:
+        for row in dbv.rows():
+            if row[iv["THT_TIPO"]] != TIPO_PEDIDO:
+                continue
+            if mejor is None or row[iv["THT_AUTOINCREMENT"]] > mejor[iv["THT_AUTOINCREMENT"]]:
+                mejor = row
+
     if mejor is None:
         return None, []
     header = dict(zip(cols_v, mejor))
@@ -466,11 +479,24 @@ def _ultimo_pedido_db():
     dbd = pydbisam.PyDBISAM(RUTA_DET)
     cols_d = dbd.fields()
     idd = {n: i for i, n in enumerate(cols_d)}
+    total_d = dbd.total_rows
     detalle = []
-    for row in dbd.rows():
-        if row[idd["TBT_TIPOOPERACION"]] == TIPO_PEDIDO and \
+
+    # Optimización: buscar detalles en la cola (últimas 500 filas)
+    start_d = max(0, total_d - 500)
+    for i in range(start_d, total_d):
+        row = dbd.row(i)
+        if row and row[idd["TBT_TIPOOPERACION"]] == TIPO_PEDIDO and \
                 row[idd["TBT_OPERACION_AUTOINCREMENT"]] == auto:
             detalle.append(dict(zip(cols_d, row)))
+
+    # Fallback a recorrido completo de detalles
+    if not detalle:
+        for row in dbd.rows():
+            if row[idd["TBT_TIPOOPERACION"]] == TIPO_PEDIDO and \
+                    row[idd["TBT_OPERACION_AUTOINCREMENT"]] == auto:
+                detalle.append(dict(zip(cols_d, row)))
+
     return header, detalle
 
 
