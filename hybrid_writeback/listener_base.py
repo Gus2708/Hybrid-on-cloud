@@ -183,7 +183,13 @@ def hay_pendientes_prioritarios():
     return False
 
 
-POLL_INTERVAL = 5          # segundos entre sondeos (reducido de 8 para detección más rápida)
+POLL_INTERVAL = 3          # segundos entre sondeos EN REPOSO (bajado de 5; el sondeo
+                           # ocioso ahora hace 1 sola query a Supabase, ver correr_loop).
+POLL_INTERVAL_TRAS_TRABAJO = 1  # tras una pasada que SÍ procesó pendientes, re-sondear
+                                # casi enseguida para DRENAR la cola sin el tiempo muerto
+                                # de "se queda pensando" entre una tarea y la siguiente.
+                                # No es 0 para no entrar en tight-loop si un item quedara
+                                # 'pendiente' por fallo reintentable (backoff mínimo).
 
 
 # ─── Bucle principal ────────────────────────────────────────────────────────
@@ -222,6 +228,13 @@ def correr_loop(log, listener_file, nombre, get_pendientes, procesar_pendientes,
     # cambia (o cuando se vuelve a estado operativo), no en cada iteración.
     ultimo_motivo_skip = None
 
+    def _volver_operativo():
+        """Loguea el retorno a estado operativo una sola vez (tras un skip)."""
+        nonlocal ultimo_motivo_skip
+        if ultimo_motivo_skip is not None:
+            log.info("Vuelve a estado operativo: se procesan %s normalmente.", sujeto)
+            ultimo_motivo_skip = None
+
     while True:
         HYBRID_WRITE_ENABLED = check_hybrid_write_enabled()
         if not (HYBRID_WRITE_ENABLED or once):
@@ -233,8 +246,12 @@ def correr_loop(log, listener_file, nombre, get_pendientes, procesar_pendientes,
             time.sleep(POLL_INTERVAL)
             continue
 
+        hubo_trabajo = False   # ¿esta pasada procesó pendientes? -> re-sondeo rápido
         motivo_skip = None
         try:
+            # ── Guards BARATOS (no dependen de la cola): se evalúan ANTES de
+            #    tocar Supabase, para no gastar queries en una pasada que igual
+            #    se saltaría. ──
             if not _h_disponible():
                 # F2: guard de H: a nivel de pasada. Sin esto, los flujos
                 # revientan con FileNotFoundError al leer TExistenciaInv.Dat y
@@ -250,20 +267,29 @@ def correr_loop(log, listener_file, nombre, get_pendientes, procesar_pendientes,
                 motivo_skip = ("fuera_de_ventana",
                                 f"Fuera de HYBRID_WRITE_WINDOW ({HYBRID_WRITE_WINDOW_RAW}) "
                                 f"-> no se procesan {sujeto} esta pasada.")
-            elif ceder_si is not None and not once and ceder_si():
-                # Prioridad: hay altas de cliente/proveedor pendientes -> este listener
-                # cede el paso hasta que se apliquen (se registran primero que todo).
-                motivo_skip = ("ceder_prioridad",
-                                "Hay altas de cliente/proveedor pendientes; cedo el paso "
-                                f"hasta aplicarlas (no se procesan {sujeto} esta pasada).")
 
             if motivo_skip is None:
-                if ultimo_motivo_skip is not None:
-                    log.info("Vuelve a estado operativo: se procesan %s normalmente.", sujeto)
-                    ultimo_motivo_skip = None
-                if HYBRID_WRITE_ENABLED or once:
-                    procesar_pendientes(get_pendientes())
-            else:
+                # Se piden los pendientes UNA sola vez. El chequeo de prioridad
+                # (ceder_si = 2 queries extra a Supabase) SOLO se paga si de
+                # verdad hay algo que procesar: el sondeo ocioso -el caso más
+                # frecuente- queda en 1 sola query en lugar de 3, y el bucle
+                # ocioso pega bastante menos a la nube.
+                pendientes = get_pendientes()
+                if not pendientes:
+                    _volver_operativo()   # sin trabajo, pero seguimos operativos
+                elif ceder_si is not None and not once and ceder_si():
+                    # Prioridad: hay altas de cliente/proveedor pendientes -> este
+                    # listener cede el paso hasta que se apliquen (se registran
+                    # primero que todo).
+                    motivo_skip = ("ceder_prioridad",
+                                    "Hay altas de cliente/proveedor pendientes; cedo el paso "
+                                    f"hasta aplicarlas (no se procesan {sujeto} esta pasada).")
+                else:
+                    _volver_operativo()
+                    procesar_pendientes(pendientes)
+                    hubo_trabajo = True
+
+            if motivo_skip is not None:
                 clave, mensaje = motivo_skip
                 if clave != ultimo_motivo_skip:
                     log.warning(mensaje)
@@ -272,4 +298,7 @@ def correr_loop(log, listener_file, nombre, get_pendientes, procesar_pendientes,
             log.error("Error en bucle: %r", e)
         if once:
             break
-        time.sleep(POLL_INTERVAL)
+        # Tras una pasada que aplicó cambios, re-sondear casi enseguida para
+        # drenar la cola sin el tiempo muerto entre tareas (era el "se queda
+        # pensando" que reportó el dueño); en reposo, el intervalo normal.
+        time.sleep(POLL_INTERVAL_TRAS_TRABAJO if hubo_trabajo else POLL_INTERVAL)

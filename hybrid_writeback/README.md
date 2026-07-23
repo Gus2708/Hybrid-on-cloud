@@ -3,9 +3,12 @@
 Permite que, desde la app / el bot, se solicite un cambio de **precio** o **stock** y que
 el backend lo aplique en el sistema local HybridLite **sin corromper la base de datos**.
 
-> **Estado (2026-07-09):** ✅ **Precio y Stock FUNCIONAN**, verificados leyendo la DB
-> real (pydbisam). Falta únicamente **cablear el pipeline** (listener + tabla en Supabase)
-> para que la app dispare los cambios sola.
+> **Estado (2026-07-23):** ✅ **Pipeline COMPLETO y en producción 24/7.** Cuatro listeners
+> supervisados por `backend_watchdog.py` aplican solos: **stock/precio/costo/ficha**
+> (`listener_writeback`), **compras** (`listener_compras`), **pedidos** (`listener_pedidos`)
+> y **altas de cliente/proveedor** (`listener_directorio`). Todo verificado contra la DBISAM
+> real (pydbisam). Última pasada: **optimización de latencia + auditoría de colas** (ver
+> [§ Rendimiento y auditoría de colas](#rendimiento-y-auditoría-de-colas-2026-07-23)).
 
 ---
 
@@ -28,18 +31,26 @@ el backend lo aplique en el sistema local HybridLite **sin corromper la base de 
 | `flujo_compra_real.py` | Coreografía de compras + alta de producto nuevo. |
 | `abrir_hybrid.py` | Instancia AISLADA de HybridLite: launch, login, `cerrar_aislada()` (solo mata el PID propio). |
 | `safety_control.py` | Banner topmost, F12 aborto, mutex del mouse (`Local\SerruchoBotMouseLock`) que serializa los dos listeners. |
-| `listener_base.py` | Núcleo común de listeners (config, logging, guards, REST, bucle `correr_loop`). |
-| `listener_writeback.py` / `listener_compras.py` | Pipelines 24/7 (`ordenes_cambio_items` / `compras_app`), lanzados por `backend_watchdog.py`. |
+| `flujo_pedido_real.py` | Coreografía de pedidos de cliente (Tipo 10 / Status 4). |
+| `flujo_directorio_real.py` | Coreografía de alta de cliente/proveedor en la Ficha del Directorio. |
+| `flujo_ficha_real.py` | Edición de descripción/referencia de un producto existente (Modificar). |
+| `listener_base.py` | Núcleo común de los 4 listeners (config, logging, guards, REST, prioridad `hay_pendientes_prioritarios`, bucle `correr_loop`). |
+| `listener_writeback.py` | Pipeline `ordenes_cambio_items` (stock/precio/costo/ficha), 3 fases globales por pasada. |
+| `listener_compras.py` | Pipeline `compras_app` (una compra = un documento). |
+| `listener_pedidos.py` | Pipeline `pedidos_app` (un pedido = un documento Tipo 10). |
+| `listener_directorio.py` | Pipeline `registro_clientes_app` / `registro_proveedores_app` (**prioritario**: los demás listeners le ceden el paso). |
 | `grabar_flujo.py` | Grabadora de coreografías (sesiones con el dueño). |
 | `diagnostico/` | Scripts desechables (ver su propio README). |
 
 ### Flujo de datos
 
-1. La app (El Serrucho Go) escribe un pendiente en Supabase: `ordenes_cambio_items`
-   (stock) o `compras_app` (compras), con `backend_status='pendiente'`.
-2. El listener correspondiente sondea esa tabla cada 8 s (`POLL_INTERVAL` en
-   `listener_base.py`), usando `SUPABASE_SERVICE_KEY` (la RLS de esas tablas exige
-   dueño autenticado; con la anon key el listener vería 0 filas, sin error).
+1. La app (El Serrucho Go) escribe un pendiente en Supabase (`ordenes_cambio_items`,
+   `compras_app`, `pedidos_app`, `registro_clientes_app` / `registro_proveedores_app`),
+   con `backend_status='pendiente'`.
+2. El listener correspondiente sondea su tabla cada `POLL_INTERVAL` (3 s en reposo,
+   `listener_base.py`) y **re-sondea en 1 s tras una pasada productiva** para drenar la
+   cola sin tiempo muerto. Usa `SUPABASE_SERVICE_KEY` (la RLS de esas tablas exige dueño
+   autenticado; con la anon key el listener vería 0 filas, sin error).
 3. Se ejecuta la coreografía de input real sobre una instancia AISLADA de
    HybridLite (levantada/logueada por `abrir_hybrid.py`), nunca sobre la sesión
    del empleado.
@@ -70,6 +81,62 @@ el backend lo aplique en el sistema local HybridLite **sin corromper la base de 
 - Los flujos de bajo nivel aceptan `commit=False` como default seguro.
 - Un preview igual **toma el mouse** si hay pendientes: no correr en horario de
   atención ni mientras alguien usa HybridLite en la estación.
+
+---
+
+## Rendimiento y auditoría de colas (2026-07-23)
+
+Pasada de optimización de latencia + auditoría de que las colas no se rompen en ningún caso.
+Diagnóstico hecho midiendo los **deltas de timestamps reales de `writeback.log`**.
+
+### Cuellos de botella medidos y corregidos
+
+| Síntoma (medido) | Causa | Cambio |
+|---|---|---|
+| ~14.6 s muertos entre una tarea y la siguiente (picos de 26–75 s) | `POLL_INTERVAL=5` fijo + **3 queries a Supabase por pasada** (2 del chequeo de prioridad `ceder_si` + 1 de pendientes), aun ociosas | `POLL_INTERVAL` 5→3 s; nuevo `POLL_INTERVAL_TRAS_TRABAJO=1 s` (re-sondeo rápido tras una pasada productiva); el bucle pide pendientes **una vez** y solo paga `ceder_si` si hay trabajo → sondeo ocioso de 3 a **1 query** |
+| ~7 s muertos por ítem en precio/pedido/compra (`Lista posicionada: False`) | `_esperar_refresco` quemaba su timeout de 6 s+1 s **siempre** que la grilla era ilegible | corta a `probe_ilegible=1.5 s` si la grilla nunca se pudo leer (+ fallback 1.0→0.5 s) → ~2 s; el caso legible **no cambia** |
+
+> Los picos de 26–75 s son **contención del mutex de mouse** entre los 4 listeners (un solo
+> mouse físico): se alivian al bajar el tiempo por ítem, pero no se eliminan — es un límite físico.
+
+### Cómo se manejan las colas (los 3 mecanismos que evitan romperlas)
+
+1. **Lock optimista** — cada ítem/cabecera se marca `aplicando` + `backend_intentos++`
+   **antes** de tocar HybridLite; `get_pendientes` solo trae `backend_status='pendiente'`.
+2. **Mutex de mouse cross-proceso** (`Local\SerruchoBotMouseLock`, timeout 5 min, degrada
+   sin él) — serializa a los 4 procesos: nunca hay dos bots clickeando a la vez.
+3. **Prioridad directorio** (`ceder_si=hay_pendientes_prioritarios`) — compras/pedidos/
+   writeback ceden mientras haya altas de cliente/proveedor `pendiente`, para que existan en
+   Hybrid antes del documento que las referencia; el mutex tapa además la ventana `aplicando`.
+
+### Máquina de estados por ítem
+
+```
+pendiente ──lock──► aplicando ──► completado            (commit real verificado en DB)
+                                └► pendiente             (preview, o fallo REINTENTABLE < MAX_INTENTOS=3)
+                                └► error                 (etapa AMBIGUA post-commit, o intentos ≥ 3,
+                                                          o guarda anti doble-stock)
+```
+
+**Taxonomía de etapas (auditada consistente en los 4 listeners):**
+- **Reintentables** (pre-commit, todo-o-nada, nada quedó a medias): `abrir_hybrid`,
+  `navegacion`, `carga/conteo`, `carga_item`, `precio_item`, `escritura`, `aceptar`,
+  `campos`, `alta_producto:*` (pre-Guardar).
+- **Ambiguas → `error` inmediato** (post-commit, riesgo de doble aplicación): `totalizar`,
+  `verificacion_db`, `guardar`, `alta_producto:guardar`.
+- En compras las etapas del alta se **prefijan** `alta_producto:` en `registrar_compra`, y
+  `carga_item`/`precio_item` se **construyen dinámicas** (no salen en un grep literal, pero existen).
+
+### Guarda anti doble-ajuste de kardex (nueva, 2026-07-23)
+
+Único hallazgo del audit: un ítem de writeback con parte de **stock + precio/costo/ficha** a
+la vez, si el **stock commitea** (delta relativo = documento permanente) y la fase hermana
+falla reintentable, volvía a `pendiente` y en el reintento **re-aplicaba el delta → doble
+ajuste**. `_aplicar_resultado_final` ahora detecta *stock commiteado + hermana pendiente* y
+degrada a **`error`** (revisión manual) en vez de reencolar. Las fases absolutas
+(precio/costo/ficha) son idempotentes y **no** gatillan la guarda. Reachability ínfima (la app
+separa stock de precio/ficha en items distintos: 0 de 6 635 los combinan), pero el blindaje
+cierra el hueco a futuro.
 
 ---
 

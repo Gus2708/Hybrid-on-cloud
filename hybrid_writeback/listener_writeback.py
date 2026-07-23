@@ -284,11 +284,31 @@ def _aplicar_resultado_final(iid, partes, intentos):
     combinados = []
     peor_status_rank = {"completado": 0, "pendiente": 1, "error": 2}
     status_final = "completado"
+    stock_commiteado = False
     for parte in partes:
         status, resultado = _politica_resultado(parte["res"], intentos)
         combinados.append(f"{parte['nombre']}: {resultado}")
+        if parte["nombre"] == "Stock" and status == "completado":
+            stock_commiteado = True
         if peor_status_rank[status] > peor_status_rank[status_final]:
             status_final = status
+
+    # GUARDA anti doble-ajuste de kardex (audit 2026-07-23): el Stock es un delta
+    # RELATIVO (documento permanente). Si esa parte YA commiteó pero una fase
+    # hermana (Precio/Costo/Ficha) quedó 'pendiente' para reintento, reencolar el
+    # item haría que el próximo pase RE-APLIQUE el delta sobre una existencia que
+    # ya lo incluye -> DOBLE ajuste. Se degrada a 'error' (revisión manual, misma
+    # filosofía que las etapas ambiguas): el stock aplicado NO se pierde; solo la
+    # fase hermana pendiente hay que re-emitirla a mano. Precio/Costo/Ficha son
+    # valores ABSOLUTOS e idempotentes, así que si commitean y falla el stock (u
+    # otra absoluta) reencolar es seguro y esta guarda no aplica. Reachability
+    # ínfima -la app separa stock de precio/ficha en items distintos- pero el
+    # blindaje es barato y cierra el hueco a futuro.
+    if stock_commiteado and status_final == "pendiente":
+        status_final = "error"
+        combinados.append("ATENCIÓN: el STOCK ya se aplicó (delta de kardex) pero otra "
+                          "fase quedó pendiente; NO se reencola para no re-aplicar el delta "
+                          "(doble ajuste). Aplicar la fase faltante a mano.")
 
     resultado_final = " | ".join(combinados)
     if status_final == "completado":

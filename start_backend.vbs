@@ -41,13 +41,20 @@ KillOurProcesses "pythonw.exe"
 KillOurProcesses "python.exe"
 WScript.Sleep 2000
 
-' Iniciar el Watchdog CON PRIVILEGIOS DE ADMIN (él se encargará de iniciar el resto)
-' BlockInput requiere admin para bloquear mouse/teclado durante el writeback.
-' Ruta ABSOLUTA obligatoria: con ruta relativa la línea de comandos del
-' watchdog no contiene scriptDir y KillOurProcesses nunca lo encuentra,
-' dejando watchdogs viejos vivos tras cada reinicio.
+' Iniciar el Watchdog NO ELEVADO (él se encargará de iniciar el resto).
+' ⚠ NO usar "runas"/elevación aquí (revertido 2026-07-23 tras romper H: en prod):
+' H: es una unidad de RED MAPEADA del usuario (\\192.168.1.118\Happs) y un proceso
+' ELEVADO NO ve las unidades mapeadas (salvo EnableLinkedConnections=1 en el
+' registro, que NO está seteado) -> el backend elevado deja de ver H: y TODO
+' (extracción, sync, writeback, widget) reporta "H: desconectada" aunque el
+' Explorador la vea. La elevación se había agregado (commit 358c06e) para el
+' BlockInput del writeback, pero ese bloqueo es OPCIONAL (el banner topmost + F12
+' protegen igual) y NO justifica perder el acceso a H:.
+' Ruta ABSOLUTA obligatoria: con ruta relativa la línea de comandos del watchdog
+' no contiene scriptDir y KillOurProcesses nunca lo encuentra, dejando watchdogs
+' viejos vivos tras cada reinicio.
 WshShell.CurrentDirectory = scriptDir
-CreateObject("Shell.Application").ShellExecute "pythonw", """" & scriptDir & "\backend_watchdog.py""", scriptDir, "runas", 0
+WshShell.Run "pythonw """ & scriptDir & "\backend_watchdog.py""", 0, False
 
 
 ' Limpiar lock

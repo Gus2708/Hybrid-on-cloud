@@ -155,9 +155,20 @@ def _grid_primera_fila_codigo(busq):
     return None
 
 
-def _esperar_refresco(busq, codigo, timeout=6.0):
+def _esperar_refresco(busq, codigo, timeout=6.0, probe_ilegible=1.5):
     """Espera a que la lista de la búsqueda se posicione en el código pedido.
-    Si no puede leer la grilla, espera un tiempo prudencial fijo."""
+    Si no puede leer la grilla, espera un tiempo prudencial fijo.
+
+    Optimización (2026-07-23, contra tiempo muerto medido en writeback.log): si
+    la grilla resulta ILEGIBLE por este método (nunca se pudo leer su primera
+    fila) tras `probe_ilegible` segundos, se corta la espera — no va a volverse
+    legible, así que aguantar el `timeout` completo era ~7s de tiempo muerto por
+    ítem (este caso SIEMPRE devolvía False). La red de seguridad real NO es esta
+    espera sino la verificación posterior (_ficha_muestra en cargar_producto y
+    _verificar_en_pantalla antes de cualquier commit): si la fila se seleccionó
+    mal, esas verificaciones lo cazan y el ítem se reintenta, nunca se escribe a
+    ciegas. Si la grilla SÍ es legible se conserva la paciencia completa (se
+    espera hasta ver el código correcto), así que el caso "bueno" no cambia."""
     t0 = time.time()
     leible = False
     while time.time() - t0 < timeout:
@@ -166,9 +177,11 @@ def _esperar_refresco(busq, codigo, timeout=6.0):
             leible = True
             if prim.strip() == codigo.strip():
                 return True
+        elif not leible and time.time() - t0 >= probe_ilegible:
+            break             # grilla ilegible: no seguir quemando el timeout completo
         time.sleep(0.15)
     if not leible:
-        time.sleep(1.0)   # no pude leer la grilla: espera fija generosa
+        time.sleep(0.5)   # no pude leer la grilla: espera fija breve antes de seleccionar
     return False
 
 
