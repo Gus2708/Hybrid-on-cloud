@@ -70,6 +70,7 @@ log = logging.getLogger("pedido_real")
 DIR = os.path.dirname(os.path.abspath(__file__))
 
 PEDIDOS_CLASS = "TFormHTransaccion_Pedidos"   # title='Transacciones : : PEDIDOS'
+GRID_EDIT_CLASSES = ("THybridEdit", "THybridEditNumber")   # editores de la fila activa
 TOTAL_CLASS = "TFrmTotalOperacion"            # title='Total Operación'
 PREVIEW_CLASS = "TfrxPreviewForm"             # comprobante (no debería aparecer en esta PC)
 CONF_CLASS = "TFConfirmacion"                 # diálogo de confirmación SI/NO genérico
@@ -153,6 +154,168 @@ def _confirmar_lo_que_pregunte(timeout=5):
                 continue
         time.sleep(0.3)
     return respondido
+
+
+def _esperar_foreground(hped, timeout=3.0):
+    """Espera a que la ventana de Pedidos vuelva a ser la del frente.
+
+    Una alerta de HybridLite roba el foreground; si se teclea antes de que
+    vuelva, las teclas se pierden sin ningún error visible. Devuelve True si
+    quedó al frente."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            if win32gui.GetForegroundWindow() == hped:
+                return True
+        except Exception:
+            pass
+        _focus(hped)
+        time.sleep(0.2)
+    return False
+
+
+def _drenar_alertas(hped, timeout=2.0, rondas=4):
+    """Cierra las alertas pendientes hasta que no quede ninguna y devuelve el
+    foco a Pedidos.
+
+    Antes esto era un `if` con una sola pasada: si aparecía una segunda alerta
+    (o una llegaba tarde), quedaba viva y se tragaba las teclas del ítem
+    siguiente. Ese es el patrón que dejó el doc 00004751 con 24 de 25 ítems."""
+    hubo = False
+    for _ in range(rondas):
+        if not (fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm")):
+            break
+        _confirmar_lo_que_pregunte(timeout=timeout)
+        hubo = True
+        time.sleep(0.2)
+    if hubo:
+        _esperar_foreground(hped)
+    return hubo
+
+
+def _fila_activa(hped):
+    """(top, campos) de la fila que se está EDITANDO en la grilla de Pedidos.
+
+    Solo la fila activa expone editores vivos; la ya posteada deja de ser
+    legible (mismo comportamiento que la grilla de Ajustes, ver
+    flujo_stock_real._celdas). Los editores de una fila comparten 'top', así que
+    se agrupan por esa coordenada (±3px) y se toma la banda con >=3 controles —
+    eso descarta los edits sueltos de la ventana (buscador, panel de seriales)
+    que también caen dentro del rectángulo de la grilla.
+
+    Orden de columnas VERIFICADO el 2026-07-28 con
+    diagnostico/diag_fila_en_curso_pedidos.py:
+        THybridEdit       -> codigo | descripcion | unidad
+        THybridEditNumber -> cantidad | precio | (6a columna)
+    Se indexa por posición relativa, no por 'left' absoluto, para que no dependa
+    de dónde esté la ventana.
+
+    Devuelve (None, {}) si no se puede leer; el llamador decide qué hacer.
+    """
+    try:
+        ped = fp._win(hped)
+        grid = ped.child_window(class_name="TAdvStringGrid", found_index=0)
+        gr = grid.rectangle()
+        ctrls = []
+        for c in ped.descendants():
+            try:
+                cls = c.class_name()
+                r = c.rectangle()
+            except Exception:
+                continue
+            if cls not in GRID_EDIT_CLASSES:
+                continue
+            if gr.left <= r.left < gr.right and gr.top <= r.top < gr.bottom:
+                ctrls.append((r.top, r.left, cls, c))
+    except Exception as e:
+        log.debug("No pude inspeccionar la grilla de Pedidos: %r", e)
+        return None, {}
+
+    bandas = {}
+    for top, left, cls, c in ctrls:
+        clave = next((k for k in bandas if abs(k - top) <= 3), top)
+        bandas.setdefault(clave, []).append((left, cls, c))
+
+    candidatas = {k: v for k, v in bandas.items() if len(v) >= 3}
+    if not candidatas:
+        return None, {}
+
+    top = max(candidatas)
+    fila = sorted(candidatas[top], key=lambda x: x[0])
+
+    def txt(c):
+        try:
+            return (c.window_text() or "").strip()
+        except Exception:
+            return ""
+
+    edits = [c for _, cls, c in fila if cls == "THybridEdit"]
+    nums = [c for _, cls, c in fila if cls == "THybridEditNumber"]
+
+    campos = {
+        "codigo":      txt(edits[0]) if len(edits) >= 1 else "",
+        "descripcion": txt(edits[1]) if len(edits) >= 2 else "",
+        "cantidad":    txt(nums[0]) if len(nums) >= 1 else "",
+        "precio":      txt(nums[1]) if len(nums) >= 2 else "",
+    }
+    return top, campos
+
+
+def _verificar_producto_cargado(hped, codigo):
+    """Confirma EN PANTALLA que el código llegó a la grilla y que HybridLite
+    resolvió el producto, antes de seguir tecleando cantidad y precio.
+
+    Este es el chequeo que faltaba el 2026-07-28: una alerta asíncrona ('llegó
+    al mínimo' del ítem anterior) robó el foco, las teclas del código 05133 se
+    perdieron, y cargar_item lo dio por cargado igual -> el doc 00004751 quedó
+    con 24 de 25 ítems y recién se detectó tras Totalizar, con el documento ya
+    permanente.
+
+    Si la fila no se puede leer se avisa y se sigue: una lectura fallida no debe
+    tumbar un flujo que ya funcionaba (la verificación contra DBISAM sigue de
+    red final)."""
+    _, campos = _fila_activa(hped)
+    if not campos:
+        log.warning("No pude leer la fila en curso del ítem %s: queda sin verificar "
+                    "en pantalla.", codigo)
+        return
+
+    leido = campos.get("codigo", "")
+    if leido.upper() != str(codigo).strip().upper():
+        raise PedidoError(
+            f"El código {codigo} no llegó a la grilla (la celda quedó en {leido!r}). "
+            f"Casi seguro una alerta de HybridLite robó el foco y se comió las teclas."
+        )
+    if not campos.get("descripcion"):
+        raise PedidoError(
+            f"El ítem {codigo} quedó sin descripción en la grilla: HybridLite no "
+            f"resolvió el producto. No sigo tecleando a ciegas."
+        )
+
+
+def _verificar_fila_posteada(hped, codigo, top_antes):
+    """Confirma que la fila entró al documento.
+
+    La fila posteada no se puede leer, pero la fila ACTIVA baja una posición
+    cuando el ítem entra (40px medidos el 2026-07-28 con
+    diagnostico/diag_fila_activa_pedidos.py: 321 -> 361 -> 401). Si no bajó, el
+    ítem no está en el documento.
+
+    Se compara con '>' y no contra los 40px exactos para no atarse a la
+    resolución ni al tema de la ventana."""
+    top_ahora, _ = _fila_activa(hped)
+
+    if top_ahora is None:
+        log.warning("No pude leer la fila activa tras postear %s: queda sin verificar "
+                    "en pantalla.", codigo)
+        return
+    if top_antes is None:
+        return   # sin referencia previa; que exista banda ya indica fila viva
+    if top_ahora <= top_antes:
+        raise PedidoError(
+            f"El ítem {codigo} no se posteó: la fila activa siguió en y={top_ahora}. "
+            f"Se cancela el documento completo para no dejarlo a medias."
+        )
 
 
 def _leer_cliente_header(hped):
@@ -330,10 +493,14 @@ def cargar_item(codigo, cantidad, precio=None, es_primero=False):
             ri.click(L + ITEM_GRID_REL[0], T + ITEM_GRID_REL[1])
         time.sleep(0.2)
 
-    # drenar cualquier alerta previa colgada antes de teclear este código
-    if fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm"):
-        _confirmar_lo_que_pregunte(timeout=2)
-        _focus(hped)
+    # drenar TODA alerta colgada antes de teclear, y esperar a que Pedidos vuelva
+    # al frente: teclear con una alerta viva es exactamente lo que perdió el ítem
+    # 05133 del doc 00004751 (2026-07-28).
+    _drenar_alertas(hped)
+    _esperar_foreground(hped)
+
+    # referencia para comprobar después que la fila realmente se posteó
+    top_antes, _ = _fila_activa(hped)
 
     ri.type_code(str(codigo))
     time.sleep(0.15)
@@ -343,6 +510,9 @@ def cargar_item(codigo, cantidad, precio=None, es_primero=False):
     # un diálogo de error acá = código inexistente / producto no válido
     if fp._find_hwnd("TMessageForm"):
         raise PedidoError(f"Error al cargar el ítem {codigo} (¿código inexistente?).")
+
+    # el código llegó y HybridLite resolvió el producto (si no, no seguimos a ciegas)
+    _verificar_producto_cargado(hped, codigo)
 
     ri.type_number(f"{float(cantidad):g}")
     time.sleep(0.1)
@@ -362,6 +532,15 @@ def cargar_item(codigo, cantidad, precio=None, es_primero=False):
         ri.press_shift("4")              # '$' (layout latam): marca el valor como USD
         time.sleep(0.08)
 
+    # Telemetría del precio manual: la celda es legible mientras la fila sigue
+    # activa. No se valida acá (el '$' puede reformatear el valor y un falso
+    # negativo cancelaría el documento); la validación dura es contra la DBISAM.
+    if precio is not None:
+        _, campos_previos = _fila_activa(hped)
+        if campos_previos:
+            log.info("Ítem %s: celda Precio antes de postear = %r (tecleado %.2f).",
+                     codigo, campos_previos.get("precio"), float(precio))
+
     ri.press("ENTER")                    # postea la fila / baja a la siguiente  # CALIBRAR
     time.sleep(0.3)
 
@@ -375,6 +554,10 @@ def cargar_item(codigo, cantidad, precio=None, es_primero=False):
 
     # drenar una alerta tardía (p.ej. 'llegó al mínimo') para que no se cuele al siguiente
     _confirmar_lo_que_pregunte(timeout=1.0)
+    _drenar_alertas(hped, timeout=1.0)
+
+    # la fila entró de verdad al documento (si no, se cancela todo)
+    _verificar_fila_posteada(hped, codigo, top_antes)
 
     if precio is None:
         log.info("Ítem %s cargado (cant=%s, precio maestro).", codigo, cantidad)
