@@ -34,9 +34,16 @@ Secuencia (registrar_pedido, un solo documento de Pedidos):
 SEGURIDAD: preview por defecto (llena y verifica en pantalla, NO totaliza);
 --commit aplica de verdad y verifica contra la base.
 
+PRECIO MANUAL (2026-07-28): cada ítem puede traer un precio propio en USD CON
+IVA; se teclea TAL CUAL en la celda Precio de la grilla, con el sufijo '$' (misma
+convención que el costo en compras). Sin precio, el ítem usa el precio maestro
+—comportamiento histórico—. La secuencia está CONFIRMADA contra la grabación
+grabar_flujo_20260728_165901.log y las unidades contra el doc 00004749.
+
 USO:
     python flujo_pedido_real.py 001 --items "01404:2"
     python flujo_pedido_real.py 001 --items "01404:2,03618:1" --commit
+    python flujo_pedido_real.py 001 --items "01404:2:15.90"     # precio manual
 """
 import os
 import sys
@@ -72,6 +79,19 @@ RUTA_DET = r"H:\HybridLite\HybridEmpresa\HybridDataBase\TDetalleVta.dat"
 
 TIPO_PEDIDO = 10                              # THT_TIPO / TBT_TIPOOPERACION del pedido
 TOL_CANT = 0.001                              # tolerancia de cantidad en la verificación
+TOL_PRECIO = 0.02                             # tolerancia de precio (misma que flujo_compra_real)
+
+# UNIDADES DEL PRECIO (verificado 2026-07-28 contra el pedido doc 00004749):
+# la celda Precio de la grilla —y TBT_PRECIODEVENTA— van en USD **CON IVA**, las
+# MISMAS unidades que productos.precio_venta y que manda la app. NO se divide
+# entre 1.16. Comprobación sobre ese documento:
+#   TBT_PRECIODEVENTA/THT_FACTORREFERENCIAL == productos.precio_venta exacto
+#     05126 -> 9.00 == 9.00 | 01418 -> 0.50 == 0.50 | TPH-12 -> 0.50 == 0.50
+#   THT_TOTALNETO      = suma(precio con IVA * cantidad)      -> 8542.33 ✓
+#   THT_TOTALIMPUESTO  = IVA CONTENIDO, no agregado encima    -> 1178.25 ✓
+#     (11.50 - 11.50/1.16) * 742.8105 = 1178.25
+# OJO: el comentario de scratch/compare_sales.py que dice "TBT_PRECIODEVENTA
+# almacena el precio SIN IVA" es INCORRECTO; no guiarse por él.
 
 # Coordenadas relativas (fallbacks por posición) tomadas de la grabación
 # 2026-07-21; se usan SOLO si la localización por título/clase no encuentra el
@@ -268,16 +288,33 @@ def seleccionar_cliente(ped, cliente_codigo, cliente_nombre=None):
 
 
 # ── ítems de la grilla ──────────────────────────────────────────────────────
-def cargar_item(codigo, cantidad, es_primero=False):
+def cargar_item(codigo, cantidad, precio=None, es_primero=False):
     """Teclea un ítem en la grilla de Pedidos:
         (solo el 1er ítem) clic en la celda Código de la grilla TAdvStringGrid
-        código -> ENTER (carga) -> cantidad -> ENTER -> ENTER (postea la fila)
-    NO hay costo ni precio (usa el precio maestro del producto). Lanza PedidoError
-    ante cualquier diálogo de error; el llamador cancela TODO el documento.
+        código -> ENTER (carga) -> cantidad -> ENTER -> [precio] -> ENTER (postea)
 
-    # CALIBRAR: el 2º ENTER (posteo) se tomó de la grabación; si en vivo la fila
-    # no postea o pide algo más, ajustar aquí. Los ítems siguientes NO re-clickean
-    # la grilla (el cursor baja solo tras postear, igual que en compras)."""
+    `precio` (USD CON IVA, como lo manda la app) es OPCIONAL:
+      * None  -> no se teclea nada: el 2º ENTER acepta lo que Hybrid ya puso en la
+                 celda, o sea el PRECIO MAESTRO. Es el comportamiento histórico y
+                 la ruta por defecto.
+      * valor -> se teclea TAL CUAL (USD con IVA, sin convertir) con el sufijo
+                 '$', igual que el costo en compras, donde el '$' le indica a
+                 HybridLite que el número va en dólares
+                 (ver flujo_compra_real.cargar_item: type_number + press_shift('4')).
+
+    Lanza PedidoError ante cualquier diálogo de error; el llamador cancela TODO
+    el documento.
+
+    CONFIRMADO EN VIVO (grabación 2026-07-28, grabar_flujo_20260728_165901.log):
+    el dueño hizo código -> ENTER -> ENTER (cantidad por defecto) -> '2' +
+    Shift+4 ('$') -> ENTER. O sea el campo que sigue a Cantidad ES el Precio y
+    acepta el sufijo '$'. Coincide con esta secuencia.
+
+    # CALIBRAR: el ENTER final (posteo) se tomó de la grabación; si en vivo la
+    # fila no postea o pide algo más, ajustar aquí. Los ítems siguientes NO
+    # re-clickean la grilla (el cursor baja solo tras postear, igual que en
+    # compras). La verificación contra DBISAM (_verificar_pedido_db) compara el
+    # precio y aborta si no cuadra."""
     hped = fp._find_hwnd(PEDIDOS_CLASS)
 
     if es_primero:
@@ -311,13 +348,39 @@ def cargar_item(codigo, cantidad, es_primero=False):
     time.sleep(0.1)
     ri.press("ENTER")                    # confirma la cantidad
     time.sleep(0.2)
+
+    # Precio manual: tras confirmar la cantidad el cursor queda en la celda
+    # Precio con el maestro puesto (CONFIRMADO en la grabación 2026-07-28
+    # grabar_flujo_20260728_165901.log: código->ENTER->ENTER->'2'+Shift+4->ENTER).
+    # Se sobreescribe con el valor en USD CON IVA + '$'. Sin precio no se teclea
+    # nada y el ENTER de abajo acepta el maestro.
+    if precio is not None:
+        if not (float(precio) > 0):
+            raise PedidoError(f"Precio inválido para el ítem {codigo}: {precio!r}.")
+        ri.type_number(f"{float(precio):.2f}")
+        time.sleep(0.08)
+        ri.press_shift("4")              # '$' (layout latam): marca el valor como USD
+        time.sleep(0.08)
+
     ri.press("ENTER")                    # postea la fila / baja a la siguiente  # CALIBRAR
     time.sleep(0.3)
+
+    # un diálogo acá con precio manual suele ser "precio bajo el costo" o un
+    # permiso que el usuario de Hybrid no tiene: se drena igual que el resto
+    if fp._find_hwnd("TMessageForm") and precio is not None:
+        raise PedidoError(
+            f"HybridLite rechazó el precio manual del ítem {codigo} "
+            f"(${float(precio):.2f} con IVA). ¿El usuario tiene permiso para cambiar precio?"
+        )
 
     # drenar una alerta tardía (p.ej. 'llegó al mínimo') para que no se cuele al siguiente
     _confirmar_lo_que_pregunte(timeout=1.0)
 
-    log.info("Ítem %s cargado (cant=%s).", codigo, cantidad)
+    if precio is None:
+        log.info("Ítem %s cargado (cant=%s, precio maestro).", codigo, cantidad)
+    else:
+        log.info("Ítem %s cargado (cant=%s, precio manual $%.2f con IVA).",
+                 codigo, cantidad, float(precio))
 
 
 # ── cierre del documento ─────────────────────────────────────────────────────
@@ -522,17 +585,42 @@ def _verificar_pedido_db(cliente_codigo, items, cliente_nombre=None):
     if cliente_nombre and cliente_nombre.strip().upper() not in persona.upper():
         fallos.append(f"cliente en DB={persona!r}, esperaba {cliente_nombre!r}")
 
-    # ítems: mapa codigo -> cantidad en el detalle
+    # ítems: mapa codigo -> (cantidad, precio) en el detalle
     en_db = {}
+    precio_db = {}
     for d in detalle:
         c = str(d.get("TBT_CODIGO") or "").strip()
         en_db[c] = en_db.get(c, 0.0) + float(d.get("TBT_CANTIDAD") or 0)
+        precio_db[c] = float(d.get("TBT_PRECIODEVENTA") or 0)
+
+    # TBT_PRECIODEVENTA está en Bs CON IVA; el factor del propio documento lo
+    # lleva a USD, quedando en las mismas unidades que manda la app (ver el
+    # bloque UNIDADES DEL PRECIO arriba, verificado contra doc 00004749).
+    tasa = float(header.get("THT_FACTORREFERENCIAL") or 0)
+
     for it in items:
         c = str(it["codigo"]).strip()
         if c not in en_db:
             fallos.append(f"el ítem {c} no aparece en el detalle del pedido")
-        elif abs(en_db[c] - float(it["cantidad"])) > TOL_CANT:
+            continue
+        if abs(en_db[c] - float(it["cantidad"])) > TOL_CANT:
             fallos.append(f"ítem {c}: cantidad en DB={en_db[c]}, esperaba {it['cantidad']}")
+
+        # Solo se verifica el precio de los ítems que traían uno manual: los
+        # demás quedaron con el maestro, que no conocemos desde acá.
+        esperado = it.get("precio")
+        if esperado is None:
+            continue
+        if tasa <= 0:
+            fallos.append(f"ítem {c}: no pude verificar el precio manual "
+                          f"(THT_FACTORREFERENCIAL={tasa!r} en el documento)")
+            continue
+        usd = precio_db[c] / tasa
+        if abs(usd - float(esperado)) > TOL_PRECIO:
+            fallos.append(
+                f"ítem {c}: precio en DB=${usd:.2f}, esperaba ${float(esperado):.2f} "
+                f"(ambos USD con IVA)"
+            )
 
     if fallos:
         return False, f"pedido doc={doc}: " + "; ".join(fallos), doc
@@ -542,7 +630,9 @@ def _verificar_pedido_db(cliente_codigo, items, cliente_nombre=None):
 
 # ── orquestador ──────────────────────────────────────────────────────────────
 def registrar_pedido(cliente_codigo, items, commit=False, cliente_nombre=None):
-    """items: list[dict] {"codigo": str, "cantidad": float}.
+    """items: list[dict] {"codigo": str, "cantidad": float, "precio": float|None}.
+    "precio" es opcional (USD CON IVA): si falta o es None se usa el precio
+    maestro de Hybrid, que es el comportamiento histórico.
     Return: {"ok": bool, "etapa": str, "detalle": str}.
     etapas éxito: "commit" | "preview"
     etapas fallo PRE-commit (reintentables, documento cancelado completo):
@@ -581,7 +671,7 @@ def registrar_pedido(cliente_codigo, items, commit=False, cliente_nombre=None):
     primero = True
     for it in items:
         try:
-            cargar_item(it["codigo"], it["cantidad"], es_primero=primero)
+            cargar_item(it["codigo"], it["cantidad"], precio=it.get("precio"), es_primero=primero)
             primero = False
         except PedidoError as e:
             _cancelar_pedido(fp._find_hwnd(PEDIDOS_CLASS))
@@ -622,17 +712,19 @@ def registrar_pedido(cliente_codigo, items, commit=False, cliente_nombre=None):
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 def _parse_items(spec):
-    """'COD:cant,COD2:cant2' -> list[dict]."""
+    """'COD:cant[:precio],COD2:cant2[:precio2]' -> list[dict].
+    El precio es opcional y va en USD CON IVA (como lo manda la app); sin él, el
+    ítem usa el precio maestro de Hybrid."""
     items = []
     for par in spec.split(","):
         partes = par.split(":")
-        if len(partes) != 2:
-            raise ValueError(f"Ítem inválido: {par!r} (formato codigo:cantidad)")
-        codigo, cantidad = partes
-        codigo = codigo.strip()
+        if len(partes) not in (2, 3):
+            raise ValueError(f"Ítem inválido: {par!r} (formato codigo:cantidad[:precio])")
+        codigo = partes[0].strip()
         if not codigo:
             raise ValueError(f"Ítem inválido: {par!r} (código vacío)")
-        items.append({"codigo": codigo, "cantidad": float(cantidad)})
+        precio = float(partes[2]) if len(partes) == 3 and partes[2].strip() else None
+        items.append({"codigo": codigo, "cantidad": float(partes[1]), "precio": precio})
     return items
 
 
@@ -651,7 +743,7 @@ if __name__ == "__main__":
 
     if len(args) < 1 or "--items" not in _raw:
         print('Uso: python flujo_pedido_real.py <cliente_codigo> '
-              '--items "COD:cant,COD2:cant2" [--commit]')
+              '--items "COD:cant[:precioUSDconIVA],..." [--commit]')
         sys.exit(1)
 
     cliente_codigo = args[0]

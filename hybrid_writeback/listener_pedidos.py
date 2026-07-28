@@ -92,11 +92,15 @@ def get_pedidos_pendientes():
 
 def get_items(pedido_id):
     """Items de un pedido, mapeados a la forma que espera
-    flujo_pedido_real.registrar_pedido: {"codigo","cantidad"} (la tabla usa
-    codigo_producto). Sin costo/precio (el pedido usa el precio maestro)."""
+    flujo_pedido_real.registrar_pedido: {"codigo","cantidad","precio"} (la tabla
+    usa codigo_producto).
+
+    `precio` (migración 040) es el precio que el vendedor fijó A MANO en la app,
+    en USD CON IVA. NULL = no lo tocó -> el flujo no teclea nada y Hybrid aplica
+    el precio maestro del producto, que es el comportamiento histórico."""
     try:
         path = (f"{TABLE_ITEMS}?pedido_id=eq.{pedido_id}"
-                f"&select=codigo_producto,descripcion,cantidad"
+                f"&select=codigo_producto,descripcion,cantidad,precio"
                 f"&order=id.asc")
         filas = lb.rest("GET", path) or []
     except urllib.error.HTTPError as e:
@@ -111,6 +115,7 @@ def get_items(pedido_id):
         {
             "codigo": fila["codigo_producto"],
             "cantidad": float(fila["cantidad"]),
+            "precio": None if fila.get("precio") in (None, "") else float(fila["precio"]),
         }
         for fila in filas
     ]
