@@ -41,12 +41,20 @@ import email
 import email.policy
 import email.utils
 import datetime
+import socket
 import requests
+
+# Red de la tienda inestable: sin un timeout total, una llamada de red que se
+# cuelga (p. ej. el refresh de token de MSAL, que no fija timeout propio) congela
+# el proceso para siempre. Este default acota CUALQUIER socket sin timeout propio;
+# los requests a Graph/Supabase ya pasan su timeout=30 explicito y no se ven afectados.
+socket.setdefaulttimeout(60)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE_DIR, "zelle_listener.log")
 TOKEN_CACHE_FILE = os.path.join(BASE_DIR, "zelle_token_cache.json")
 STATE_FILE = os.path.join(BASE_DIR, "zelle_state.json")
+HEARTBEAT_FILE = os.path.join(BASE_DIR, "zelle_heartbeat.json")
 
 _MAX_LOG_BYTES = 5 * 1024 * 1024
 
@@ -379,6 +387,24 @@ def guardar_estado(estado):
         log(f"Error guardando estado: {repr(e)}")
 
 
+def latir():
+    """Marca 'sigo avanzando' para backend_watchdog.py (is_hung).
+
+    El watchdog lee este archivo en paralelo, asi que se escribe de forma atomica
+    (tmp + os.replace) para que nunca lea un JSON a medio escribir. Silencioso a
+    proposito: un fallo al latir no debe tumbar el listener ni ensuciar el log en
+    cada ciclo; si el archivo se queda viejo, el watchdog reinicia, que es la red
+    de seguridad que se busca.
+    """
+    try:
+        tmp = HEARTBEAT_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"timestamp": time.time(), "pid": os.getpid()}, f)
+        os.replace(tmp, HEARTBEAT_FILE)
+    except Exception:
+        pass
+
+
 # ─── Microsoft Graph (polling HTTPS) ──────────────────────────────────────────
 
 def _graph_headers(access_token):
@@ -472,9 +498,15 @@ def procesar_pendientes(access_token, estado):
 def correr_listener():
     log("=== Iniciando Listener de Zelle v2.0 (Microsoft Graph, polling HTTPS) ===")
 
+    latir()
     while not config.ZELLE_CLIENT_ID:
         log("ZELLE_CLIENT_ID no configurado en .env. Durmiendo 1h...")
+        # Latir tambien aqui: dormir sin configurar es un estado sano y esperado
+        # (ver docstring del modulo), no un cuelgue. Sin latido el watchdog lo
+        # reiniciaria cada 15 min, que es justo el bucle de reinicios que se evita.
+        latir()
         time.sleep(NOT_CONFIGURED_SLEEP_S)
+        latir()
         import importlib
         importlib.reload(config)
 
@@ -486,6 +518,10 @@ def correr_listener():
             backoff = 10
             while True:
                 procesar_pendientes(access_token, estado)
+                # Se late DESPUES de procesar: el latido significa "complete un
+                # ciclo", no "entre al ciclo". Si procesar_pendientes o el refresh
+                # de token se cuelgan, el archivo envejece y el watchdog actua.
+                latir()
                 time.sleep(config.ZELLE_POLL_INTERVAL_S)
                 # acquire_token_silent no golpea la red si el token sigue vigente;
                 # solo refresca cuando esta por expirar.
@@ -495,14 +531,20 @@ def correr_listener():
             # Token invalido/expirado sin refresh posible: requiere --login manual.
             log(f"[AUTH] {e}")
             log("Reintentando en 10 min (si persiste, correr: python zelle_listener.py --login)")
+            latir()
             time.sleep(600)
+            latir()
         except requests.exceptions.RequestException as e:
             log(f"Error de red con Graph: {repr(e)}. Reintentando en {backoff}s...")
+            latir()
             time.sleep(backoff)
+            latir()
             backoff = min(backoff * 2, 300)
         except Exception as e:
             log(f"Error inesperado: {repr(e)}. Reintentando en {backoff}s...")
+            latir()
             time.sleep(backoff)
+            latir()
             backoff = min(backoff * 2, 300)
 
 

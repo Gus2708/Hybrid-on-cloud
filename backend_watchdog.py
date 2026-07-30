@@ -290,6 +290,20 @@ def is_hung(script):
                     return True
         except: pass
         return False
+    if script == "zelle_listener.py":
+        # zelle_listener late en zelle_heartbeat.json cada ciclo (~5s) y en cada
+        # manejador de error. >15 min sin latir = congelado (vivo pero sin avanzar;
+        # tipico: cuelgue de red en el refresh de token sobre la red inestable de la
+        # tienda). El umbral supera el sleep de 10 min del reintento AUTH del listener.
+        try:
+            p = os.path.join(BASE_DIR, "zelle_heartbeat.json")
+            if os.path.exists(p):
+                with open(p) as f:
+                    ts = json.load(f).get("timestamp", 0)
+                if ts and time.time() - ts > 900:
+                    return True
+        except: pass
+        return False
     if script == "app.py":
         if _api_responds():
             _APP_PORT_FAILS = 0
