@@ -30,6 +30,7 @@ el backend lo aplique en el sistema local HybridLite **sin corromper la base de 
 | `flujo_stock_real.py` | Coreografía de ajustes de stock (single y lote; la carga de fila vive en `cargar_y_fijar_fila`, el single delega con fila=0). |
 | `flujo_compra_real.py` | Coreografía de compras + alta de producto nuevo. |
 | `abrir_hybrid.py` | Instancia AISLADA de HybridLite: launch, login, `cerrar_aislada()` (solo mata el PID propio). |
+| `hybrid_health.py` | Detección de HybridLite **colgado** y kill de recuperación (ver más abajo). |
 | `safety_control.py` | Banner topmost, F12 aborto, mutex del mouse (`Local\SerruchoBotMouseLock`) que serializa los dos listeners. |
 | `flujo_pedido_real.py` | Coreografía de pedidos de cliente (Tipo 10 / Status 4). |
 | `flujo_directorio_real.py` | Coreografía de alta de cliente/proveedor en la Ficha del Directorio. |
@@ -60,10 +61,50 @@ el backend lo aplique en el sistema local HybridLite **sin corromper la base de 
    (`backend_status`, `backend_resultado`, `backend_intentos`, `backend_aplicado_en`).
 6. La app muestra ese estado como chip en el item correspondiente.
 
+### Recuperación de HybridLite colgado (`hybrid_health.py`, 2026-08-12)
+
+Cada tanto HybridLiteOS deja de responder y hasta ahora había que ir al
+Administrador de tareas a matar todo a mano: el bot no distinguía una app colgada
+de una sana, intentaba trabajar sobre ella y el ítem fallaba en la etapa
+`abrir_hybrid` (reintentable, así que reintentaba contra la misma app muerta).
+
+`abrir_hybrid.asegurar_hybrid()` —el punto por el que pasan **los 6 flujos**—
+ahora arranca llamando a `hybrid_health.recuperar_si_colgado()`:
+
+| Síntoma | Cómo se detecta |
+|---|---|
+| Ventana que no bombea mensajes | `IsHungAppWindow` + `SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG)` sobre cada ventana top-level visible de un `HybridLiteOS.exe` |
+| Proceso fantasma | PID de `HybridLiteOS.exe` vivo **sin ninguna ventana visible** propia (es el que suele trabar el arranque de instancias nuevas) |
+
+Confirmado el síntoma, se reconfirma durante `HYBRID_HANG_GRACE` (10 s por
+defecto) — un reporte pesado congela la ventana unos segundos y **no** es motivo
+para matar nada — y recién entonces se hace `taskkill /F /T /IM HybridLiteOS.exe`,
+se espera a que los procesos mueran de verdad + 3 s de settle (que el SO libere
+los handles de los `.Dat`) y `asegurar_hybrid()` sigue su curso lanzando y
+logueando una instancia limpia. El flujo continúa sin intervención.
+
+Además, si un intento de lanzar la instancia aislada **no produce ninguna
+ventana**, `matar_huerfanos()` cierra el proceso a medio arrancar — solo PIDs
+nacidos en ese intento, nunca el del empleado. Sin eso, cada intento fallido
+dejaba un fantasma más.
+
+Costo en el camino sano: **~21 ms** por flujo (barrido de 260 procesos + 4 pings).
+
+```powershell
+python hybrid_health.py            # diagnóstico, no toca nada (exit 1 si está colgado)
+python hybrid_health.py --matar    # mata todas las instancias, colgadas o no
+```
+
+Variables opcionales: `HYBRID_HANG_GRACE` (s de gracia, 10), `HYBRID_HANG_KILL=0`
+(diagnosticar sin matar: el flujo aborta con el detalle), `HYBRID_HANG_PING_MS`
+(800), `HYBRID_HANG_SETTLE` (3 s), `HYBRID_HANG_EXES`.
+
 ### Invariantes de seguridad (NUNCA romper)
 
 - Nunca cerrar la ventana de HybridLite del empleado; solo la instancia aislada
-  propia (`abrir_hybrid.cerrar_aislada()`, por PID verificado).
+  propia (`abrir_hybrid.cerrar_aislada()`, por PID verificado). **Única
+  excepción:** `hybrid_health.matar_todo()` con un cuelgue CONFIRMADO — ahí la
+  app del empleado ya estaba perdida igual, y sin matarla no arranca ninguna otra.
 - Nunca UPDATE crudo a la DBISAM ni parchear los `.DAT` (solo lectura).
 - Todo-o-nada pre-Totalizar: cualquier fallo cancela el documento entero.
 - Los timings, coordenadas y el orden de manejo de alertas de las coreografías

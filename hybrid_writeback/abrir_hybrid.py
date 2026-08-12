@@ -9,6 +9,11 @@ el bug — si un empleado estaba a mitad de un ajuste o una compra sin guardar,
 el bot tomaba control real del teclado/mouse SOBRE ESA MISMA ventana y el
 empleado perdía el trabajo en curso. Ahora:
 
+  0. Antes que nada chequea que HybridLite no esté COLGADO (hybrid_health.py):
+     si la app no responde o quedó un proceso fantasma sin ventana, mata TODAS
+     las instancias y sigue por el paso 2 con una limpia. Es la única vía por
+     la que el bot cierra la ventana de un empleado, y solo con el cuelgue
+     confirmado (esa app ya estaba perdida igual).
   1. Si ya existe una instancia aislada abierta por una pasada anterior de
      ESTE proceso (mismo PID vivo) -> la reutiliza (evita relanzar/loguear en
      cada pasada del listener).
@@ -46,6 +51,7 @@ except Exception:
     pass
 
 import flujo_precio as fp
+import hybrid_health as hh
 import realinput as ri
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -249,6 +255,19 @@ def asegurar_hybrid(timeout_login=60, timeout_main=60):
     módulo). Deja flujo_precio.set_target_pid() apuntando a esa instancia."""
     global _AISLADO_PID
 
+    # 0) ¿HybridLite está COLGADO? Antes de cualquier otra cosa: si la app no
+    #    responde (o quedó un proceso fantasma sin ventana), reutilizarla o
+    #    lanzar otra encima no sirve de nada -el flujo fallaría igual y alguien
+    #    tendría que matar tareas a mano-. hybrid_health confirma el cuelgue y
+    #    mata TODAS las instancias; abajo se lanza una limpia y el flujo sigue.
+    accion, detalle = hh.recuperar_si_colgado()
+    if accion == "fallo":
+        return False, f"HybridLite está colgado y no pude dejarlo limpio: {detalle}"
+    if accion == "recuperado":
+        print(f"Hybrid estaba colgado ({detalle}); arranco de cero.")
+        _AISLADO_PID = None
+        fp.clear_target_pid()
+
     # 1) ¿la instancia aislada de una pasada anterior sigue viva? -> reusarla
     cls_viva, h_viva = _instancia_aislada_viva()
     if h_viva:
@@ -276,6 +295,7 @@ def asegurar_hybrid(timeout_login=60, timeout_main=60):
 
     antes_login = fp._hwnds_de_clase(LOGIN)
     antes_main = fp._hwnds_de_clase(MAIN)
+    pids_antes = hh.pids_hybrid()
     subprocess.Popen([EXE], cwd=EXE_DIR)
 
     hlogin = fp._esperar_ventana_nueva(LOGIN, antes_login, timeout=timeout_login)
@@ -300,6 +320,11 @@ def asegurar_hybrid(timeout_login=60, timeout_main=60):
         fp.set_target_pid(pid)
         return True, "Hybrid abrió una instancia nueva y aislada, directo al módulo principal (sin login)."
 
+    # El intento no produjo ventana: si dejó un proceso a medio arrancar, se
+    # cierra ACÁ (solo PIDs nacidos en este intento, jamás el del empleado). Sin
+    # esto cada intento fallido suma un fantasma más, y son justo los que
+    # terminan trabando el arranque y obligando a matar tareas a mano.
+    hh.matar_huerfanos(pids_antes)
     return False, ("Lancé una instancia nueva de Hybrid pero no detecté ni login ni "
                    "módulo principal NUEVOS (¿la app bloquea multi-instancia en este equipo?).")
 
@@ -346,7 +371,8 @@ def cerrar_aislada():
 
     ⚠️ NUNCA hacer `taskkill /IM HybridLiteOS.exe` ni cerrar TODAS las
     instancias: eso mataría también la del empleado. El cierre SIEMPRE es por
-    este PID puntual."""
+    este PID puntual. (Única excepción en todo el proyecto:
+    hybrid_health.matar_todo, y solo con un cuelgue confirmado.)"""
     global _AISLADO_PID
     import win32con
     pid = _AISLADO_PID
