@@ -71,6 +71,13 @@ DIR = os.path.dirname(os.path.abspath(__file__))
 TOL = 0.02
 IVA_DEF = 0.16
 
+# Productos EXENTOS de IVA: Hybrid guarda la exencion por producto en
+# TImpuestosInv (DIM_EXENTO). En un exento la app NO desglosa -- deja
+# PVPSINIMPUESTO1 == PVPCONIMPUESTO1 --, asi que verificar contra
+# target/1.16 falla siempre (ver 05156, compra 19 del 2026-07-30).
+RUTA_IMPUESTOS_INV = r"H:\HybridLite\HybridEmpresa\HybridDataBase\TImpuestosInv.Dat"
+_EXENTOS_CACHE = {"mtime": None, "codigos": None}
+
 # Botones owner-drawn de la barra de la Ficha (coords relativas, grabacion 2026-07-07)
 MODIFICAR_REL = (122, 62)
 GUARDAR_REL = (240, 60)
@@ -78,6 +85,42 @@ GUARDAR_REL = (240, 60)
 
 class PrecioError(Exception):
     pass
+
+
+def _exentos():
+    """Set de codigos exentos de IVA leido de TImpuestosInv (SOLO LECTURA).
+
+    Se cachea por mtime del .DAT: una compra recorre decenas de items y el
+    archivo pesa ~800KB. Si la unidad H: no esta o el archivo no se puede
+    leer, devuelve None -> el llamador cae al IVA por defecto."""
+    try:
+        mtime = os.path.getmtime(RUTA_IMPUESTOS_INV)
+    except OSError as e:
+        log.warning("No pude acceder a TImpuestosInv (%s); asumo IVA por defecto.", e)
+        return None
+    if _EXENTOS_CACHE["mtime"] == mtime and _EXENTOS_CACHE["codigos"] is not None:
+        return _EXENTOS_CACHE["codigos"]
+    try:
+        db = hpw.read_db_precio.pydbisam.PyDBISAM(RUTA_IMPUESTOS_INV)
+        idx = {n: i for i, n in enumerate(db.fields())}
+        cod_i, ex_i = idx["DIM_CODIGOPRODUCTO"], idx["DIM_EXENTO"]
+        codigos = {str(row[cod_i]).strip() for row in db.rows() if row[ex_i]}
+    except Exception as e:
+        log.warning("No pude leer TImpuestosInv (%s); asumo IVA por defecto.", e)
+        return None
+    _EXENTOS_CACHE.update(mtime=mtime, codigos=codigos)
+    log.info("TImpuestosInv leido: %d producto(s) exento(s) de IVA.", len(codigos))
+    return codigos
+
+
+def iva_producto(codigo):
+    """IVA efectivo del producto: 0.0 si esta marcado EXENTO en Hybrid, IVA_DEF
+    si no (o si no se pudo leer la tabla / el producto aun no existe)."""
+    codigos = _exentos()
+    if codigos is not None and str(codigo).strip() in codigos:
+        log.info("Producto %s es EXENTO de IVA: se verifica sin desglose.", codigo)
+        return 0.0
+    return IVA_DEF
 
 
 # ── helpers de lectura de la Ficha ───────────────────────────────────────────
@@ -325,10 +368,18 @@ def escribir_precio(target, iva):
     # y se sale más rápido. Típico al comprar un producto cuyo precio de venta no
     # cambió. En un alta el campo arranca en 0, así que igual se escribe.
     con_actual = hpw._num(con_field.window_text())
+    sin_actual = hpw._num(sin_field.window_text())
     if con_actual is not None and abs(con_actual - target) <= TOL:
-        sin_actual = hpw._num(sin_field.window_text())
         log.info("Precio con-impuesto ya está en %.2f (=target); no se reescribe.", con_actual)
         return {"con": con_actual, "sin": sin_actual}
+
+    # Red de seguridad sobre `iva`: la pantalla es la que manda. Si el producto
+    # ya traía con == sin (y no son cero), la app NO le desglosa impuesto -- es
+    # un exento -- por mucho que se haya pedido verificar contra 1+IVA.
+    if (con_actual and sin_actual and abs(con_actual - sin_actual) <= TOL and iva):
+        log.warning("El precio en pantalla no viene desglosado (con=%.2f sin=%.2f): "
+                    "se trata como EXENTO y se verifica sin IVA.", con_actual, sin_actual)
+        iva = 0.0
 
     # enfocar el campo con-impuesto: clic real en la parte baja del campo + set_focus
     r = con_field.rectangle()
@@ -463,20 +514,51 @@ def db_costo_usd(codigo):
     return hpw._db_costo_usd(codigo)
 
 
-def _click_boton_dialogo(titulo):
-    """Clic REAL en un botón del diálogo Costos y Precios (Aceptar/Salir)."""
-    hd = fp._find_hwnd(fp.PRECIOS_CLASS)
-    if not hd:
-        return False
-    _focus(hd)
-    try:
-        b = fp._win(hd).child_window(title=titulo, class_name="TButton")
-        r = b.rectangle()
-        ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+def _al_frente(hwnd, intentos=3):
+    """Deja `hwnd` en primer plano y lo VERIFICA. True si lo logró.
+
+    `_focus` pide el foco pero no comprueba que lo haya conseguido: si justo
+    en ese momento aparece una ventana intrusa (notificación de Windows, del
+    antivirus, de Claude Code...) el input real siguiente cae en ella."""
+    for _ in range(intentos):
+        _focus(hwnd)
+        if win32gui.GetForegroundWindow() == hwnd:
+            return True
+        time.sleep(0.3)
+    return False
+
+
+def _click_boton_dialogo(titulo, esperar_cierre=False, intentos=3):
+    """Clic REAL en un botón del diálogo Costos y Precios (Aceptar/Salir).
+
+    ROBUSTEZ ante robo de foco (2026-07-30, compra 19): una ventana intrusa que
+    aparezca entre el foco y el clic hace que el clic caiga fuera, el diálogo
+    queda abierto y la compra entera se cancela (todo-o-nada). Por eso se
+    verifica que el diálogo esté REALMENTE al frente antes de clickear y, con
+    `esperar_cierre`, se reintenta hasta comprobar que se cerró."""
+    for intento in range(1, intentos + 1):
+        hd = fp._find_hwnd(fp.PRECIOS_CLASS)
+        if not hd:
+            # ya no está: si se esperaba el cierre, un clic previo lo consiguió
+            return esperar_cierre
+        if not _al_frente(hd):
+            log.warning("Intento %d de pulsar '%s': el diálogo no queda al frente "
+                        "(¿ventana intrusa?); reintento.", intento, titulo)
+            continue
+        try:
+            b = fp._win(hd).child_window(title=titulo, class_name="TButton")
+            r = b.rectangle()
+            ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+        except Exception as e:
+            log.warning("Intento %d de pulsar '%s': %s", intento, titulo, e)
+            time.sleep(0.4)
+            continue
         time.sleep(0.6)
-        return True
-    except Exception:
-        return False
+        if not esperar_cierre or not fp._find_hwnd(fp.PRECIOS_CLASS):
+            return True
+        log.warning("Intento %d: '%s' pulsado pero el diálogo sigue abierto; reintento.",
+                    intento, titulo)
+    return False
 
 
 def _confirmar_si():
@@ -511,7 +593,7 @@ def _guardar_ficha():
     return True
 
 
-def set_precio_costo(codigo, nuevo_precio=None, nuevo_costo=None, iva=IVA_DEF, commit=False):
+def set_precio_costo(codigo, nuevo_precio=None, nuevo_costo=None, iva=None, commit=False):
     """Cambia precio y/o costo de un producto en UNA sola sesión de Ficha.
 
     Al menos uno de nuevo_precio/nuevo_costo debe venir. Si vienen ambos: se
@@ -595,7 +677,8 @@ def set_precio_costo(codigo, nuevo_precio=None, nuevo_costo=None, iva=IVA_DEF, c
             if precio_pin is not None:
                 log.info("Fijando el precio en %.2f (pin: sin cambio de precio pedido, "
                          "compensa el recálculo costo->precio).", precio_pin)
-            preview_precio = escribir_precio(precio_a_escribir, iva)
+            preview_precio = escribir_precio(
+                precio_a_escribir, iva_producto(codigo) if iva is None else iva)
     except PrecioError as e:
         _click_boton_dialogo("Salir")   # descartar, nada queda a medias
         return {"ok": False, "etapa": "escritura", "detalle": str(e),
@@ -651,7 +734,7 @@ def set_precio_costo(codigo, nuevo_precio=None, nuevo_costo=None, iva=IVA_DEF, c
             "db_costo_antes": db_costo_antes, "db_costo_despues": db_costo_despues}
 
 
-def set_precio(codigo, target, iva=IVA_DEF, commit=False):
+def set_precio(codigo, target, iva=None, commit=False):
     """Wrapper delgado sobre set_precio_costo (compatibilidad: comportamiento
     externo sin cambios, el listener actual lo sigue llamando igual)."""
     return set_precio_costo(codigo, nuevo_precio=target, iva=iva, commit=commit)
@@ -683,7 +766,7 @@ if __name__ == "__main__":
     if target is None and costo is None:
         print("Debe indicar <precio_usd> y/o --costo <costo_usd>.")
         sys.exit(1)
-    iva = IVA_DEF
+    iva = None          # None -> se resuelve por producto (exento o IVA_DEF)
     if "--iva" in _raw:
         iva = float(_raw[_raw.index("--iva") + 1])
     res = set_precio_costo(codigo, nuevo_precio=target, nuevo_costo=costo,

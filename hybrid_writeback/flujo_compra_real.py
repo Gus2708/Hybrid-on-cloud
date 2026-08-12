@@ -460,7 +460,7 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False)
 
     try:
         _escribir_costo_alta(costo)
-        fpr.escribir_precio(float(precio), fpr.IVA_DEF)
+        fpr.escribir_precio(float(precio), fpr.iva_producto(codigo))
     except fpr.PrecioError as e:
         fpr._click_boton_dialogo("Salir")        # descarta el diálogo, nada guardado
         _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))
@@ -767,20 +767,21 @@ def cargar_item(codigo, cantidad, costo, precio, commit, es_primero=False):
         return
 
     try:
-        fpr.escribir_precio(float(precio), fpr.IVA_DEF)
+        fpr.escribir_precio(float(precio), fpr.iva_producto(codigo))
     except fpr.PrecioError as e:
         fpr._click_boton_dialogo("Salir")   # descarta el ítem, nada queda a medias
         raise CompraError(f"El precio del ítem {codigo} no cuadró en pantalla: {e}")
 
-    if commit:
-        if not fpr._click_boton_dialogo("Aceptar"):
-            raise CompraError(f"No pude pulsar 'Aceptar' en Costos y Precios para {codigo}.")
-        if fp._find_hwnd(fp.PRECIOS_CLASS):
-            fpr._click_boton_dialogo("Salir")
-    else:
-        fpr._click_boton_dialogo("Salir")   # preview: descarta el ítem individual
+    # OJO (regresión 2026-07-30): 'Aceptar' CONFIRMA el precio pero NO cierra el
+    # diálogo — el que cierra es 'Salir'. Son dos pasos, no uno; por eso el
+    # 'Aceptar' va sin esperar_cierre (si no, reintenta un cierre que nunca llega
+    # y aborta la compra en el primer ítem).
+    if commit and not fpr._click_boton_dialogo("Aceptar"):
+        raise CompraError(f"No pude pulsar 'Aceptar' en Costos y Precios para {codigo}.")
 
-    if fp._find_hwnd(fp.PRECIOS_CLASS):
+    # cierre (y, en preview, descarte del ítem). esperar_cierre=True reintenta si
+    # una ventana intrusa se robó el foco justo en el clic.
+    if not fpr._click_boton_dialogo("Salir", esperar_cierre=True):
         raise CompraError(f"El diálogo Costos y Precios no se cerró para el ítem {codigo}.")
 
     # Drenar la alerta TARDÍA 'llegó al mínimo' que este ítem (si quedó at-min)
