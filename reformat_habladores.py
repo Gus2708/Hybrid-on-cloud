@@ -1,13 +1,19 @@
+"""Normaliza el CSV que exporta HybridLite para los habladores de estante.
+
+El export trae la descripción y el precio en líneas distintas, separados por
+una fila "REF."; esto lo aplana a un CSV de DESCRIPCION,PRECIO.
+
+    python reformat_habladores.py entrada.csv -o salida.csv
+"""
+import argparse
 import csv
 import os
 import re
 
-input_path = r'C:\Users\OFICINA\Desktop\Habladores $.csv'
-output_path = r'C:\Users\OFICINA\Desktop\Habladores_Limpio.csv'
 
-def process_file():
+def process_file(input_path, output_path):
     results = []
-    
+
     # Intenta leer el archivo original
     if not os.path.exists(input_path):
         print(f"Error: No se encuentra el archivo en {input_path}")
@@ -35,7 +41,7 @@ def process_file():
             row = next(csv.reader([lines[i]]))
             if row:
                 name = row[0].strip()
-        except:
+        except Exception:
             name = line.split(',')[0].strip().strip('"')
 
         if not name:
@@ -83,7 +89,22 @@ def process_file():
     
     return output_path, len(results)
 
-if __name__ == "__main__":
-    path, count = process_file()
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("entrada", help="CSV exportado por HybridLite")
+    parser.add_argument("-o", "--salida", default=None,
+                        help="CSV de salida (por defecto: <entrada>_limpio.csv)")
+    args = parser.parse_args()
+
+    salida = args.salida
+    if salida is None:
+        base, ext = os.path.splitext(args.entrada)
+        salida = f"{base}_limpio{ext or '.csv'}"
+
+    path, count = process_file(args.entrada, salida)
     if path:
         print(f"Proceso completado. {count} productos guardados en {path}")
+
+
+if __name__ == "__main__":
+    main()
