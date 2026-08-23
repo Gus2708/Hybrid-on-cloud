@@ -62,6 +62,7 @@ except Exception:
 
 import flujo_precio as fp          # helpers de ventanas + constantes de clase
 import hybrid_price_writer as hpw  # lectura DBISAM + localizacion de campos USD
+import hybrid_health as hh         # responde(): ping WM_NULL para saber si la app esta ocupada
 import realinput as ri
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -182,6 +183,89 @@ def _focus(hwnd):
     time.sleep(0.25)
 
 
+def _esperar_desocupada(hwnd, timeout=45.0, que="la ventana"):
+    """Espera a que `hwnd` vuelva a bombear mensajes, es decir a que la app
+    TERMINE lo que esté haciendo (cargar la lista, aplicar el filtro...).
+
+    POR QUÉ EXISTE (2026-08-22): la Búsqueda de la Ficha abre con los ~7.600
+    productos y, según cómo ande la unidad de red H:, cargar o filtrar esa
+    lista puede tardar varios segundos. Mientras carga, Delphi NO procesa
+    mensajes: el clic al campo de búsqueda se pierde, el tecleo no entra y el
+    ENTER termina aceptando la fila 1 de la lista sin filtrar -> siempre
+    '00-002-024'. Es exactamente el fallo intermitente
+    "La Ficha NO cargó X (edits=[... '00-002-024'])" de writeback.log: no
+    fallaba por lógica sino por llegar antes que los datos. Antes se esperaba
+    un tiempo FIJO (0.3s), que alcanzaba cuando la lista cargaba rápido.
+
+    Devuelve True si quedó libre; False si se agotó el timeout (el llamador
+    sigue igual: la verificación posterior atrapa el problema)."""
+    t0 = time.time()
+    avisado = False
+    while time.time() - t0 < timeout:
+        if hh.responde(hwnd, timeout_ms=400):
+            if avisado:
+                log.info("%s quedó lista tras %.1fs.", que.capitalize(), time.time() - t0)
+            return True
+        if not avisado:
+            log.info("Esperando a que %s termine de cargar...", que)
+            avisado = True
+        time.sleep(0.3)
+    log.warning("%s sigue ocupada tras %.0fs; continúo igual.", que.capitalize(), timeout)
+    return False
+
+
+def _scrollbar_lista(busq):
+    """(visible, alto) de la barra de desplazamiento VERTICAL del grid de la
+    Búsqueda — la más alta de las TScrollWindow. None si no se encuentra.
+
+    CÓMO SE ELIGIÓ ESTA SEÑAL (differ de TODA la ventana, en vivo 2026-08-22):
+    al buscar un código, lo único que cambia de forma observable es
+    `TScrollingStyleHook.TScrollWindow.vis: True -> False`, a los ~4.8s. El
+    TDBGrid no es legible (`texts()` da 0 entradas) y el "Registros: N" que se
+    ve en pantalla no llega por `window_text()` (la etiqueta es fija y el
+    número va en un panel aparte que además conserva el valor anterior)."""
+    mejor = None
+    for c in busq.descendants():
+        try:
+            if not c.class_name().endswith("TScrollWindow"):
+                continue
+            r = c.rectangle()
+            alto = r.bottom - r.top
+            if mejor is None or alto > mejor[1]:
+                mejor = (bool(c.is_visible()), alto)
+        except Exception:
+            pass
+    return mejor
+
+
+def _esperar_lista_filtrada(busq, timeout=60.0):
+    """Espera a que la lista quede FILTRADA, es decir a que la barra vertical
+    del grid desaparezca porque ya caben todas las filas sin scroll.
+
+    Buscando por código exacto el resultado es 1 fila, así que la barra sobra y
+    Delphi la oculta: es una señal directa de "ya hay resultados", no un
+    "algo cambió".
+
+    NO vale esperar "cualquier cambio" en la ventana (se intentó): al reabrir
+    la Búsqueda para el segundo producto, el contador conserva el valor de la
+    búsqueda anterior y se limpia a los ~3s; ese cambio se tomaba por
+    resultados y se clicaba sobre la lista todavía completa, cargando su fila 1
+    -> '00-002-024'. Comprobado en vivo el 2026-08-22.
+
+    Devuelve True si quedó filtrada; False si se agotó el timeout."""
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        barra = _scrollbar_lista(busq)
+        if barra is not None and not barra[0]:
+            log.info("Lista filtrada en %.1fs (barra de scroll oculta).",
+                     time.time() - t0)
+            return True
+        time.sleep(0.3)
+    log.warning("La lista no se filtró en %.0fs (la barra de scroll sigue visible).",
+                timeout)
+    return False
+
+
 def _grid_primera_fila_codigo(busq):
     """Intenta leer el código de la 1a fila visible del TDBGrid (para saber si la
     lista ya se posicionó en el producto buscado). Devuelve str o None."""
@@ -272,32 +356,68 @@ def cargar_producto(codigo):
     busq = fp._win(hbusq)
     time.sleep(0.3)
 
-    _focus(hbusq)
+    # La Búsqueda abre cargando los ~7.600 productos. Hasta que NO termine, la
+    # app no procesa mensajes y cualquier clic/tecla se pierde (ver
+    # _esperar_desocupada). Antes se esperaba 0.3s fijos: bastaba cuando la
+    # lista cargaba rápido, y es justo lo que falla cuando H: va lenta.
+    _esperar_desocupada(hbusq, que="la lista de la búsqueda")
+
+    # BUSCAR Y CARGAR. Todo el ciclo se reintenta completo (teclear -> esperar
+    # resultados -> doble-clic -> verificar): si algo se desincroniza, repetir
+    # solo el clic no arregla nada porque la lista sigue como estaba.
     ed = busq.child_window(class_name="THybridEdit", found_index=0)
-    r = ed.rectangle()
-    ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)    # Ed_Buscar
-    time.sleep(0.15)
-    ri.clear_field()
-    ri.type_text(codigo)
-    time.sleep(0.2)
-    ri.press("ENTER")                                            # ejecuta la búsqueda
+    grid = busq.child_window(class_name="TDBGrid")
+    for intento in range(1, 4):
+        if not fp._find_hwnd(fp.BUSQ_CLASS):
+            break                       # ya se cerró: la Ficha se cargó abajo
 
-    # ESPERAR a que la lista se posicione en el código (el usuario avisó de esto)
-    posicionado = _esperar_refresco(busq, codigo, timeout=6.0)
-    log.info("Lista posicionada en %s: %s", codigo, posicionado)
-
-    # Seleccionar la fila actual (la que quedó posicionada = el match). Enter la carga.
-    if fp._find_hwnd(fp.BUSQ_CLASS):
         _focus(hbusq)
-        ri.press("ENTER")
-        time.sleep(0.6)
+        r = ed.rectangle()
+        ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)    # Ed_Buscar
+        time.sleep(0.15)
+        ri.clear_field()
+        ri.type_text(codigo)
+        time.sleep(0.3)
+        # El campo refleja lo tecleado: si quedó vacío es que el clic o las
+        # teclas se perdieron (app ocupada, o una ventana topmost por delante),
+        # y seguir sería teclear al vacío y aceptar la fila 1 de la lista.
+        escrito = (ed.window_text() or "").strip()
+        if escrito != codigo.strip():
+            log.warning("Intento %d: el código no entró en el campo de búsqueda "
+                        "(quedó %r); reintento.", intento, escrito)
+            _esperar_desocupada(hbusq, timeout=15.0, que="la búsqueda")
+            continue
 
-    # Fallback: si sigue abierta, doble-clic en la fila posicionada (arriba del grid)
-    if fp._find_hwnd(fp.BUSQ_CLASS):
-        grid = busq.child_window(class_name="TDBGrid")
+        ri.press("ENTER")                                        # ejecuta la búsqueda
+        _esperar_desocupada(hbusq, que="el filtro de la búsqueda")
+
+        # ESPERAR A QUE LA LISTA ESTÉ FILTRADA antes de clicar. Sin esto se
+        # clica sobre la lista completa y se carga su fila 1 -> '00-002-024'.
+        if not _esperar_lista_filtrada(busq, timeout=60.0):
+            log.warning("Intento %d: la lista no llegó a filtrarse para %s.",
+                        intento, codigo)
+            continue
+
+        # CARGAR LA FILA con DOBLE-CLIC. Ya filtrada, la fila 1 ES el producto.
+        # El ENTER no sirve como acción principal: el foco está en el campo de
+        # búsqueda (hubo que clicarlo para teclear), así que un ENTER ahí
+        # relanza la búsqueda en vez de seleccionar. Por eso la lista mostraba
+        # el producto y aun así nunca se cargaba en la Ficha.
+        _al_frente(hbusq)
         gr = grid.rectangle()
-        ri.click(gr.left + 100, gr.top + 26, double=True)
-        time.sleep(0.6)
+        ri.click(gr.left + 100, gr.top + 26, double=True)        # fila 1 = el resultado
+
+        # Abrir la Ficha del producto también tarda: esperar de verdad.
+        t0 = time.time()
+        while time.time() - t0 < 20.0:
+            if _ficha_muestra(codigo) or fp._find_hwnd("TMessageForm"):
+                break
+            time.sleep(0.4)
+        if _ficha_muestra(codigo):
+            log.info("Producto cargado en la Ficha al intento %d.", intento)
+            break
+        log.warning("Intento %d: el doble-clic no cargó %s (edits=%s); "
+                    "repito la búsqueda entera.", intento, codigo, _ficha_edits())
 
     if fp._find_hwnd("TMessageForm"):
         _cerrar_residuales()
@@ -769,8 +889,22 @@ if __name__ == "__main__":
     iva = None          # None -> se resuelve por producto (exento o IVA_DEF)
     if "--iva" in _raw:
         iva = float(_raw[_raw.index("--iva") + 1])
-    res = set_precio_costo(codigo, nuevo_precio=target, nuevo_costo=costo,
-                            iva=iva, commit="--commit" in _raw)
-    print("\n=== RESULTADO ===")
-    for k, v in res.items():
-        print(f"  {k}: {v}")
+    try:
+        res = set_precio_costo(codigo, nuevo_precio=target, nuevo_costo=costo,
+                                iva=iva, commit="--commit" in _raw)
+        print("\n=== RESULTADO ===")
+        for k, v in res.items():
+            print(f"  {k}: {v}")
+    finally:
+        # Cierra la instancia AISLADA que ESTE proceso abrió, para no dejar
+        # ventanas de Hybrid acumuladas en corridas standalone (llegaron a
+        # verse 13 a la vez, y tantas ventanas de la misma clase desordenan el
+        # targeting: el input real acaba en la ventana equivocada). El listener
+        # (proceso largo que REUTILIZA una sola instancia entre pasadas) importa
+        # set_precio_costo directamente y NO pasa por este __main__, así que su
+        # reuso no se rompe. Mismo patrón que flujo_pedido_real/_directorio_real.
+        try:
+            import abrir_hybrid
+            abrir_hybrid.cerrar_aislada()
+        except Exception as e:
+            print(f"(aviso: no pude cerrar la instancia aislada de Hybrid: {e})")

@@ -39,6 +39,10 @@ Secuencia (registrar_compra, un solo documento de Compras):
   6. Verificación (solo commit) contra DBISAM por ítem: existencia esperada =
      existencia_antes + cantidad (read_db_existencia), costo/precio esperados
      via hybrid_price_writer._db_costo_usd / _db_precio_usd, tolerancia 0.01/0.02.
+     Estas lecturas van contra la unidad de red H:, que se cae de a ratos: si no
+     responde se reintenta (ver _leer_item_db) y, si aun así no hay forma, se
+     devuelve la etapa "verificacion_indisponible" — la compra YA está
+     registrada, solo no se pudo confirmar. NO es lo mismo que un fallo.
 
 ALTA DE PRODUCTO NUEVO (crear_producto): cuando un ítem de la compra trae
 es_nuevo=True, ANTES de cargarlo en la grilla de Compras hay que darlo de alta
@@ -94,6 +98,7 @@ import flujo_precio_real as fpr               # escribir_precio, _click_boton_di
 import flujo_stock_real as fsr                # _cerrar_ficha_si_abierta (modelo de apertura)
 import hybrid_price_writer as hpw             # _db_precio_usd, _db_costo_usd
 import read_db_existencia as dbex             # existencia() de verificación
+import colisiones                             # clave de búsqueda segura (código vs referencia)
 import realinput as ri
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -139,9 +144,50 @@ CANCELAR_REL = (175, 62)   # 3er botón (descarta el alta sin guardar)
 
 TOL_ALTA = 0.02   # misma tolerancia que TOL_COSTO_PRECIO, usada en la verificación de alta
 
+# Reintentos de LECTURA de la DBISAM en la verificación post-Totalizar. La
+# unidad H: es un share de red que se cae de a ratos y vuelve sola en menos de
+# un minuto (visto el 2026-08-13 con la compra 35: se cayó a mitad del bucle y
+# volvió 10 min después). Reintentar acá evita reportar como fallo una compra
+# que sí se registró.
+REINTENTOS_LECTURA_DB = 3
+ESPERA_LECTURA_DB = 20    # segundos entre reintentos
+
 
 class CompraError(Exception):
     pass
+
+
+class VerificacionIndisponible(Exception):
+    """La DBISAM no se pudo LEER para verificar (típicamente la unidad H: caída).
+
+    No es un fallo de la compra: cuando esto salta después de Totalizar, el
+    documento YA está registrado en HybridLite y lo único que falta es
+    confirmarlo. Se distingue del resto de errores justamente para que el
+    listener no lo trate como "pudo quedar a medias" ni lo reencole."""
+
+
+def _leer_item_db(codigo):
+    """(existencia, costo, precio) de un ítem en la DBISAM, con reintentos.
+
+    Las tres lecturas abren archivos en la unidad de red H:. Si el share se cae
+    a mitad del bucle de verificación, pydbisam levanta OSError
+    (FileNotFoundError) — un error de LECTURA, no de la compra. Se reintenta un
+    par de veces (la unidad suele volver sola) y, si aun así no hay forma, se
+    traduce a VerificacionIndisponible para que el llamador pueda decir "la
+    compra sí quedó, no la reencoles" en vez de propagar un error crudo
+    indistinguible de un fallo real."""
+    for intento in range(1, REINTENTOS_LECTURA_DB + 1):
+        try:
+            existencia, _ = dbex.existencia(codigo)
+            return existencia, hpw._db_costo_usd(codigo), hpw._db_precio_usd(codigo)
+        except OSError as e:
+            if intento == REINTENTOS_LECTURA_DB:
+                raise VerificacionIndisponible(
+                    f"la DBISAM no responde tras {REINTENTOS_LECTURA_DB} intentos ({e!r}); "
+                    f"probablemente se cayó la unidad H:") from e
+            log.warning("Lectura DB de %s falló (%r); reintento %s/%s en %ss.",
+                        codigo, e, intento + 1, REINTENTOS_LECTURA_DB, ESPERA_LECTURA_DB)
+            time.sleep(ESPERA_LECTURA_DB)
 
 
 # ── utilidades compartidas (mismo patrón que flujo_precio_real/flujo_stock_real) ──
@@ -486,11 +532,11 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False)
     time.sleep(0.8)
 
     try:
-        existencia_db, _ = dbex.existencia(codigo)
-    except Exception:
-        existencia_db = None
-    costo_db = hpw._db_costo_usd(codigo)
-    precio_db = hpw._db_precio_usd(codigo)
+        existencia_db, costo_db, precio_db = _leer_item_db(codigo)
+    except VerificacionIndisponible as e:
+        return {"ok": False, "etapa": "verificacion_indisponible",
+                "detalle": f"Alta de {codigo}: el Guardar ya se pulsó (el producto pudo quedar "
+                           f"creado) pero no se pudo confirmar contra la DBISAM: {e}."}
     log.info("Verificación DB del alta de %s: existencia=%s costo=%s precio=%s",
              codigo, existencia_db, costo_db, precio_db)
 
@@ -687,7 +733,8 @@ def seleccionar_proveedor(com, proveedor_codigo, proveedor_nombre=None):
 
 
 # ── ítems de la grilla ──────────────────────────────────────────────────────
-def cargar_item(codigo, cantidad, costo, precio, commit, es_primero=False):
+def cargar_item(codigo, cantidad, costo, precio, commit, es_primero=False,
+                clave_busqueda=None):
     """Teclea un ítem completo en la grilla de Compras (el foco ya está en la
     celda Código, sin clic previo, replicando la grabación):
         código -> ENTER (carga)
@@ -702,7 +749,15 @@ def cargar_item(codigo, cantidad, costo, precio, commit, es_primero=False):
     Costos y Precios, HybridLite deja el cursor en la celda Código del siguiente
     ítem automáticamente (confirmado por el dueño 2026-07-12), así que los ítems
     siguientes NO se re-enfocan ni se clickea celda alguna -- re-activar la
-    ventana perturbaría ese cursor auto-posicionado."""
+    ventana perturbaría ese cursor auto-posicionado.
+
+    `clave_busqueda`: string a TECLEAR para que la grilla cargue `codigo`. Puede
+    diferir del código cuando éste es la referencia de otro producto y teclearlo
+    cargaría ese otro (ver colisiones.py); lo calcula el pre-vuelo de
+    registrar_compra. `codigo` sigue siendo el producto REAL para todo lo demás
+    (IVA, verificación contra la DBISAM). None -> se teclea el código tal cual
+    (comportamiento previo, usado por el preview)."""
+    a_teclear = clave_busqueda or codigo
     hcom = fp._find_hwnd(COMPRAS_CLASS)
     if es_primero:
         _focus(hcom)
@@ -717,7 +772,10 @@ def cargar_item(codigo, cantidad, costo, precio, commit, es_primero=False):
         _confirmar_lo_que_pregunte(timeout=2)
         _focus(hcom)
 
-    ri.type_code(codigo)
+    if a_teclear != codigo:
+        log.info("Ítem %s: se teclea %r para esquivar la colisión código/referencia.",
+                 codigo, a_teclear)
+    ri.type_code(a_teclear)
     time.sleep(0.15)
     ri.press("ENTER")
     time.sleep(0.6)
@@ -957,6 +1015,11 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
       (clase/proveedor) | "carga_item" | "precio_item"
     etapas fallo AMBIGUAS: "totalizar" | "verificacion_db" | "alta_producto:guardar" |
       "alta_producto:verificacion_db"
+    etapa fallo NO AMBIGUA pero tampoco reintentable: "verificacion_indisponible"
+      -- la compra SÍ se totalizó y solo falló la LECTURA de la DBISAM para
+      confirmarla (unidad H: caída). Reencolar duplicaría el documento; hay que
+      revisar a mano. ("alta_producto:verificacion_indisponible" es su gemela en
+      el alta: el Guardar ya se pulsó y no se pudo confirmar.)
     REGLA DE ORO: ante CUALQUIER fallo antes de pulsar Totalizar -> Cancelar la
     compra completa + Salir de la ventana + devolver etapa pre-commit. La compra
     es TODO-O-NADA (un documento). El alta de productos nuevos (es_nuevo) corre
@@ -1025,6 +1088,37 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
                     "resultados": altas_resultado}
         log.info("Alta de %s (es_nuevo): %s", codigo, res_alta["detalle"])
 
+    # PRE-VUELO DE COLISIONES código<->referencia (ver colisiones.py). Va DESPUÉS
+    # de las altas (un producto es_nuevo recién creado ya está en el catálogo y
+    # también puede resultar interceptado) y ANTES de abrir Compras: si algún
+    # ítem no tiene clave segura se aborta acá, con la grilla sin tocar y la
+    # lista COMPLETA de lo que hay que corregir en el catálogo.
+    # Sin esto, la compra #43 (2026-08-22) cargó 3 ítems en el producto
+    # equivocado y lo descubrió recién tras Totalizar, cuando ya era permanente.
+    # En preview los ítems es_nuevo NO se cargan en la grilla (el alta se
+    # descartó, el producto no existe) -- se excluyen para que el pre-vuelo no
+    # los reporte como "no encontrados" cuando la ausencia es esperada.
+    codigos_a_revisar = [it["codigo"] for it in items
+                         if commit or not it.get("es_nuevo")]
+    try:
+        claves_busqueda, problemas = colisiones.revisar_lote(codigos_a_revisar)
+    except colisiones.CatalogoIlegible as e:
+        return {"ok": False, "etapa": "navegacion",
+                "detalle": f"No pude verificar colisiones código/referencia: {e}. "
+                           f"Nada se tocó (fail-closed).",
+                "resultados": altas_resultado}
+    if problemas:
+        detalle = " | ".join(f"{c}: {m}" for c, m in problemas.items())
+        log.error("Compra ABORTADA por colisión sin salida: %s", detalle)
+        return {"ok": False, "etapa": "navegacion",
+                "detalle": f"Compra CANCELADA antes de tocar nada: "
+                           f"{len(problemas)} ítem(s) sin clave de búsqueda segura. "
+                           f"{detalle}",
+                "resultados": altas_resultado}
+    for codigo, clave in claves_busqueda.items():
+        if clave != codigo:
+            log.warning("Ítem %s se tecleará como %r (colisión evitada).", codigo, clave)
+
     # existencia ANTES de cada ítem (para la verificación post-commit). Para
     # ítems es_nuevo en preview el producto no existe todavía -> existencia
     # ANTES no es legible (None), esperado y no bloqueante.
@@ -1065,7 +1159,8 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
             continue
         try:
             cargar_item(it["codigo"], it["cantidad"], it["costo"], it["precio"],
-                        commit, es_primero=primero)
+                        commit, es_primero=primero,
+                        clave_busqueda=claves_busqueda.get(it["codigo"]))
             primero = False
         except CompraError as e:
             etapa = "precio_item" if "precio" in str(e).lower() else "carga_item"
@@ -1111,9 +1206,16 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
         existencia_antes = existencias_antes.get(codigo)
         existencia_esperada = (existencia_antes + float(it["cantidad"])
                                if existencia_antes is not None else None)
-        existencia_despues, _ = dbex.existencia(codigo)
-        costo_despues = hpw._db_costo_usd(codigo)
-        precio_despues = hpw._db_precio_usd(codigo)
+        try:
+            existencia_despues, costo_despues, precio_despues = _leer_item_db(codigo)
+        except VerificacionIndisponible as e:
+            detalle = (f"Compra TOTALIZADA (doc={doc_numero}) con {len(items)} ítem(s), pero la "
+                       f"verificación quedó a medias en {codigo}: {e}. La compra YA ESTÁ "
+                       f"REGISTRADA en HybridLite — NO reencolar (sería una compra doble); "
+                       f"revisar existencias a mano y cerrar la solicitud.")
+            log.error("Verificación incompleta de la compra doc=%s: %s", doc_numero, detalle)
+            return {"ok": False, "etapa": "verificacion_indisponible",
+                    "detalle": detalle, "resultados": resultados}
 
         fallos = []
         if existencia_esperada is None:
@@ -1199,12 +1301,26 @@ if __name__ == "__main__":
         print(f"Error parseando --items: {e}")
         sys.exit(1)
 
-    res = registrar_compra(proveedor_codigo, items, doc_numero, commit="--commit" in _raw)
-    print("\n=== RESULTADO ===")
-    for k, v in res.items():
-        if k == "resultados":
-            print("  resultados:")
-            for codigo, r in v.items():
-                print(f"    {codigo}: {r}")
-        else:
-            print(f"  {k}: {v}")
+    try:
+        res = registrar_compra(proveedor_codigo, items, doc_numero, commit="--commit" in _raw)
+        print("\n=== RESULTADO ===")
+        for k, v in res.items():
+            if k == "resultados":
+                print("  resultados:")
+                for codigo, r in v.items():
+                    print(f"    {codigo}: {r}")
+            else:
+                print(f"  {k}: {v}")
+    finally:
+        # Cierra la instancia AISLADA que ESTE proceso abrió, para no dejar
+        # ventanas de Hybrid acumuladas en corridas standalone (llegaron a
+        # verse 13 a la vez, y tantas ventanas de la misma clase desordenan el
+        # targeting: el input real acaba en la ventana equivocada). El listener
+        # (proceso largo que REUTILIZA una sola instancia entre pasadas) importa
+        # registrar_compra directamente y NO pasa por este __main__, así que su
+        # reuso no se rompe. Mismo patrón que flujo_pedido_real/_directorio_real.
+        try:
+            import abrir_hybrid
+            abrir_hybrid.cerrar_aislada()
+        except Exception as e:
+            print(f"(aviso: no pude cerrar la instancia aislada de Hybrid: {e})")
