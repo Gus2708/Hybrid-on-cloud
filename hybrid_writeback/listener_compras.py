@@ -49,6 +49,10 @@ completo de cada punto):
     AMBIGUA ("totalizar", "verificacion_db", excepción) marca 'error' de
     inmediato sin reintentar: la compra pudo haber quedado registrada a
     medias en HybridLite y reencolarla arriesga una compra doble.
+    Caso aparte: "verificacion_indisponible" — la compra SÍ se totalizó y lo
+    único que falló fue leer la DBISAM para confirmarla (unidad H: caída a
+    mitad del bucle). Tampoco se reintenta, pero se marca 'error' con un
+    detalle que dice "ya registrada, NO reencolar" en vez del aviso ambiguo.
   * Al arrancar, recupera huérfanos: compras que quedaron en 'aplicando' por
     una corrida anterior interrumpida se marcan 'error' (mismo motivo: no se
     sabe si Totalizar llegó a aplicarse).
@@ -95,6 +99,16 @@ MAX_INTENTOS = 3
 ETAPAS_REINTENTABLES = ("abrir_hybrid", "navegacion", "carga_item", "precio_item",
                         "alta_producto:abrir_ficha", "alta_producto:campos",
                         "alta_producto:costos_precios")
+
+# Etapas donde lo que falló fue LEER la DBISAM para confirmar, no la escritura
+# (flujo_compra_real.VerificacionIndisponible: la unidad H: se cae de a ratos).
+# Tampoco se reintentan -- el documento ya está en HybridLite y reencolarlo
+# sería una compra doble -- pero su detalle ya dice exactamente eso, así que no
+# se le pega encima el "pudo quedar a medias" genérico, que manda a buscar un
+# desastre que no existe. Lección de la compra 35 (2026-08-13): quedó marcada
+# 'error' con un aviso alarmante cuando en realidad sus 9 ítems estaban perfectos.
+ETAPAS_VERIFICACION_ILEGIBLE = ("verificacion_indisponible",
+                                "alta_producto:verificacion_indisponible")
 
 
 def get_compras_pendientes():
@@ -192,7 +206,8 @@ def _politica_resultado(res, intentos):
     flujo_compra_real.registrar_compra a (backend_status, backend_resultado),
     misma política F5 de listener_writeback: commit real -> 'completado'; ok
     pero sin commit -> preview, sigue 'pendiente'; fallo en etapa reintentable
-    -> 'pendiente'/'error' según MAX_INTENTOS; fallo en etapa ambigua ->
+    -> 'pendiente'/'error' según MAX_INTENTOS; verificación ilegible ->
+    'error' con el aviso de que SÍ quedó registrada; fallo en etapa ambigua ->
     'error' inmediato."""
     if res["ok"] and lb.check_hybrid_write_enabled() and res.get("etapa") == "commit":
         return "completado", res["detalle"]
@@ -202,6 +217,8 @@ def _politica_resultado(res, intentos):
     if etapa in ETAPAS_REINTENTABLES:
         final = "error" if intentos >= MAX_INTENTOS else "pendiente"
         return final, res["detalle"]
+    if etapa in ETAPAS_VERIFICACION_ILEGIBLE:
+        return "error", res["detalle"]
     resultado = (f"{res['detalle']} | ATENCIÓN: la compra pudo quedar registrada a "
                  f"medias en HybridLite; verificar ANTES de reencolar (riesgo de "
                  f"compra doble).")
