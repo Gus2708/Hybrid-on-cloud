@@ -1,122 +1,206 @@
-# 🛠️ Backend Serrucho — Sistema de Sincronización y Writeback Inteligente
+# Hybrid-on-Cloud — Bidirectional Bridge Between a Legacy POS and the Cloud
 
-Bienvenido al núcleo del sistema de gestión de inventario y automatización para **Ferretería El Serrucho**. Este backend es la infraestructura crítica que conecta la base de datos local del POS de escritorio (**HybridLite / DBISAM 4**) con la nube (**Supabase**) en ambas direcciones (Sincronización de lectura + Writeback de escritura por automatización UI).
+Production backend that keeps a closed, 20-year-old Delphi/DBISAM point-of-sale
+system (**HybridLite**) in sync with a **Supabase/PostgreSQL** database — in both
+directions. It has been running unattended, 24/7, in a working hardware store
+since May 2026.
 
----
-
-## 🚀 Resumen de Funcionalidades
-
-1. **Write-back por Input Real de Hardware (`hybrid_writeback/`)**: Ejecuta operaciones solicitadas desde la App (El Serrucho Go) en una **instancia aislada de HybridLite** mediante simulación de eventos nativos Win32 (`SendInput`).
-2. **5 Listeners 24/7 Supervisados por Watchdog**:
-   - `listener_writeback.py`: Ajustes de stock por kardex en lote, actualización de precios en USD, costos y ficha.
-   - `listener_compras.py`: Recepción de mercancía y alta automática de productos nuevos en el catálogo.
-   - `listener_pedidos.py`: Carga de notas de entrega para cobro ultra-rápido en la caja registradora.
-   - `listener_directorio.py`: Alta de fichas de clientes y proveedores con código derivado/autoasignado.
-   - `zelle_listener.py`: Monitoreo en tiempo real de correos de Bank of America via Microsoft Graph API para alertas push instantáneas.
-3. **Control de Seguridad de Hardware (`safety_control.py`)**:
-   - Mutex global nativo Win32 (`Local\SerruchoBotMouseLock`) que evita colisión de mouse entre listeners.
-   - Banner visible superior (Topmost Window) avisando la ejecución en vivo.
-   - Hotkey de emergencia **F12** para abortar el proceso inmediatamente.
-   - Bloqueo de periféricos (`BlockInput`) en ejecución con privilegios.
-4. **Sincronización Incremental de Lectura (Sync-Espejo)**: Detección por hashing MD5 para subir facturas, productos, clientes y tasas a Supabase en lotes de 1,000 registros.
-5. **Supervisor 24/7 (`backend_watchdog.py`)**: Mantiene todos los procesos vivos continuamente en la PC de la oficina de la tienda.
-6. **Integración de Memoria Persistente (`Engram`)**: Registra la evolución técnica, parches y decisiones arquitectónicas en la base de datos de memoria persistente para agentes AI (`.engram/engram.db`).
+> **Read path:** DBISAM `.DAT` files → Python extractors → incremental diff →
+> Supabase.
+> **Write path:** cloud request queue → supervised UI automation → HybridLite.
 
 ---
 
-## 📁 Estructura del Proyecto
+## The interesting problem
+
+The POS stores its data in **DBISAM 4** tables and exposes no API. Its ODBC
+driver is a paid add-on that was not licensed, and the `.DAT` files are the live
+database of a business that is open for trade — patching them directly risks
+corrupting B-tree indexes, BLOB chains and checksums, and would silently destroy
+the accounting ledger.
+
+So the two directions needed different solutions:
+
+**Reading** was tractable: the DBISAM format could be parsed read-only from
+Python, streaming record by record so a 200 MB table never lands in RAM.
+
+**Writing** was not. With no supported write path, the only remaining interface
+was the application's own UI — but the usual automation route failed in a way
+that took a while to characterize: driving it with `pywinauto`'s synthetic input
+*appears* to work, yet the data-loading triggers quietly misbehave. The search
+dialog answers `"Database name is missing"` and the grid comes back empty. The
+approach that does work is emitting **real hardware-level input events through
+the Win32 `SendInput` API**, which the application cannot distinguish from a
+person typing — against an isolated second instance of the POS, behind a mutex
+so automation never fights the cashier for the mouse.
+
+Some of it is genuinely fiddly: price fields only accept the decimal separator
+from the **numeric keypad** (`VK_DECIMAL`), ignoring the same character sent as
+Unicode text.
+
+That constraint — *the database is untouchable, so the UI is the API* — shapes
+most of the design decisions below.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Store["Store PC (Windows, 24/7)"]
+        DAT[("DBISAM .DAT<br/>live POS data")]
+        MON["monitor.py<br/>file watcher"]
+        EXT["extractors<br/>streaming reader"]
+        SYNC["sync engines<br/>MD5 diff"]
+        WD["backend_watchdog.py<br/>process supervisor"]
+        LIS["5 listeners<br/>write-back queue"]
+        UI["SendInput engine<br/>isolated POS instance"]
+    end
+    SUPA[("Supabase<br/>PostgreSQL")]
+    APP["Mobile app<br/>El Serrucho Go"]
+
+    DAT --> MON --> EXT --> SYNC --> SUPA
+    SUPA --> LIS --> UI --> DAT
+    APP <--> SUPA
+    WD -.supervises.-> MON & LIS
+```
+
+### Read path — incremental mirror
+
+Extractors pull inventory, prices, stock, invoices, customers and suppliers out
+of the `.DAT` files. Each row is hashed (MD5); only rows whose hash changed are
+pushed, in batches of 1,000. A file watcher triggers extraction on change, with
+per-table debounce and cooldown so a burst of POS writes collapses into one sync.
+
+Sales are converted to USD using **the exchange rate stored on each individual
+invoice**, not today's rate — in a country with daily currency devaluation,
+re-converting historical sales at the current rate silently rewrites the past.
+
+### Write path — the UI *is* the API
+
+The mobile app writes a request row to Supabase. A listener claims it, drives the
+POS through the corresponding flow, then **verifies the result by reading the
+database back** before reporting success.
+
+| Listener | Responsibility |
+| :--- | :--- |
+| `listener_writeback.py` | Stock adjustments (as kardex documents), USD prices, costs |
+| `listener_compras.py` | Goods receipts, plus creating products that don't exist yet |
+| `listener_pedidos.py` | Delivery notes, pre-loaded so the register can charge in seconds |
+| `listener_directorio.py` | Customer and supplier records with derived codes |
+| `zelle_listener.py` | Bank payment notifications via Microsoft Graph, with anti-spoofing |
+
+---
+
+## Safety invariants
+
+Automating a UI to mutate live accounting data is the risky part of this system,
+so the constraints are explicit and deliberately conservative:
+
+1. **Never write `.DAT` directly.** Every mutation goes through the POS engine so
+   indexes, BLOBs and checksums stay consistent.
+2. **Stock changes are documents, not updates.** Stock is adjusted by posting a
+   count-adjustment document, which keeps the kardex auditable. There is no path
+   that overwrites a balance.
+3. **Ambiguous failures are never retried.** If a flow fails *after* the commit
+   keystroke, the system cannot know whether the document was posted. Retrying
+   could double a purchase or a stock delta, so the request is marked `error` for
+   a human instead. Failures in clearly pre-commit stages *are* retried.
+   The distinction is enforced in code, not by convention.
+4. **One hand on the mouse.** A named Win32 mutex (`Local\SerruchoBotMouseLock`)
+   serializes all automation. A top-most banner announces live execution and
+   **F12** aborts immediately.
+5. **Isolated instance.** Automation drives its own POS window, never the
+   cashier's session.
+6. **Time-boxed.** Writes are restricted to a configurable off-hours window.
+
+A dry-run mode (`HYBRID_WRITE_ENABLED=0`) navigates and fills every field but
+never commits, which is how flows are developed and regression-checked.
+
+---
+
+## Resilience
+
+The store's network drive and internet connection are both unreliable, so the
+system assumes failure rather than treating it as exceptional:
+
+- A supervisor process restarts any listener that dies or hangs, detected via
+  heartbeat files rather than liveness of the PID alone.
+- The sync cache is only updated **after** the server confirms the write, so a
+  connection dropped mid-batch re-sends instead of silently skipping rows.
+- Health checks against the network drive run with a timeout, because a
+  disconnected SMB share blocks indefinitely instead of failing.
+- A hung POS instance is detected and recovered before each flow.
+
+---
+
+## Layout
 
 ```text
-backend serrucho/
-├── backend_watchdog.py       # Supervisor 24/7 que relanza listeners caídos
-├── hybrid_writeback/         # Paquete Motor de Writeback UI
-│   ├── listener_writeback.py # Pipeline stock (kardex), precio, costo y ficha
-│   ├── listener_compras.py   # Pipeline recepción de compras + productos nuevos
-│   ├── listener_pedidos.py   # Pipeline notas de entrega para caja
-│   ├── listener_directorio.py# Pipeline alta de clientes y proveedores
-│   ├── flujo_stock_real.py   # Coreografía SendInput de stock (single y lote)
-│   ├── flujo_precio_real.py  # Coreografía SendInput de Ficha (precios/costos)
-│   ├── flujo_compra_real.py  # Coreografía SendInput de Compras
-│   ├── flujo_pedido_real.py  # Coreografía SendInput de Pedidos
-│   ├── flujo_directorio_real.py # Coreografía SendInput de Clientes/Proveedores
-│   ├── realinput.py          # Motor de input nativo Win32 (SendInput numpad)
-│   ├── abrir_hybrid.py       # Instancia aislada de HybridLite con login automático
-│   ├── safety_control.py     # Mutex Win32, Banner Topmost, F12 Hotkey, BlockInput
-│   └── README.md             # Documentación técnica detallada del paquete
-├── zelle_listener.py         # Polling MS Graph API OAuth2 de correos Bank of America
-├── app.py                    # Servidor Flask (API local y Orquestación)
-├── sync.py                   # Sincronización de inventario (DBISAM -> Supabase)
-├── sync_ventas.py            # Sincronización de ventas y facturas en USD
-├── sync_ajustes.py           # Sincronización espejo de movimientos locales
-├── extraer_ventas.py         # Extractor incremental de facturas desde .DAT
-├── actualizar_inventario.py   # Extractor de productos y precios (IVA 16% incl.)
-├── monitor.py                # Vigilante de cambios en archivos .DAT
-├── rates_service.py          # Scraper de tasas BCV y Binance P2P
-├── lock_util.py              # Gestión de bloqueos por PID
-├── widget.pyw                # Widget de escritorio estilo iOS para monitoreo
-├── config.py                 # Central de credenciales y variables de entorno
-└── tests/                    # Suite de pruebas unitarias (pytest)
+├── app.py                     # Flask API (product search, sync endpoints)
+├── backend_watchdog.py        # Supervisor: keeps every process alive
+├── monitor.py                 # .DAT file watcher with per-table debounce
+├── config.py                  # Central config, environment-driven
+│
+├── actualizar_inventario.py   # Inventory + price + stock extractor
+├── extraer_ventas.py          # Invoice extractor (filters voided documents)
+├── sync.py                    # Incremental inventory sync (MD5 diff)
+├── sync_ventas.py             # Sales sync, USD-converted per invoice
+├── sync_ajustes.py            # Adjustment sync
+├── rates_service.py           # BCV and Binance P2P exchange-rate scraper
+│
+├── hybrid_writeback/          # Write-back engine
+│   ├── realinput.py           # Win32 SendInput driver (real hardware events)
+│   ├── abrir_hybrid.py        # Isolated POS instance + automated login
+│   ├── safety_control.py      # Mutex, abort hotkey, live banner
+│   ├── flujo_*_real.py        # One choreography per operation
+│   ├── listener_*.py          # One queue consumer per operation
+│   └── diagnostico/           # Throwaway UI-inspection scripts
+│
+├── widget.pyw                 # Desktop status widget (system tray)
+├── plans/                     # Design notes written before each change
+└── tests/                     # pytest suite
 ```
 
 ---
 
-## 🛠️ Instalación y Configuración
+## Running it
 
-### 1. Requisitos Previos
-- Python 3.10+ (32-bit/64-bit compatible con `SendInput`).
-- HybridLite instalado localmente (`C:\HybridLiteEstacion` / datos en `H:\`).
-- Credenciales en Supabase (`SUPABASE_REST_URL`, `SUPABASE_SERVICE_KEY`).
-- Cliente [Engram](https://github.com/Gentleman-Programming/engram) instalado en el sistema.
+Requires Python 3.10+ on Windows, and a licensed HybridLite installation for the
+write-back path. The read path only needs access to the `.DAT` files.
 
-### 2. Configuración del Entorno (`.env`)
-```env
-SUPABASE_REST_URL=https://tu-proyecto.supabase.co
-SUPABASE_SERVICE_KEY=tu-service-role-key # Requerido para bypass RLS en colas writeback
-HYBRID_WRITE_ENABLED=1                    # Habilita escrituras reales (0 = PREVIEW)
-HYBRID_WRITE_WINDOW=19:00-07:00           # Ventana horaria de ejecución (fuera de tienda)
-```
-
----
-
-## 🖥️ Arquitectura de Ejecución 24/7
-
-### 1. Bucle Principal con Watchdog
-Para iniciar toda la infraestructura de la tienda:
 ```powershell
-python backend_watchdog.py
-```
-El watchdog arrancará y mantendrá en ejecución constante:
-* `listener_writeback.py`
-* `listener_compras.py`
-* `listener_pedidos.py`
-* `listener_directorio.py`
-* `zelle_listener.py`
-* `monitor.py`
+pip install -r requirements.txt
+copy .env.example .env          # then fill in your Supabase credentials
 
-### 2. Pruebas y Previsualización Manual (Modo Safe)
-Puedes probar cualquier listener individualmente en modo **PREVIEW** (navega y verifica en pantalla sin hacer commit):
-```powershell
-python hybrid_writeback/listener_writeback.py --once
+python sync.py once             # one-shot inventory sync
+python sync.py force            # full resync, ignoring the hash cache
+pytest                          # test suite
+
+python backend_watchdog.py      # start the full 24/7 stack
 ```
+
+Configuration is entirely environment-driven — see [.env.example](.env.example)
+for every supported variable. No credentials are committed to this repository.
 
 ---
 
-## 🛡️ Invariantes de Seguridad del Writeback (NUNCA romper)
+## Documentation
 
-1. **Nunca editar `.Dat` a mano**: DBISAM 4 requiere pasar por el motor de HybridLite para mantener checksums, BLOBs e índices B-tree consistentes.
-2. **Instancia Aislada**: Toda automatización corre sobre su propia ventana aislada (`abrir_hybrid.py`), nunca sobre la sesión de trabajo del empleado/cajero.
-3. **Etapas Ambiguas NO son Reintentables**: Si una orden de cambio falla *post-commit*, pasa inmediatamente a `error` para evitar duplicar deltas de stock.
-4. **Mutex de Periféricos**: Ningún script puede tocar el mouse/teclado sin obtener primero `Local\SerruchoBotMouseLock`.
+| Document | Contents |
+| :--- | :--- |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Sync engine internals and data flow |
+| [hybrid_writeback/README.md](hybrid_writeback/README.md) | Write-back engine, flow by flow |
+| [SECURITY-RLS.md](SECURITY-RLS.md) | Row-level security policies and hardening |
+| [API-SYNC-GUIDE.md](API-SYNC-GUIDE.md) | Local API endpoints |
+| [ZELLE-LISTENER.md](ZELLE-LISTENER.md) | Payment-notification listener and anti-spoofing |
+| [plans/](plans/) | Design notes written before each significant change |
 
----
-
-## 🧠 Integración con Engram Memory
-El backend utiliza **Engram** para guardar descubrimientos técnicos, calibraciones de formularios Delphi y soluciones a incidencias. Para buscar memorias relevantes del backend desde la terminal:
-```powershell
-engram search "writeback"
-engram search "hybrid"
-```
+Code comments and internal documents are in Spanish, the working language of the
+business this was built for.
 
 ---
 
-Desarrollado con ❤️ para **Ferretería El Serrucho** por ***GusDev***.
+## License
+
+MIT — see [LICENSE](LICENSE).
