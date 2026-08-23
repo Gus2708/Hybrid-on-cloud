@@ -61,7 +61,11 @@ MAIN = "TF_MainHybridCashMG"
 LOGIN = "TFUserPassMainForm"
 CONF = os.path.join(DIR, "hybrid_login.json")
 
-DEFAULTS = {"usuario": "SU", "clave": "SU"}
+# Credenciales de la instancia local de HybridLite. Se leen de hybrid_login.json
+# (fuera de git) o del entorno; el respaldo "SU/SU" es la credencial de fábrica
+# que trae el propio HybridLite, no un secreto de este despliegue.
+DEFAULTS = {"usuario": os.environ.get("HYBRID_USER", "SU"),
+            "clave": os.environ.get("HYBRID_PASS", "SU")}
 
 
 def _creds():

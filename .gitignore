@@ -1,20 +1,59 @@
+# ─── Entornos y artefactos de Python ─────────────────────────────────────────
 venv/
+.venv/
 *.pyc
 __pycache__/
+tests/.pytest_cache/
+.pytest_cache/
+
+# ─── Secretos y configuración local ──────────────────────────────────────────
+# Las credenciales viven solo aquí; la plantilla versionada es .env.example.
 .env
+.env.*
+!.env.example
+*.token
+*.pem
+
+# Todos los .json del proyecto son estado de runtime o credenciales
+# (hybrid_login.json, zelle_token_cache.json, *_cache.json, *_settings.json...).
+# Se ignoran en bloque a propósito: si algún día hace falta versionar uno,
+# agregarlo aquí con una negación explícita (!archivo.json) y revisar antes
+# que no lleve datos de la tienda ni tokens.
+*.json
+
+# ─── Datos de la tienda (NUNCA se versionan) ─────────────────────────────────
+# Los .dat son la base DBISAM viva del POS y los .csv son extractos con datos
+# reales de clientes, ventas y costos.
 *.csv
 *.dat
 *.Dat
-*.json
+MAESTRO_ACTUAL.csv
+
+# ─── Runtime: logs, locks y temporales ───────────────────────────────────────
 *.log
 *.log.1
 *.log.old
 *.lock
 *.tmp
 *.bak
+last_monitor.json
+*.state.json
+
+# ─── Artefactos de diagnóstico del write-back ────────────────────────────────
+# Capturas de pantalla, volcados de árboles de controles Win32 y snapshots
+# binarios de la DBISAM: se regeneran con los scripts de hybrid_writeback/
+# diagnostico/ y no aportan nada al repositorio.
+hybrid_writeback/*.png
+hybrid_writeback/*.bin
+hybrid_writeback/*.meta
+hybrid_writeback/calib_*.txt
+hybrid_writeback/dump_*.txt
+hybrid_writeback/inspeccion_*.txt
+scratch/
+
+# ─── Herramientas de agentes AI (no forman parte del proyecto) ───────────────
 .agents/
 .gemini/
-tests/.pytest_cache/
-# Junctions hacia .agents/ (ya ignorado); committearlos duplicaría su contenido
+.engram/
 .claude/skills/
 skills/improve/

@@ -136,9 +136,12 @@ def check_waha() -> dict:
     """Verifica el estado de la sesión default en WAHA.
     Retorna {'ok': bool, 'status': str, 'detail': str}.
     """
-    env_path = r"C:\Proyect\whatsapp-agent\.env"
-    api_key = ""
-    if os.path.exists(env_path):
+    # La clave sale del entorno o del .env del agente de WhatsApp (fuera de este
+    # repo). Sin clave no se inventa ninguna: se reporta como no configurado,
+    # que es la señal correcta para el widget.
+    api_key = os.environ.get("WAHA_API_KEY", "")
+    env_path = os.environ.get("WAHA_ENV_PATH", r"C:\Proyect\whatsapp-agent\.env")
+    if not api_key and os.path.exists(env_path):
         try:
             with open(env_path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -150,7 +153,8 @@ def check_waha() -> dict:
             pass
 
     if not api_key:
-        api_key = "REDACTED-API-KEY"
+        return {"ok": False, "status": "NO_CONFIGURADO",
+                "detail": "WAHA_API_KEY no configurada (ver .env.example)"}
 
     url = "http://localhost:3000/api/sessions/default"
     headers = {

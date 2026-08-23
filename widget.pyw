@@ -25,17 +25,15 @@ except ImportError:
     HAS_TRAY = False
 
 # --- Configuración ---
-# Se intenta leer de config.py (que a su vez lee .env) para no desincronizar
-# el widget si se rota la anon key. Si config.py falla o deja valores vacíos,
-# se cae a los valores hardcodeados como respaldo (el widget nunca debe morir
-# por esto: es la cara visible del sistema).
+# Las credenciales salen de config.py (que a su vez lee .env). Si faltan, el
+# widget arranca igual pero sin consultar la nube: es la cara visible del
+# sistema y no debe morir por un .env incompleto. El bucle de actualización ya
+# trata ese fallo como "Sin conexión", así que degradar a cadenas vacías
+# equivale a estar sin internet. Ver .env.example.
 try:
     from config import SUPABASE_REST_URL, SUPABASE_ANON_KEY
-    if not SUPABASE_REST_URL or not SUPABASE_ANON_KEY:
-        raise ValueError("config.py devolvió valores vacíos")
 except Exception:
-    SUPABASE_REST_URL = "https://YOUR-PROJECT-REF.supabase.co"
-    SUPABASE_ANON_KEY = "REDACTED-JWT"
+    SUPABASE_REST_URL = SUPABASE_ANON_KEY = ""
 
 HYBRID_PATHS = [
     r'H:\HybridLite\HybridEmpresa\HybridDataBase\TInventario.dat',
