@@ -36,13 +36,18 @@ except ImportError:
 _MAX_RETRIES = 3
 _RETRY_DELAY = 2  # segundos
 
-# Encabezados para comunicación REST con Supabase (mismo patrón que sync_ajustes.py)
-HEADERS = {
-    "apikey": SUPABASE_ANON_KEY,
-    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "resolution=merge-duplicates",
-}
+# Encabezados para comunicación REST con Supabase (mismo patrón que sync_ajustes.py):
+# la service key si está configurada, si no la anon key.
+try:
+    from supabase_rest import build_write_headers
+    HEADERS = build_write_headers(extra_prefer="resolution=merge-duplicates")
+except Exception:
+    HEADERS = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",
+    }
 # ==========================================
 
 logging.basicConfig(

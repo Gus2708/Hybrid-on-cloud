@@ -5,12 +5,21 @@ import urllib.request
 import urllib.error
 from config import SUPABASE_REST_URL, SUPABASE_ANON_KEY
 
-HEADERS = {
-    "apikey": SUPABASE_ANON_KEY,
-    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "resolution=merge-duplicates",
-}
+# HEADERS de escritura: usa SUPABASE_SERVICE_KEY si está configurada (vía
+# build_write_headers en supabase_rest.py), si no cae a la anon key. Escribe en
+# clientes/ventas/ventas_detalle, que sql/harden_rls.sql restringe a
+# service_role: con la anon key sola los upserts fallarían por RLS.
+# try/except porque este script debe seguir funcionando aunque falle el import.
+try:
+    from supabase_rest import build_write_headers
+    HEADERS = build_write_headers(extra_prefer="resolution=merge-duplicates")
+except Exception:
+    HEADERS = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",
+    }
 
 def upsert_batch(table: str, on_conflict: str, payload: list) -> bool:
     if not payload:

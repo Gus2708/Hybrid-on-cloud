@@ -13,13 +13,20 @@ except ImportError:
     SUPABASE_REST_URL = ""
     SUPABASE_ANON_KEY = ""
 
-# Encabezados para comunicación REST con Supabase
-HEADERS = {
-    "apikey": SUPABASE_ANON_KEY,
-    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "return=minimal"
-}
+# Encabezados para comunicación REST con Supabase. Usa SUPABASE_SERVICE_KEY si
+# está configurada (mismo patrón que sync_ventas.py y remote_listener.py), para
+# que las escrituras sigan funcionando si se endurecen las políticas RLS.
+# try/except: debe seguir funcionando aunque falte el helper.
+try:
+    from supabase_rest import build_write_headers
+    HEADERS = build_write_headers(extra_prefer="return=minimal")
+except Exception:
+    HEADERS = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
 
 def decode_dbisam_time(ms_value):
     """Decodifica milisegundos desde medianoche a formato HH:MM:SS"""
