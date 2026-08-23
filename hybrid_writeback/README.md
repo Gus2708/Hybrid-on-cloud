@@ -390,8 +390,11 @@ ejecutó ni se cableó. Retomarla el día que se agregue edición de precio en l
    `backend_resultado` por item (chip de estado), reencolado manual de items en
    `error` (con advertencia de verificación previa), realtime opcional. Ver
    `el-serrucho-go/docs/WRITEBACK-PIPELINE.md`.
-3. **Limpieza** de scripts de diagnóstico (`diag_*`, `shot_*`, `dbg_*`, `*.png`,
-   enfoques ODBC/pywinauto abandonados, incluido `hybrid_ui.py`).
+3. **Limpieza** de los enfoques abandonados que siguen versionados
+   (`hybrid_ui.py`, `odbc_*.py`, `dbisam_write.py`): se conservan como registro
+   de lo que se probó y por qué no sirvió, pero no deben confundirse con código
+   de producción. Los artefactos generados (`*.png`, `calib_*`, `dump_*`,
+   snapshots `.bin`) ya salieron del repositorio y hoy los cubre `.gitignore`.
 4. **Integración al watchdog**: decidir si `listener_writeback.py` entra a
    `backend_watchdog.py` (con `HYBRID_WRITE_ENABLED=1` + `HYBRID_WRITE_WINDOW` de
    producción) una vez validado el end-to-end.

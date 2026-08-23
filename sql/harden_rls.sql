@@ -15,7 +15,7 @@
 -- key, las políticas lo rechazarán, y la sincronización (sync.py,
 -- sync_ventas.py, remote_listener.py, rates_service.py) DEJARÁ DE
 -- ESCRIBIR en Supabase silenciosamente hasta que se complete la
--- migración. Ver SECURITY-RLS.md para el procedimiento paso a paso.
+-- migración. Ver docs/SECURITY-RLS.md para el procedimiento paso a paso.
 -- =============================================================
 
 -- Ejecutar en: Supabase → SQL Editor

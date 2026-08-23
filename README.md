@@ -189,11 +189,11 @@ for every supported variable. No credentials are committed to this repository.
 
 | Document | Contents |
 | :--- | :--- |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Sync engine internals and data flow |
+| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Sync engine internals and data flow |
 | [hybrid_writeback/README.md](hybrid_writeback/README.md) | Write-back engine, flow by flow |
-| [SECURITY-RLS.md](SECURITY-RLS.md) | Row-level security policies and hardening |
-| [API-SYNC-GUIDE.md](API-SYNC-GUIDE.md) | Local API endpoints |
-| [ZELLE-LISTENER.md](ZELLE-LISTENER.md) | Payment-notification listener and anti-spoofing |
+| [SECURITY-RLS.md](docs/SECURITY-RLS.md) | Row-level security policies and hardening |
+| [API-SYNC-GUIDE.md](docs/API-SYNC-GUIDE.md) | Local API endpoints |
+| [ZELLE-LISTENER.md](docs/ZELLE-LISTENER.md) | Payment-notification listener and anti-spoofing |
 | [plans/](plans/) | Design notes written before each significant change |
 
 Code comments and internal documents are in Spanish, the working language of the
