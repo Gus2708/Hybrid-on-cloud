@@ -22,6 +22,48 @@
 -- Este script es idempotente: se puede correr varias veces sin error.
 
 -- =============================================================
+-- 0. Barrido de policies de escritura preexistentes
+--
+-- Las policies RLS son PERMISIVAS: se combinan con OR. Basta con que
+-- sobreviva una sola que le dé escritura a anon para que todo el
+-- endurecimiento de abajo no sirva de nada.
+--
+-- La primera versión de este script borraba por nombre ("Escritura anon
+-- productos"), pero las policies reales del proyecto se llamaban distinto
+-- ("Sync Engine - write productos", "Active employees - write productos",
+-- "clientes_anon_update", "Allow anon - all tazas"...). El script corría sin
+-- error y dejaba anon escribiendo igual — un falso OK peligroso.
+--
+-- Por eso ahora se barre por ROL y no por nombre: se elimina toda policy de
+-- escritura sobre estas tablas que no sea exclusiva de service_role, salvo
+-- las dos excepciones que las apps necesitan y que se recrean más abajo.
+-- Los SELECT no se tocan: la lectura sigue siendo pública a propósito.
+-- =============================================================
+DO $$
+DECLARE
+    p RECORD;
+    n INT := 0;
+BEGIN
+    FOR p IN
+        SELECT tablename, policyname, cmd, roles
+        FROM pg_policies
+        WHERE schemaname = 'public'
+          AND tablename IN ('productos', 'ventas', 'ventas_detalle',
+                            'clientes', 'tazas', 'comandos_remotos')
+          AND cmd <> 'SELECT'
+          AND roles <> '{service_role}'::name[]
+          AND policyname NOT IN ('Insercion anon comandos_remotos',
+                                 'App marca error_local comandos_remotos')
+    LOOP
+        EXECUTE format('DROP POLICY %I ON public.%I', p.policyname, p.tablename);
+        RAISE NOTICE 'Eliminada: "%" (% sobre %) roles=%',
+                     p.policyname, p.cmd, p.tablename, p.roles;
+        n := n + 1;
+    END LOOP;
+    RAISE NOTICE '--- Policies de escritura eliminadas: % ---', n;
+END $$;
+
+-- =============================================================
 -- 1. productos
 -- =============================================================
 ALTER TABLE public.productos ENABLE ROW LEVEL SECURITY;
@@ -189,10 +231,29 @@ REVOKE UPDATE ON public.comandos_remotos FROM anon, authenticated;
 GRANT  UPDATE (status) ON public.comandos_remotos TO anon, authenticated;
 
 -- =============================================================
--- 7. Verificación: listar todas las policies resultantes
+-- 7. Verificación
+--
+-- No alcanza con listar las policies y mirarlas a ojo: así fue como la
+-- primera versión pasó por buena dejando anon con escritura. Esta consulta
+-- clasifica cada policy de escritura y marca las que son un problema.
+--
+-- Resultado esperado: solo filas 'OK'. Las dos únicas policies de escritura
+-- que no son de service_role deben ser las excepciones de comandos_remotos
+-- (INSERT público y el UPDATE acotado a 'error_local').
 -- =============================================================
-SELECT schemaname, tablename, policyname, cmd, roles
+SELECT
+    tablename,
+    policyname,
+    cmd,
+    roles,
+    CASE
+        WHEN roles = '{service_role}'::name[] THEN 'OK - backend'
+        WHEN policyname = 'Insercion anon comandos_remotos' THEN 'OK - la app encola comandos'
+        WHEN policyname = 'App marca error_local comandos_remotos' THEN 'OK - excepcion acotada'
+        ELSE '*** REVISAR: da escritura fuera de service_role ***'
+    END AS veredicto
 FROM pg_policies
 WHERE schemaname = 'public'
   AND tablename IN ('productos', 'ventas', 'ventas_detalle', 'clientes', 'tazas', 'comandos_remotos')
-ORDER BY tablename, cmd;
+  AND cmd <> 'SELECT'
+ORDER BY (roles = '{service_role}'::name[]), tablename, cmd;
