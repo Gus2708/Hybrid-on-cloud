@@ -131,8 +131,9 @@ CREATE POLICY "Escritura service_role tazas"
 -- 6. comandos_remotos (caso especial)
 -- anon conserva SELECT (el listener local lee comandos pendientes)
 -- e INSERT (las apps externas crean comandos remotos con anon).
--- UPDATE/DELETE quedan restringidos a service_role (el listener local
--- actualiza el status del comando con la service key).
+-- DELETE queda restringido a service_role, y UPDATE también salvo la
+-- excepción acotada del final: la app necesita poder marcar 'error_local'
+-- un comando colgado, y solo eso.
 -- =============================================================
 ALTER TABLE public.comandos_remotos ENABLE ROW LEVEL SECURITY;
 
@@ -165,6 +166,27 @@ CREATE POLICY "Borrado service_role comandos_remotos"
     FOR DELETE
     TO service_role
     USING (true);
+
+-- Excepción necesaria: El Serrucho Go marca como 'error_local' un comando que
+-- quedó colgado (src/hooks/useSyncStatus.ts). Con solo la policy de UPDATE
+-- restringida a service_role, esa función de la app dejaría de operar en
+-- silencio. Se permite el UPDATE desde la app pero acotado por dos lados:
+--   * WITH CHECK: la fila resultante SOLO puede quedar en 'error_local', así
+--     que no se puede usar para marcar un comando como 'completado'.
+--   * GRANT por columna (más abajo): solo se puede tocar la columna 'status'.
+DROP POLICY IF EXISTS "App marca error_local comandos_remotos" ON public.comandos_remotos;
+CREATE POLICY "App marca error_local comandos_remotos"
+    ON public.comandos_remotos
+    FOR UPDATE
+    TO anon, authenticated
+    USING (true)
+    WITH CHECK (status = 'error_local');
+
+-- Limita a nivel de privilegio qué columnas puede modificar la app. Sin esto,
+-- la policy de arriba dejaría cambiar cualquier columna mientras el status
+-- final fuera 'error_local'.
+REVOKE UPDATE ON public.comandos_remotos FROM anon, authenticated;
+GRANT  UPDATE (status) ON public.comandos_remotos TO anon, authenticated;
 
 -- =============================================================
 -- 7. Verificación: listar todas las policies resultantes

@@ -66,8 +66,18 @@ Recién ahora, con el backend ya reiniciado y probado con la service key:
    - `SELECT` sigue disponible para todos (anon incluido) en las 6 tablas.
    - `INSERT/UPDATE/DELETE` en `productos`, `ventas`, `ventas_detalle`,
      `clientes`, `tazas` quedaron restringidos a `service_role`.
-   - En `comandos_remotos`: `SELECT` e `INSERT` públicos, `UPDATE`/`DELETE`
-     restringidos a `service_role`.
+   - En `comandos_remotos`: `SELECT` e `INSERT` públicos, `DELETE` restringido a
+     `service_role`, y **dos** policies de `UPDATE` (ver nota abajo).
+
+> **Por qué `comandos_remotos` conserva un `UPDATE` para la app.**
+> El Serrucho Go marca como `error_local` un comando de sync que quedó colgado
+> (`src/hooks/useSyncStatus.ts`). Si el `UPDATE` quedara solo en `service_role`,
+> esa función de la app dejaría de operar **en silencio**: PostgREST responde
+> 204 afectando cero filas, sin error visible. Por eso el script deja una policy
+> acotada — `WITH CHECK (status = 'error_local')` para que no se pueda marcar un
+> comando como `completado`, más un `GRANT UPDATE (status)` por columna para que
+> no se pueda tocar nada más. Al revisar la salida de verificación, esa segunda
+> policy de `UPDATE` es esperada, no un resto de la configuración vieja.
 
 ### 5. Volver a probar sync y el widget
 
@@ -79,6 +89,14 @@ python test_conexion.py
 Y revisar que el widget de escritorio (`widget.pyw`) siga mostrando estado
 normal (bandeja del sistema, sin errores de conexión). Si el sync o el widget
 muestran errores 401/403 después de este paso, ver la sección de rollback abajo.
+
+Del lado de las apps que consumen Supabase, comprobar además que:
+
+- **El Serrucho Go** sigue leyendo catálogo, tasas y ventas (solo lee esas
+  tablas; sus escrituras van a colas — `ordenes_cambio`, `compras_app`,
+  `pedidos_app`, `presupuestos` — que este script no toca).
+- **whatsapp-agent** sigue respondiendo precios y existencias por WhatsApp
+  (consulta `productos` y `tazas` en modo lectura).
 
 ## Cómo revertir (rollback)
 
