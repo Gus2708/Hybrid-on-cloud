@@ -81,7 +81,7 @@ flowchart TB
 | :--- | :--- | :--- |
 | **Hybrid-on-Cloud** (this one) | The only component that touches the POS. Mirrors it to Supabase and applies changes back. | Owns the read and write paths. |
 | [**el-serrucho-go**](https://github.com/Gus2708/el-serrucho-go) | Mobile app (React Native + Expo) the staff uses on the floor: catalog, price/stock edits, goods receipts, delivery notes, quotes. | **Reads** `productos`, `clientes`, `tazas`, sales views. **Never writes them** — it enqueues into `ordenes_cambio`, `compras_app`, `pedidos_app`, `registro_clientes_app`, which the listeners here consume and replay into the POS. |
-| [**whatsapp-agent**](https://github.com/Gus2708/whatsapp-agent) | "Perucho", an AI agent answering customers on WhatsApp over 5,000+ SKUs: live stock, prices, quotes, voice notes. | **Read-only** consumer of `productos` and `tazas` — the catalog this backend keeps fresh. Runs on WAHA (Docker, port 3000); this backend health-checks that container and surfaces it in the desktop widget. |
+| [**whatsapp-agent**](https://github.com/Gus2708/whatsapp-agent) | "Perucho", an AI agent answering customers on WhatsApp over 7,650 SKUs: live stock, prices, quotes, voice notes. | **Read-only** consumer of `productos` and `tazas` — the catalog this backend keeps fresh. Runs on WAHA (Docker, port 3000); this backend health-checks that container and surfaces it in the desktop widget. |
 
 The important property: the mobile app never writes to the catalog tables. It
 writes *intent* to a queue, and the write-back listeners turn intent into real
