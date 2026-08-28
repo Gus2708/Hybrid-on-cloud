@@ -57,3 +57,13 @@ scratch/
 .engram/
 .claude/
 skills/
+
+# --- Artefactos de compilacion (Nuitka / Inno Setup) -------------------------
+# Los genera scripts/build_nuitka.py e installer.iss. Sumaban 737 MB sin ignorar.
+build_nuitka/
+dist/
+*.dist/
+*.build/
+installer/
+*.exe
+Instalador_*.exe
