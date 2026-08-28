@@ -5,6 +5,7 @@ from sync import get_row_hash, _load_csv, sync_incremental
 
 def test_get_row_hash():
     row1 = {
+        "codigo_interno": "1",
         "descripcion": "TEST",
         "costo": 10.0,
         "precio_venta": 20.0,
@@ -34,10 +35,10 @@ def test_sync_incremental_no_changes(mocker):
     # Mocking external calls
     mocker.patch("sync.run_hybrid_exporter", return_value=True)
     mocker.patch("sync._load_csv", return_value=[{"codigo_interno": "1", "descripcion": "P1", "costo": 1, "precio_venta": 2, "existencia": 3, "codigo_barras": "B1", "unidad": "U1"}])
-    mocker.patch("os.path.exists", side_effect=lambda x: True if "sync_cache.json" in x else False)
+    mocker.patch("os.path.exists", side_effect=lambda x: True if "sync_cache.json" in str(x) else False)
     
     # Mock cache file content
-    h = get_row_hash({"descripcion": "P1", "costo": 1, "precio_venta": 2, "existencia": 3, "codigo_barras": "B1", "unidad": "U1"})
+    h = get_row_hash({"codigo_interno": "1", "descripcion": "P1", "costo": 1, "precio_venta": 2, "existencia": 3, "codigo_barras": "B1", "unidad": "U1"})
     mocker.patch("builtins.open", mocker.mock_open(read_data=json.dumps({"1": h})))
     
     # Mock Supabase calls

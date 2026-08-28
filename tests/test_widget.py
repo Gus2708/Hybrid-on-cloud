@@ -10,7 +10,11 @@ sys.modules['PIL'] = MagicMock()
 sys.modules['PIL.Image'] = MagicMock()
 sys.modules['PIL.ImageTk'] = MagicMock()
 
-from widget import SerruchoWidget
+import socket
+socket.socket = MagicMock() # Evitar que aborte por lock_socket
+
+import config
+from widget import HybridCloudWidget
 
 @pytest.fixture
 def root():
@@ -21,21 +25,27 @@ def root():
     except: pass
 
 def test_widget_init(root):
-    app = SerruchoWidget(root)
-    assert root.title() == "El Serrucho Monitor"
-    assert app.status_text.cget("text") == "Desconectado"
+    app = HybridCloudWidget(root)
+    assert root.title() == f"{config.SAAS_NAME} - {config.BUSINESS_NAME}"
+    # Validar que existe el canvas
+    assert app.canvas is not None
 
-def test_widget_update_status_mocked(root, mocker):
-    # Mocking the urllib request
-    mock_resp = MagicMock()
-    mock_resp.read.return_value = b'{"last_sync": "2026-05-03 12:00", "status": "ok"}'
-    mock_resp.__enter__.return_value = mock_resp
-    mocker.patch("urllib.request.urlopen", return_value=mock_resp)
+def test_widget_ui_sync_state(root):
+    app = HybridCloudWidget(root)
     
-    app = SerruchoWidget(root)
+    # Test state: Syncing
+    app.is_syncing = True
+    app.update_ui()
+    # En tcl/tk, cget("text") en canvas itemconfig no funciona igual, se debe usar itemcget
+    status_text = app.canvas.itemcget(app.status_label, "text")
+    assert status_text == "Sincronizando..."
+
+def test_widget_ui_offline_state(root):
+    app = HybridCloudWidget(root)
     
-    # We need to wait for the thread to finish or mock the thread
-    # For simplicity, we can test the update_status call if we mock the threading
-    mock_thread = mocker.patch("threading.Thread")
-    app.update_status()
-    assert mock_thread.called
+    # Test state: Offline
+    app.is_syncing = False
+    app.is_online = False
+    app.update_ui()
+    status_text = app.canvas.itemcget(app.status_label, "text")
+    assert status_text == "Sin Conexión"

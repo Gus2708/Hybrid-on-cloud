@@ -1,177 +1,456 @@
-from flask import Flask, jsonify, request
+"""
+app.py — API REST para Hybrid on Cloud.
+
+Endpoints:
+    GET /health                         -> Estado del servidor
+    GET /api/v1/buscar?q=<texto>        -> Búsqueda de productos
+    GET /api/v1/tasa                    -> Tasa USD/Bs actual
+    GET /api/v1/producto/<codigo>       -> Detalle de un producto por código
+
+Parámetros de /buscar:
+    q        Texto a buscar (requerido)
+    limit    Máximo de resultados (default: 50, max: 200)
+    offset   Desplazamiento para paginación (default: 0)
+    stock    Si stock=1, devuelve solo productos con existencia > 0
+"""
+from flask import Flask, request, jsonify
 import os
-import subprocess
-import sys
+import csv
+import unicodedata
+import re
 import time
+import subprocess
 import json
-import threading
-from datetime import datetime
-from flask_cors import CORS
+from typing import List, Dict
+
+from config import (
+    SAAS_NAME,
+    BUSINESS_NAME,
+    TASA_BS_DEFAULT, 
+    CSV_SOURCE_PATH,
+    RUTA_INVENTARIO,
+    RUTA_PRECIOS,
+    RUTA_EXISTENCIA,
+    RUTA_VENTAS,
+    RUTA_VENTAS_DETALLE,
+    RUTA_CLIENTES
+)
+from rates_service import RatesService
+from logger import logger
 
 app = Flask(__name__)
-CORS(app)
 
-# --- Configuración y Estado ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CSV_SOURCE_PATH = os.path.join(BASE_DIR, "MAESTRO_ACTUAL.csv")
+# ─── Protocolo V22: Normalización de búsqueda ────────────────────────────────
+# Stop words en español para inventario de ferretería
+STOP_WORDS = {
+    "DE", "DEL", "LA", "EL", "PARA", "CON", "Y", "EN", "X",
+    "UN", "UNA", "LAS", "LOS", "POR", "AL", "A", "O", "E",
+    "SU", "SE", "SI", "NO", "NI", "QUE", "ES", "SON", "MAS",
+}
 
-_LOCAL_CACHE = []
-_LAST_LOAD_TIME = 0
+# Prefijos de unidades de medida que se suelen escribir pegados (ej: 1/2", 3/4")
+_RE_FRACTION = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+# Separadores (espacios, guiones, comas)
+_RE_SPLIT = re.compile(r"[\s\-,]+")
+
+
+def remove_accents(s: str) -> str:
+    """Elimina tildes y diacríticos."""
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+
+
+def normalize_query(text: str) -> str:
+    """
+    Normalización V22:
+    1. Mayúsculas
+    2. Eliminar acentos
+    3. Eliminar stop words
+    4. Normalizar fracciones: '1 / 2' -> '1/2'
+    5. Singularizar (quitar 'S' final en palabras >3 chars)
+    Devuelve string con tokens separados por espacio.
+    """
+    if not text:
+        return ""
+    s = text.upper()
+    s = remove_accents(s)
+    # Normalizar fracciones con espacios -> sin espacios
+    s = _RE_FRACTION.sub(r"\1/\2", s)
+    # Separar tokens
+    tokens = [t for t in _RE_SPLIT.split(s) if t and t not in STOP_WORDS]
+    # Singularizar: quitar S final en palabras de >3 chars (no números, no fracciones)
+    result = []
+    for w in tokens:
+        if len(w) > 3 and w.endswith("S") and not w[-2:].isdigit():
+            w = w[:-1]
+        result.append(w)
+    return " ".join(result)
+
+
+# ─── Cache local del CSV ──────────────────────────────────────────────────────
+_CSV_PATH = CSV_SOURCE_PATH
+_LOCAL_CACHE: List[Dict] = []
+_CACHE_MTIME: float = 0.0
+
 
 def _load_inventory_if_needed():
-    global _LOCAL_CACHE, _LAST_LOAD_TIME
-    if not os.path.exists(CSV_SOURCE_PATH):
-        _LOCAL_CACHE = []
-        return
-    
-    mtime = os.path.getmtime(CSV_SOURCE_PATH)
-    if mtime > _LAST_LOAD_TIME:
-        try:
-            import csv
-            with open(CSV_SOURCE_PATH, mode='r', encoding='utf-8-sig') as f:
-                reader = csv.DictReader(f)
-                _LOCAL_CACHE = list(reader)
-                _LAST_LOAD_TIME = mtime
-        except Exception as e:
-            print(f"Error cargando inventario: {e}")
-
-def _enrich(item):
+    """Recarga el CSV si el archivo fue modificado desde la última carga."""
+    global _LOCAL_CACHE, _CACHE_MTIME
     try:
-        costo = float(item.get("COSTO", 0) or 0)
-        precio = float(item.get("PRECIO_VENTA", 0) or 0)
-        item["costo"] = costo
-        item["precio_venta"] = precio
-        item["existencia"] = float(item.get("EXISTENCIA", 0) or 0)
-        item["codigo_interno"] = item.get("CODIGO_INTERNO", "")
-        item["descripcion"] = item.get("DESCRIPCION", "")
-        item["codigo_barras"] = item.get("CODIGO_BARRAS", "")
-        item["unidad"] = item.get("UNIDAD", "")
-    except: pass
-    return item
+        mtime = os.path.getmtime(_CSV_PATH)
+    except OSError:
+        return
 
-@app.route("/", methods=["GET"])
-def index():
+    if mtime <= _CACHE_MTIME and _LOCAL_CACHE:
+        return  # No cambió
+
+    items = []
+    try:
+        with open(_CSV_PATH, "r", encoding="utf-8-sig", errors="ignore") as f:
+            reader = csv.reader(f)
+            next(reader, None)  # Skip header
+            for row in reader:
+                if not row or len(row) < 7:
+                    continue
+                code = (row[0] or "").strip()
+                if not code or not code[0].isdigit():
+                    continue
+                desc = (row[1] or "").strip().strip('"').upper()
+                unidad = (row[2] or "").strip()
+                barcode = (row[3] or "").strip()
+                try:
+                    costo = float(row[4]) if row[4].strip() else 0.0
+                except ValueError:
+                    costo = 0.0
+                try:
+                    precio_usd = float(row[5]) if row[5].strip() else 0.0
+                except ValueError:
+                    precio_usd = 0.0
+                try:
+                    existencia = float(row[6]) if row[6].strip() else 0.0
+                except ValueError:
+                    existencia = 0.0
+
+                items.append({
+                    "codigo_interno": code,
+                    "descripcion":    desc,
+                    "unidad":         unidad,
+                    "codigo_barras":  barcode,
+                    "costo":          costo,
+                    "precio_venta":   precio_usd,
+                    "existencia":     existencia,
+                })
+    except Exception as e:
+        print(f"[APP] Error cargando CSV: {e}")
+        return
+
+    _LOCAL_CACHE = items
+    _CACHE_MTIME = mtime
+    logger.info(f"CSV cargado: {len(items)} productos (mtime actualizado).")
+
+
+def _enrich(item: Dict) -> Dict:
+    """Agrega precio_bs calculado con la tasa actual."""
+    import config
+    tasa = config.TASA_BS_DEFAULT
+    precio_bs = round(item["precio_venta"] * tasa, 2)
+    return {**item, "precio_bs": precio_bs, "tasa_bs": tasa}
+
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+
+@app.route("/health", methods=["GET"])
+def health():
+    _load_inventory_if_needed()
+    
+    # Obtener última sync
+    last_sync_str = "Nunca"
+    last_sync_ts = 0.0
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    sync_file = os.path.join(base_dir, "last_sync.json")
+    
+    if os.path.exists(sync_file):
+        try:
+            with open(sync_file, "r") as f:
+                data = json.load(f)
+                last_sync_str = data.get("last_sync", "Nunca")
+                last_sync_ts = data.get("timestamp", 0.0)
+        except: pass
+            
+    # Comprobar si HybridLite tiene archivos más nuevos que la última sync
+    hybrid_paths = [
+        RUTA_INVENTARIO, RUTA_PRECIOS, RUTA_EXISTENCIA, 
+        RUTA_VENTAS, RUTA_VENTAS_DETALLE, RUTA_CLIENTES,
+        CSV_SOURCE_PATH
+    ]
+    needs_sync = False
+    newest_file_ts = 0.0
+    
+    for path in hybrid_paths:
+        if os.path.exists(path):
+            mtime = os.path.getmtime(path)
+            if mtime > newest_file_ts:
+                newest_file_ts = mtime
+            if mtime > last_sync_ts + 2: # Margen de 2 seg
+                needs_sync = True
+    
     return jsonify({
-        "app": "El Serrucho Backend",
-        "status": "running",
-        "endpoints": [
-            "/api/v1/productos",
-            "/api/v1/sync/inventory",
-            "/api/v1/sync/sales"
-        ]
+        "status": "ok",
+        "productos_en_cache": len(_LOCAL_CACHE),
+        "last_sync": last_sync_str,
+        "needs_sync": needs_sync,
+        "csv_existe": os.path.exists(CSV_SOURCE_PATH),
+        "tasa_bs": TASA_BS_DEFAULT,
+    }), 200
+
+
+@app.route("/api/v1/tasa", methods=["GET"])
+def tasa():
+    """Devuelve la tasa de cambio USD->Bs actualmente configurada."""
+    return jsonify({
+        "tasa_bs_por_usd": TASA_BS_DEFAULT,
+        "fuente": "config/TASA_BS env var",
     })
 
-@app.route("/api/v1/productos", methods=["GET"])
-def listar_productos():
-    _load_inventory_if_needed()
-    q = request.args.get("q", "").strip().upper()
-    limit = int(request.args.get("limit", 50))
-    offset = int(request.args.get("offset", 0))
 
+@app.route("/api/v1/buscar", methods=["GET"])
+def buscar():
+    q = request.args.get("q", "").strip()
     if not q:
-        encontrados = _LOCAL_CACHE
-    else:
-        encontrados = [
-            p for p in _LOCAL_CACHE 
-            if q in p.get("CODIGO_INTERNO", "").upper() or q in p.get("DESCRIPCION", "").upper() or q in p.get("CODIGO_BARRAS", "").upper()
-        ]
+        return jsonify({"query": q, "count": 0, "total_encontrados": 0, "results": []})
+
+    # Paginación
+    try:
+        limit = min(int(request.args.get("limit", 50)), 200)
+    except ValueError:
+        limit = 50
+    try:
+        offset = max(int(request.args.get("offset", 0)), 0)
+    except ValueError:
+        offset = 0
+
+    solo_con_stock = request.args.get("stock", "0") == "1"
+
+    # Asegurar cache actualizado
+    _load_inventory_if_needed()
+
+    norm = normalize_query(q)
+    tokens = norm.split() if norm else [q.upper()]
+
+    # Filtrar
+    encontrados = []
+    for item in _LOCAL_CACHE:
+        if solo_con_stock and item["existencia"] <= 0:
+            continue
+        haystack = item["descripcion"] + " " + item["codigo_interno"] + " " + item["codigo_barras"]
+        if all(t in haystack for t in tokens):
+            encontrados.append(item)
+
+    # Ordenar: primero los que tienen stock, luego por descripción
+    encontrados.sort(key=lambda x: (-x["existencia"], x["descripcion"]))
 
     total = len(encontrados)
     pagina = encontrados[offset : offset + limit]
 
     return jsonify({
-        "total": total,
-        "results": [_enrich(p) for p in pagina]
+        "query":            q,
+        "query_norm":       norm,
+        "total_encontrados": total,
+        "count":            len(pagina),
+        "offset":           offset,
+        "limit":            limit,
+        "results":          [_enrich(r) for r in pagina],
     })
 
+
+@app.route("/api/v1/producto/<codigo>", methods=["GET"])
+def detalle_producto(codigo: str):
+    """Devuelve el detalle de un producto por código interno o código de barras."""
+    _load_inventory_if_needed()
+    codigo = codigo.strip().upper()
+    for item in _LOCAL_CACHE:
+        if item["codigo_interno"].upper() == codigo or item["codigo_barras"] == codigo:
+            return jsonify(_enrich(item))
+    return jsonify({"error": "Producto no encontrado", "codigo": codigo}), 404
+
+
 @app.route("/api/v1/sync/inventory", methods=["POST", "GET"])
-def sync_inventory():
-    from lock_util import is_locked
-    if is_locked():
-        return jsonify({"status": "error", "message": "Sincronización en curso"}), 429
-    
-    res = subprocess.run([sys.executable, "sync.py", "once"], capture_output=True, text=True)
-    if res.returncode == 0:
-        return jsonify({"status": "success", "message": "Inventario sincronizado"})
-    return jsonify({"status": "error", "message": res.stderr}), 500
+def trigger_sync_inventory():
+    """Ejecuta el proceso de sincronización de inventario."""
+    try:
+        import sys
+        result = subprocess.run(
+            [sys.executable, "sync.py", "once"],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        if result.returncode == 0:
+            return jsonify({
+                "status": "success",
+                "message": "Sincronización de inventario completada",
+                "output": result.stdout[-500:]
+            }), 200
+        else:
+            return jsonify({"status": "error", "message": "Error en sync inventario", "error": result.stderr}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 
 @app.route("/api/v1/sync/sales", methods=["POST", "GET"])
-def sync_sales():
-    from lock_util import is_locked
-    if is_locked():
-        return jsonify({"status": "error", "message": "Sincronización en curso"}), 429
-    
-    res = subprocess.run([sys.executable, "sync_ventas.py", "once"], capture_output=True, text=True)
-    if res.returncode == 0:
-        return jsonify({"status": "success", "message": "Ventas sincronizadas"})
-    return jsonify({"status": "error", "message": res.stderr}), 500
+def trigger_sync_sales():
+    """Ejecuta el proceso de sincronización de ventas."""
+    try:
+        import sys
+        result = subprocess.run(
+            [sys.executable, "sync_ventas.py"],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        if result.returncode == 0:
+            return jsonify({
+                "status": "success",
+                "message": "Sincronización de ventas completada",
+                "output": result.stdout[-500:]
+            }), 200
+        else:
+            return jsonify({"status": "error", "message": "Error en sync ventas", "error": result.stderr}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route("/api/v1/sync/run", methods=["POST", "GET"])
-def trigger_sync_all():
-    def run_all():
-        subprocess.run([sys.executable, "sync.py", "once"])
-        subprocess.run([sys.executable, "sync_ventas.py", "once"])
-    
-    threading.Thread(target=run_all).start()
-    return jsonify({"status": "success", "message": "Sincronización completa iniciada"})
 
 @app.route("/api/v1/sync/status", methods=["GET"])
 def sync_status():
-    """Verifica integridad: compara conteos locales vs nube."""
-    import csv
-    import urllib.request
-    import urllib.error
-    
+    """Calcula la integridad de datos comparando local vs nube."""
     try:
-        from config import SUPABASE_REST_URL, SUPABASE_ANON_KEY
-    except ImportError:
-        return jsonify({"status": "error", "message": "Config no disponible"}), 500
-    
-    headers = {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-        "Prefer": "count=exact"
-    }
-    
-    def count_csv(path):
-        full = os.path.join(BASE_DIR, path)
-        if not os.path.exists(full):
-            return 0
-        try:
-            with open(full, 'r', encoding='utf-8-sig') as f:
-                return sum(1 for _ in csv.DictReader(f))
-        except:
-            return 0
-    
-    def count_supabase(table):
-        try:
-            url = SUPABASE_REST_URL.rstrip('/') + "/rest/v1/" + table + "?select=count"
-            req = urllib.request.Request(url, headers=headers, method="HEAD")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                cr = resp.headers.get("content-range", "*/0")
-                return int(cr.split("/")[-1])
-        except Exception as e:
-            print(f"[STATUS] Error contando {table}: {e}")
-            return -1
-    
-    entities = {
-        "productos": {"csv": "MAESTRO_ACTUAL.csv", "table": "productos"},
-        "ventas": {"csv": "VENTAS_CABECERA.csv", "table": "ventas"},
-        "detalle": {"csv": "VENTAS_DETALLE.csv", "table": "ventas_detalle"},
-        "clientes": {"csv": "MAESTRO_CLIENTES.csv", "table": "clientes"},
-    }
-    
-    result = {}
-    all_ok = True
-    for key, cfg in entities.items():
-        local = count_csv(cfg["csv"])
-        cloud = count_supabase(cfg["table"])
-        ok = (local == cloud) if cloud >= 0 else False
-        if not ok:
-            all_ok = False
-        result[key] = {"local": local, "cloud": cloud, "ok": ok}
-    
-    return jsonify({"status": "ok" if all_ok else "mismatch", "entities": result})
+        from supabase_rest import REST_URL, ANON_KEY
+        import requests
+        
+        entities = {
+            "productos": {"file": "MAESTRO_ACTUAL.csv", "table": "inventario"},
+            "ventas":    {"file": "VENTAS_CABECERA.csv", "table": "ventas"},
+            "detalle":   {"file": "VENTAS_DETALLE.csv", "table": "ventas_detalle"},
+            "clientes":  {"file": "MAESTRO_CLIENTES.csv", "table": "clientes"},
+        }
+        
+        results = {}
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        headers = {"apikey": ANON_KEY, "Authorization": f"Bearer {ANON_KEY}", "Range-Unit": "items"}
+        
+        for key, info in entities.items():
+            # Contar local
+            local_count = 0
+            file_path = os.path.join(base_dir, info["file"])
+            if os.path.exists(file_path):
+                try:
+                    with open(file_path, "r", encoding="utf-8-sig", errors="ignore") as f:
+                        local_count = sum(1 for line in f) - 1 # Descontar header
+                except: pass
+            
+            # Contar nube (usando HEAD para mayor velocidad)
+            cloud_count = -1
+            try:
+                url = f"{REST_URL.rstrip('/')}/rest/v1/{info['table']}?select=count"
+                r = requests.get(url, headers=headers, timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                    cloud_count = data[0].get("count", 0) if data else 0
+            except: pass
+            
+            results[key] = {
+                "local": local_count,
+                "cloud": cloud_count,
+                "ok": local_count == cloud_count if cloud_count != -1 else False
+            }
+            
+        return jsonify({"status": "ok", "entities": results}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/v1/sync/run", methods=["POST", "GET"])
+def trigger_sync_legacy():
+    """Alias para compatibilidad con versiones anteriores."""
+    return trigger_sync_inventory()
+
+
+@app.route("/api/v1/tazas/update", methods=["POST", "GET"])
+def update_tazas():
+    """Consulta las tasas externas (BCV, Binance) y las guarda en la DB."""
+    try:
+        service = RatesService()
+        rates = service.get_all_rates()
+        success = service.save_to_db(rates)
+        
+        if success:
+            # Actualizar la tasa global del app (usamos BCV USD como referencia)
+            global TASA_BS_DEFAULT
+            if rates["bcv_usd"] > 0:
+                # Actualizamos la tasa por defecto para el cálculo de precios en Bs
+                # Nota: Esto solo dura mientras el proceso esté vivo.
+                # Para persistencia total, se debería leer de la DB al iniciar.
+                import config
+                config.TASA_BS_DEFAULT = rates["bcv_usd"]
+            
+            return jsonify({
+                "status": "success",
+                "rates": rates,
+                "tasa_app_actualizada": config.TASA_BS_DEFAULT
+            }), 200
+        else:
+            return jsonify({"status": "error", "message": "No se pudo guardar en la DB"}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/api/v1/tazas/actual", methods=["GET"])
+def get_tazas_actuales():
+    """Obtiene la última tasa guardada en la DB."""
+    try:
+        from supabase_rest import REST_URL, ANON_KEY
+        import requests
+        url = f"{REST_URL.rstrip('/')}/rest/v1/tazas?order=created_at.desc&limit=1"
+        headers = {
+            "apikey": ANON_KEY,
+            "Authorization": f"Bearer {ANON_KEY}"
+        }
+        resp = requests.get(url, headers=headers)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data:
+                return jsonify(data[0]), 200
+            return jsonify({"error": "No hay datos en la tabla tazas"}), 404
+        return jsonify({"error": f"DB error: {resp.status_code}"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _init_tasa():
+    """Carga la última tasa de la DB al iniciar."""
+    try:
+        from supabase_rest import REST_URL, ANON_KEY
+        import requests
+        import config
+        url = f"{REST_URL.rstrip('/')}/rest/v1/tazas?order=created_at.desc&limit=1"
+        headers = {
+            "apikey": ANON_KEY,
+            "Authorization": f"Bearer {ANON_KEY}"
+        }
+        resp = requests.get(url, headers=headers, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and data[0].get("bcv_usd"):
+                config.TASA_BS_DEFAULT = float(data[0]["bcv_usd"])
+                print(f"[APP] Tasa inicial cargada de DB: {config.TASA_BS_DEFAULT}")
+    except Exception as e:
+        print(f"[APP] No se pudo cargar tasa inicial de DB: {e}")
+
+
+# ─── Main ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    _init_tasa()
+    port = int(os.environ.get("PORT", 5000))
+    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
+    app.run(host="0.0.0.0", port=port, debug=debug)

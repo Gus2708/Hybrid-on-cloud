@@ -22,32 +22,24 @@ except ImportError:
 from supabase_rest import upsert_batch_rest, get_row_count_rest, delete_orphans_rest
 from rates_service import RatesService
 
-# Rutas críticas
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Ruta al script que genera el CSV desde HybridLite
-EXPORTER_SCRIPT = os.path.join(BASE_DIR, "actualizar_inventario.py")
-CACHE_FILE = os.path.join(BASE_DIR, "sync_cache.json")
-LAST_SYNC_FILE = os.path.join(BASE_DIR, "last_sync.json")
+from config import DATA_DIR
+CACHE_FILE = DATA_DIR / "sync_cache.json"
+LAST_SYNC_FILE = DATA_DIR / "last_sync.json"
+
+from actualizar_inventario import export_to_csv
 
 def run_hybrid_exporter():
-    """Ejecuta el script que extrae los datos de HybridLite y genera el CSV."""
+    """Ejecuta la extracción de datos de HybridLite y genera el CSV."""
     print(f"[SYNC] -> Extrayendo datos frescos de HybridLite (.dat)...")
-    if not os.path.exists(EXPORTER_SCRIPT):
-        print(f"[SYNC] ! Error: No se encontró el exportador en {EXPORTER_SCRIPT}")
-        return False
-    
     try:
-        # Ejecutamos el exportador de HybridLite
-        # Usamos sys.executable para asegurar el mismo entorno
-        result = subprocess.run([sys.executable, EXPORTER_SCRIPT], capture_output=True, text=True, check=False)
-        if result.returncode == 0:
-            print("[SYNC] -> Exportacion de HybridLite exitosa.")
+        if export_to_csv():
+            print("[SYNC] -> Exportación de HybridLite exitosa.")
             return True
         else:
-            print(f"[SYNC] ! Error en exportador: {result.stderr}")
+            print(f"[SYNC] ! Fallo en exportador.")
             return False
     except Exception as e:
-        print(f"[SYNC] ! Fallo critico al ejecutar exportador: {e}")
+        print(f"[SYNC] ! Fallo crítico al ejecutar exportador: {e}")
         return False
 
 def get_row_hash(row: Dict) -> str:
@@ -191,16 +183,6 @@ def _save_metadata():
     except: pass
 
 if __name__ == "__main__":
-    from lock_util import acquire_lock
-    
     mode = sys.argv[1] if len(sys.argv) > 1 else "once"
-    try:
-        with acquire_lock(timeout=120):
-            if mode == "force": sync_incremental(force=True)
-            else: sync_incremental()
-    except TimeoutError as e:
-        print(f"[SYNC] ! Error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"[SYNC] ! Fallo inesperado: {e}")
-        sys.exit(1)
+    if mode == "force": sync_incremental(force=True)
+    else: sync_incremental()

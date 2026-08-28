@@ -96,67 +96,33 @@ class RatesService:
     def save_to_db(self, rates: Dict[str, float]) -> bool:
         """
         Saves the rates to the Supabase 'tazas' table.
-        Maintains only two rows: 'actual' and 'anterior'.
         """
         try:
             from supabase_rest import REST_URL, ANON_KEY
-            import datetime
             if not REST_URL or not ANON_KEY:
                 print("[RATES] DB config missing.")
                 return False
             
+            url = f"{REST_URL.rstrip('/')}/rest/v1/tazas"
             headers = {
                 "apikey": ANON_KEY,
                 "Authorization": f"Bearer {ANON_KEY}",
-                "Content-Type": "application/json",
-                "Prefer": "resolution=merge-duplicates"
+                "Content-Type": "application/json"
             }
             
-            # 1. Obtener la tasa actual guardada para verificar la fecha
-            base_url = f"{REST_URL.rstrip('/')}/rest/v1/tazas"
-            actual_url = f"{base_url}?nombre=eq.actual&select=*"
-            resp = requests.get(actual_url, headers=headers, timeout=10)
-            
-            tasa_actual_db = None
-            if resp.status_code == 200 and resp.json():
-                tasa_actual_db = resp.json()[0]
-            
-            # 2. Si existe una tasa actual y es de un día distinto al de hoy, 
-            #    rotarla a 'anterior'
-            if tasa_actual_db and tasa_actual_db.get('created_at'):
-                fecha_db = tasa_actual_db['created_at'].split('T')[0]
-                hoy = datetime.date.today().isoformat()
-                
-                if fecha_db != hoy:
-                    print(f"[RATES] Rotando tasa de {fecha_db} a 'anterior'...")
-                    ant_payload = {
-                        "nombre": "anterior",
-                        "bcv_usd": tasa_actual_db["bcv_usd"],
-                        "bcv_eur": tasa_actual_db["bcv_eur"],
-                        "binance_p2p": tasa_actual_db["binance_p2p"],
-                        "tasa_promedio": tasa_actual_db["tasa_promedio"],
-                        "created_at": tasa_actual_db["created_at"]
-                    }
-                    requests.post(base_url, json=ant_payload, headers=headers, timeout=10)
-
-            # 3. Upsert de la tasa 'actual'
             payload = {
-                "nombre": "actual",
                 "bcv_usd": rates["bcv_usd"],
                 "bcv_eur": rates["bcv_eur"],
                 "binance_p2p": rates["binance_p2p"],
-                "tasa_promedio": (rates["bcv_usd"] + rates["binance_p2p"]) / 2 if rates["bcv_usd"] > 0 and rates["binance_p2p"] > 0 else rates["bcv_usd"],
-                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+                "tasa_promedio": (rates["bcv_usd"] + rates["binance_p2p"]) / 2 if rates["bcv_usd"] > 0 and rates["binance_p2p"] > 0 else rates["bcv_usd"]
             }
             
-            upsert_url = f"{base_url}?on_conflict=nombre"
-            response = requests.post(upsert_url, json=payload, headers=headers, timeout=15)
-            
+            response = requests.post(url, json=payload, headers=headers, timeout=15)
             if response.status_code in (200, 201, 204):
-                print(f"[RATES] Upsert exitoso: 'actual' (BCV: {payload['bcv_usd']})")
+                print(f"[RATES] Saved to DB: {payload}")
                 return True
             else:
-                print(f"[RATES] Error en upsert: HTTP {response.status_code} - {response.text}")
+                print(f"[RATES] Error saving to DB: HTTP {response.status_code} - {response.text}")
                 return False
         except Exception as e:
             print(f"[RATES] Exception saving to DB: {e}")

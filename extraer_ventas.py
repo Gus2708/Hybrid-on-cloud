@@ -2,16 +2,22 @@ import pydbisam
 import os
 import csv
 from datetime import date
+try:
+    import config
+    RUTA_CLIENTES = config.RUTA_CLIENTES
+    RUTA_VENTAS = config.RUTA_VENTAS
+    RUTA_VENTAS_DETALLE = config.RUTA_VENTAS_DETALLE
+except ImportError:
+    RUTA_CLIENTES = r"h:\HybridLite\HybridEmpresa\HybridDataBase\TClientes.dat"
+    RUTA_VENTAS = r"h:\HybridLite\HybridEmpresa\HybridDataBase\TTransaccionvta.dat"
+    RUTA_VENTAS_DETALLE = r"h:\HybridLite\HybridEmpresa\HybridDataBase\TDetalleVta.dat"
 
-base = r"h:\HybridLite\HybridEmpresa\HybridDataBase"
-
-def extract_table_to_csv(dat_filename, csv_filename, target_columns):
-    filepath = os.path.join(base, dat_filename)
+def extract_table_to_csv(filepath, csv_filename, target_columns):
     if not os.path.exists(filepath):
         print(f"Error: {filepath} no existe.")
         return
 
-    print(f"Extrayendo {dat_filename} a {csv_filename}...")
+    print(f"Extrayendo {os.path.basename(filepath)} a {csv_filename}...")
     tmp_filename = csv_filename + ".tmp"
     try:
         db = pydbisam.PyDBISAM(filepath)
@@ -45,26 +51,26 @@ def extract_table_to_csv(dat_filename, csv_filename, target_columns):
         print(f"  -> Guardado {db._total_rows} registros en {csv_filename}")
     except Exception as e:
         if os.path.exists(tmp_filename): os.remove(tmp_filename)
-        print(f"Error procesando {dat_filename}: {e}")
+        print(f"Error procesando {filepath}: {e}")
 
 if __name__ == '__main__':
     # Clientes
     extract_table_to_csv(
-        "TClientes.dat", 
+        RUTA_CLIENTES, 
         "MAESTRO_CLIENTES.csv", 
         ["CLT_CODIGO", "CLT_DESCRIPCION", "CLT_RIF", "CLT_TELEFONO", "CLT_DIRECCION1"]
     )
     
     # Cabecera de Ventas
     extract_table_to_csv(
-        "TTransaccionvta.dat", 
+        RUTA_VENTAS, 
         "VENTAS_CABECERA.csv", 
         ["THT_AUTOINCREMENT", "THT_DOCUMENTO", "THT_FECHAEMISION", "THT_RIFCLIENTE", "THT_TOTALNETO", "THT_STATUS", "THT_NUMEROCONTROL", "THT_TOTALIMPUESTO"]
     )
     
     # Detalle de Ventas
     extract_table_to_csv(
-        "TDetalleVta.dat", 
+        RUTA_VENTAS_DETALLE, 
         "VENTAS_DETALLE.csv", 
         ["TBT_AUTOINCREMENT", "TBT_DOCUMENTO", "TBT_CODIGO", "TBT_CANTIDAD", "TBT_PRECIODEVENTA", "TBT_CTOCOSTOSTR", "TBT_OPERACION_AUTOINCREMENT"]
     )
