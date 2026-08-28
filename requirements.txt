@@ -10,3 +10,4 @@ pystray
 beautifulsoup4
 keyring
 watchdog
+pydbisam

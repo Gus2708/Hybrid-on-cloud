@@ -1,0 +1,4 @@
+# Dependencias solo para compilar y empaquetar el ejecutable.
+# El runtime no las necesita: ver requirements.txt
+-r requirements.txt
+nuitka
