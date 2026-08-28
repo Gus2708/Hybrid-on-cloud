@@ -1,118 +1,66 @@
-# 🛠️ Backend Serrucho — Sistema de Inventario Inteligente
+# 🛠️ Hybrid on Cloud — SaaS de Inventario & Ventas Inteligente
 
-Bienvenido al núcleo del sistema de gestión de inventario para **Ferretería El Serrucho**. Este backend es una solución robusta diseñada para sincronizar en tiempo real el inventario local (HybridLite) con la nube (Supabase), proporcionando una API de alto rendimiento y una interfaz de monitoreo visual estilo iOS.
-
----
-
-## 🚀 Resumen de Funcionalidades
-
-Este sistema no es solo una API; es un ecosistema completo de sincronización y monitoreo:
-
-1.  **Sincronización Incremental Inteligente**: Utiliza algoritmos de hashing MD5 para detectar cambios exactos en el `MAESTRO_ACTUAL.csv`, minimizando el tráfico de red y optimizando la velocidad.
-2.  **Monitoreo en Tiempo Real**: Un servicio de vigilancia (`monitor.py`) detecta cambios en los archivos locales de la base de datos HybridLite y dispara actualizaciones automáticas.
-3.  **Widget de Escritorio Premium**: Una interfaz minimalista con estética iOS que muestra el estado de la conexión, la última sincronización y permite disparar actualizaciones manuales.
-4.  **Servicio de Tasas de Cambio**: Extracción automática de tasas oficiales del **BCV** y **Binance P2P** para mantener los precios en Bolívares siempre actualizados.
-5.  **API REST de Alta Disponibilidad**: Búsqueda avanzada de productos con paginación, filtrado por stock y cálculo dinámico de precios.
-6.  **Ejecución Silenciosa**: Scripts optimizados (`.vbs`) para correr en segundo plano sin interrumpir al usuario.
+Bienvenido a **Hybrid on Cloud**, la solución definitiva para transformar sistemas locales **Hybrid Lite** en potentes plataformas en la nube. Este ecosistema permite la sincronización masiva de datos, monitoreo de ventas en tiempo real y gestión centralizada, todo bajo una arquitectura de **Marca Blanca (White-Label)** totalmente personalizable.
 
 ---
 
-## 📁 Estructura del Proyecto
+## 🚀 Nuevas Funcionalidades (v1.2.0)
 
-```text
-backend serrucho/
-├── app.py                # Servidor Flask (API y Orquestador)
-├── sync.py               # Motor de sincronización CSV ↔ Supabase
-├── monitor.py            # Vigilante de archivos locales (HybridLite)
-├── rates_service.py      # Scraper de tasas BCV y Binance P2P
-├── widget.pyw            # Interfaz de monitoreo visual (Estilo iOS)
-├── config.py             # Gestión centralizada de configuración
-├── supabase_rest.py      # Cliente de bajo nivel para Supabase REST
-├── run_sync.bat          # Script de ejecución manual de sincronización
-├── start_backend.vbs     # Lanzador invisible para servicios de fondo
-├── sql/
-│   ├── crear_tabla_productos.sql  # Schema de base de datos
-│   └── crear_tabla_tazas.sql      # Schema para tasas de cambio
-└── assets/               # Recursos visuales del widget
-```
+1.  **Sincronización Multicapa**: Ya no solo sincronizamos el inventario. Ahora el sistema gestiona de forma incremental:
+    - **📦 Inventario**: Precios, existencias y datos maestros.
+    - **💰 Ventas**: Cabeceras de facturas y detalles de operaciones en tiempo real.
+    - **👥 Clientes**: Sincronización del maestro de clientes para fidelización en la nube.
+2.  **🔍 Análisis de Integridad (iOS Style)**: Nueva tarjeta expandible en el widget que permite verificar la salud de los datos. Compara registros locales vs. nube en segundos para asegurar que nada se pierda.
+3.  **📡 Disparadores Remotos (Remote Sync)**: Capacidad de forzar sincronizaciones desde el Dashboard administrativo centralizado mediante un sistema de "Heartbeat" y triggers en Supabase.
+4.  **📦 Instalador Profesional (Inno Setup)**: Distribución simplificada mediante un instalador estándar de Windows que configura rutas, accesos directos y permisos de forma automática.
+5.  **💓 Sistema de Heartbeat & HWID**: Registro único por máquina (Hardware ID) que reporta versión del software, estado de conexión y última actividad al panel de control global.
+6.  **🎛️ Configuración Avanzada (Wizard 2.0)**: Asistente visual mejorado para configurar múltiples rutas de bases de datos (`.dat`) y parámetros de marca blanca sin tocar código.
 
 ---
 
-## 🛠️ Instalación y Configuración
+## 🎨 El Widget Monitor (Interfaz de Usuario)
 
-### 1. Requisitos Previos
-- Python 3.10 o superior.
-- Una cuenta en Supabase con un proyecto activo.
-- Acceso de lectura a los archivos `.Dat` de HybridLite.
+El widget ha sido rediseñado para ofrecer una experiencia minimalista y funcional:
 
-### 2. Configuración del Entorno
-Copia el archivo `.env.example` a `.env` y completa las variables:
-```env
-SUPABASE_REST_URL=https://tu-proyecto.supabase.co
-SUPABASE_ANON_KEY=tu-anon-key
-CSV_SOURCE_PATH=C:\Ruta\Al\MAESTRO_ACTUAL.csv
-PORT=5000
-```
+-   **Indicadores de Estado**: 
+    - 🟢 **Verde**: Sistema sincronizado y saludable.
+    - 🟡 **Amarillo**: Sincronización en curso o cambios locales pendientes.
+    - 🔴 **Rojo**: Error de conexión o servicio local detenido.
+-   **Monitor de Tasas**: Extracción en tiempo real de **BCV** y **Binance P2P**. Alerta visual de "Brecha" cambiaria (se torna rojo si la brecha es crítica).
+-   **Card de Integridad**: Haz clic en el icono ▶ para desplegar el desglose detallado de registros locales vs. nube.
+-   **Bandeja de Sistema (Tray)**: Operación 100% silenciosa. El widget se minimiza a la barra de tareas y cambia su icono por el logo de tu empresa.
 
-### 3. Instalación de Dependencias
-Ejecuta el siguiente comando en la terminal:
+---
+
+## 🛠️ Instalación y despliegue
+
+### 1. Para el Usuario Final
+Ejecuta el archivo `Instalador_HybridOnCloud.exe`. El asistente te guiará para instalar la aplicación en tu PC. Al finalizar, el widget se iniciará automáticamente.
+
+### 2. Configuración Inicial (Wizard)
+Al abrir por primera vez, deberás indicar:
+- **Datos de Marca**: Nombre de tu negocio y ruta de tu logo.
+- **Rutas Críticas**: Ubicación de los archivos `TInventario.dat`, `Ventas.dat`, etc.
+- **Arranque Automático**: Activa la casilla para que el sistema inicie siempre con Windows de forma invisible.
+
+---
+
+## 🔄 Detalles Técnicos (Developer Specs)
+
+### Compilación y Empaquetado
+El sistema utiliza **Nuitka** para una compilación de alto rendimiento en C++ y **Inno Setup** para el empaquetado:
+
 ```powershell
-pip install -r requirements.txt
+# Compilación del ejecutable principal
+python -m nuitka --standalone --onefile --windows-console-mode=disable --windows-icon-from-ico=assets/icon.ico --include-data-dir=assets=assets --plugin-enable=tk-inter --msvc=latest widget.py
 ```
 
-### 4. Preparación de la Base de Datos
-Importa los archivos SQL en el **SQL Editor** de Supabase para crear las tablas necesarias (`productos` y `tazas`).
+### Seguridad e Instancia Única
+- **Socket Lock**: Previene múltiples ejecuciones en el puerto `58231`.
+- **HWID Fingerprinting**: Generación de identificador único basado en componentes de hardware para gestión de licencias.
+- **Service Bridge**: El widget se comunica con un backend local en Python (Flask) para operaciones pesadas de extracción de datos, garantizando que la UI nunca se bloquee.
 
 ---
 
-## 🖥️ Uso del Sistema
+Desarrollado con ❤️ por **Hybrid on Cloud Team**.
 
-### Ejecución de Servicios
-Existen varias formas de iniciar el backend:
-
-- **Modo Desarrollo**: `python app.py` (Muestra logs detallados).
-- **Modo Fondo (Recomendado)**: Ejecuta `start_backend.vbs` para lanzar la API y el monitor de forma invisible.
-- **Widget de Monitoreo**: Ejecuta `widget.pyw` para tener el panel visual en tu escritorio.
-
-### API Endpoints Principales
-
-| Método | Endpoint | Descripción |
-| :--- | :--- | :--- |
-| `GET` | `/api/v1/buscar?q=martillo` | Búsqueda global de productos. |
-| `GET` | `/api/v1/producto/<id>` | Detalle de un producto por código o barra. |
-| `GET` | `/api/v1/tasa` | Obtiene la tasa de cambio actual. |
-| `POST` | `/api/v1/sync/run` | Fuerza una sincronización inmediata. |
-| `GET` | `/health` | Estado de salud de los servicios. |
-
----
-
-## 🔄 Lógica de Sincronización
-
-El sistema utiliza un flujo de tres capas para garantizar la integridad de los datos:
-
-1.  **Detección**: El `monitor.py` vigila la fecha de modificación de los archivos HybridLite.
-2.  **Comparación**: `sync.py` genera un hash de cada fila del CSV. Solo las filas cuyo hash ha cambiado o que no existen en la nube son enviadas.
-3.  **Actualización**: Se realiza una operación `UPSERT` masiva en Supabase para maximizar la eficiencia.
-
----
-
-## 🎨 El Widget (Serrucho Monitor)
-
-El widget es una ventana flotante transparente que:
-- **Punto Verde**: Todo sincronizado y online.
-- **Punto Amarillo**: Sincronización en progreso o cambios pendientes.
-- **Punto Rojo**: Error de conexión o servicio caído.
-- **Glow Animado**: Pulso visual que indica actividad del sistema.
-- **Integración con Tray**: Se minimiza a la barra de tareas para no estorbar.
-
----
-
-## 🛡️ Mantenimiento y Solución de Problemas
-
-- **Logs**: Revisa `monitor.log` para ver errores de sincronización.
-- **Prueba de Conexión**: Ejecuta `python test_conexion.py` para diagnosticar problemas con Supabase.
-- **Reinicio Forzado**: Cierra los procesos de Python en el administrador de tareas y vuelve a ejecutar `start_backend.vbs`.
-
----
-
-Desarrollado con ❤️ para **Ferretería El Serrucho**.

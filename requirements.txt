@@ -8,3 +8,5 @@ responses
 Pillow
 pystray
 beautifulsoup4
+keyring
+watchdog

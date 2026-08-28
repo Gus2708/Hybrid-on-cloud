@@ -1,12 +1,44 @@
+# Entornos virtuales
 venv/
-*.pyc
+.venv/
+env/
+
+# Python cache
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Configuración y secretos
 .env
+*.log
+
+# Bases de datos y archivos de datos locales
 *.csv
 *.dat
 *.Dat
-*.json
-*.log
+*.db
+
+# Artefactos de compilación (Nuitka / PyInstaller)
+build/
+dist/
+*.build/
+*.dist/
+*.onefile-build/
+*.spec
+nuitka-crash-report.xml
+
+# Binarios y ejecutables
+*.exe
+*.bin
+
+# Instaladores
+installer/
+Instalador_*.exe
+
+# Carpetas de agentes y temporales
 .agents/
 .gemini/
-tests/.pytest_cache/
+scratch/
+skills/
