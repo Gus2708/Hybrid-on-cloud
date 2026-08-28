@@ -6,10 +6,25 @@ Carga variables en este orden de prioridad:
   3. Valores por defecto hardcodeados (mínimos de seguridad)
 """
 import os
+import sys
 from pathlib import Path
 
+# ─── Deteccion de ejecutable congelado ───────────────────────────────────────
+# Portado desde la rama serrucho. Compilado con Nuitka, __file__ apunta a un
+# directorio temporal: hay que resolver la ruta real del .exe para encontrar
+# el .env y los assets junto al binario que el usuario ejecuta.
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).parent          # PyInstaller
+    IS_FROZEN = True
+elif "__compiled__" in globals() or hasattr(sys, "nuitka_version"):
+    BASE_DIR = Path(os.path.abspath(sys.argv[0])).parent   # Nuitka
+    IS_FROZEN = True
+else:
+    BASE_DIR = Path(__file__).parent                # desarrollo
+    IS_FROZEN = False
+
 # Cargar .env si existe (python-dotenv es opcional)
-_env_path = Path(__file__).parent / ".env"
+_env_path = BASE_DIR / ".env"
 if _env_path.exists():
     try:
         from dotenv import load_dotenv
@@ -105,3 +120,24 @@ ZELLE_TRUSTED_SENDERS = {s.strip().lower() for s in os.environ.get(
 ZELLE_REQUIRE_DMARC = os.environ.get("ZELLE_REQUIRE_DMARC", "1") == "1"
 ZELLE_POLL_INTERVAL_S = float(os.environ.get("ZELLE_POLL_INTERVAL_S", "5"))
 
+# ─── Marca blanca y licenciamiento ───────────────────────────────────────────
+# Portado desde la rama serrucho (empaquetado Nuitka). Las credenciales van por
+# entorno, nunca embebidas: ver commit 533d126 "eliminar credenciales embebidas".
+#
+# DATA_DIR: carpeta de datos persistentes del usuario. En Windows vive en APPDATA
+#   para que el ejecutable no escriba junto al .exe (Program Files es de solo
+#   lectura para el usuario). security.py guarda ahi el estado de licencia.
+# BUSINESS_NAME / BRAND_LOGO: personalizacion visible del producto por cliente.
+# LICENSE_SUPABASE_*: proyecto Supabase SEPARADO del de inventario, dedicado a
+#   validar licencias por HWID. Sin estas variables, verify_license() no valida.
+if os.name == "nt":
+    DATA_DIR = Path(os.getenv("APPDATA", str(BASE_DIR))) / "HybridToCloud"
+else:
+    DATA_DIR = BASE_DIR
+os.makedirs(DATA_DIR, exist_ok=True)
+
+BUSINESS_NAME = os.environ.get("BUSINESS_NAME", "Mi Negocio")
+BRAND_LOGO = os.environ.get("BRAND_LOGO", "assets/logo.png")
+
+LICENSE_SUPABASE_URL = os.environ.get("LICENSE_SUPABASE_URL", "")
+LICENSE_SUPABASE_ANON_KEY = os.environ.get("LICENSE_SUPABASE_ANON_KEY", "")
