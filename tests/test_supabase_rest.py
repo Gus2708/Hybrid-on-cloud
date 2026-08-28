@@ -22,17 +22,35 @@ def test_upsert_batch_rest_success():
     sent_payload = json.loads(responses.calls[0].request.body)
     assert sent_payload[0]["codigo_interno"] == "1"
 
-from unittest.mock import MagicMock
-
-def test_get_row_count_rest(mocker):
+@responses.activate
+def test_get_row_count_rest():
+    # get_row_count_rest usa requests y lee la cabecera Content-Range.
+    # El test anterior mockeaba urllib.request.urlopen y por eso salía a la red.
     import supabase_rest
     supabase_rest.REST_URL = "https://example.supabase.co"
     supabase_rest.ANON_KEY = "test-key"
-    
-    mock_resp = MagicMock()
-    mock_resp.getheader.return_value = "0-0/100"
-    mock_resp.__enter__.return_value = mock_resp
-    mocker.patch("urllib.request.urlopen", return_value=mock_resp)
-    
-    count = get_row_count_rest()
-    assert count == 100
+
+    responses.add(
+        responses.GET,
+        "https://example.supabase.co/rest/v1/productos",
+        status=206,
+        headers={"Content-Range": "0-0/100"},
+    )
+
+    assert get_row_count_rest() == 100
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_get_row_count_rest_sin_content_range():
+    import supabase_rest
+    supabase_rest.REST_URL = "https://example.supabase.co"
+    supabase_rest.ANON_KEY = "test-key"
+
+    responses.add(
+        responses.GET,
+        "https://example.supabase.co/rest/v1/productos",
+        status=200,
+    )
+
+    assert get_row_count_rest() == -1
