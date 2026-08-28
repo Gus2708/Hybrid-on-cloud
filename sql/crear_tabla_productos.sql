@@ -1,6 +1,6 @@
 -- =============================================================
 -- crear_tabla_productos.sql
--- Tabla de productos para Ferretería El Serrucho
+-- Tabla de productos para Hybrid on Cloud
 -- Ejecutar en: Supabase → SQL Editor
 -- =============================================================
 
