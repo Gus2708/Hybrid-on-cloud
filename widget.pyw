@@ -448,7 +448,7 @@ class SerruchoPremiumWidget:
                             self.is_syncing = backend_syncing
                         self.root.after(0, lambda d=data: self._update_ui_full(d))
                 except: pass
-                time.sleep(3 if self.is_syncing else 15)
+                time.sleep(3 if self.is_syncing else 45)
         t = threading.Thread(target=task, daemon=True)
         t.start()
 
@@ -516,21 +516,37 @@ class SerruchoPremiumWidget:
     def update_loop(self):
         def task():
             while True:
-                # 1. Obtener tasas de Supabase (aislado)
+                # 1. Obtener tasas (preferir API local para no consumir Egress en Supabase)
+                rates_loaded = False
                 try:
-                    url = f"{SUPABASE_REST_URL}/rest/v1/tazas?nombre=eq.actual&limit=1"
-                    headers = {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"}
-                    req = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=5) as resp:
-                        data = json.loads(resp.read().decode())
-                        if data:
-                            bcv, bnb = data[0].get("bcv_usd", 0), data[0].get("binance_p2p", 0)
+                    r_req = urllib.request.Request("http://localhost:5000/api/v1/rates")
+                    with urllib.request.urlopen(r_req, timeout=4) as r_resp:
+                        r_data = json.loads(r_resp.read().decode())
+                        if r_data:
+                            bcv = r_data.get("bcv_usd", 0)
+                            bnb = r_data.get("binance_p2p", 0)
                             self.root.after(0, lambda bcv=bcv, bnb=bnb: self._update_rates_ui(bcv, bnb))
-                except Exception as e:
+                            rates_loaded = True
+                except Exception:
+                    pass
+
+                # Fallback a Supabase solo si API local no responde las tasas
+                if not rates_loaded:
                     try:
-                        self.root.after(0, lambda: self.canvas.itemconfig(self.diff_label, text="Brecha: --.--% (Sin conexión)"))
-                        log_widget_error(f"Error tazas Supabase: {repr(e)}")
-                    except: pass
+                        url = f"{SUPABASE_REST_URL}/rest/v1/tazas?nombre=eq.actual&limit=1"
+                        headers = {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}"}
+                        req = urllib.request.Request(url, headers=headers)
+                        with urllib.request.urlopen(req, timeout=5) as resp:
+                            data = json.loads(resp.read().decode())
+                            if data:
+                                bcv, bnb = data[0].get("bcv_usd", 0), data[0].get("binance_p2p", 0)
+                                self.root.after(0, lambda bcv=bcv, bnb=bnb: self._update_rates_ui(bcv, bnb))
+                                rates_loaded = True
+                    except Exception as e:
+                        try:
+                            self.root.after(0, lambda: self.canvas.itemconfig(self.diff_label, text="Brecha: --.--% (Sin conexión)"))
+                            log_widget_error(f"Error tazas Supabase: {repr(e)}")
+                        except: pass
                 
                 # 2. Obtener estado de la API Local (aislado)
                 try:
@@ -544,7 +560,7 @@ class SerruchoPremiumWidget:
                     self.root.after(0, lambda: self.canvas.itemconfig(self.detail_label, text="⚠️ API local no responde — reiniciando..."))
                     log_widget_error(f"Error API local: {repr(e)}")
                 
-                time.sleep(15)
+                time.sleep(60)
         threading.Thread(target=task, daemon=True).start()
 
     def _update_rates_ui(self, bcv, bnb):

@@ -55,20 +55,47 @@ def get_product_descriptions(csv_path):
         print(f"[SYNC AJUSTES] Error cargando descripciones locales: {e}")
     return mapping
 
+SYNCED_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_ajustes_synced.json")
+
 def get_synced_transaction_ids() -> set:
-    """Busca en Supabase las cabeceras de órdenes de cambio que tienen el tag de sincronización local."""
+    """Busca en Supabase todas las cabeceras de órdenes de cambio que tienen el tag de sincronización local.
+    Pagina para asegurar que se obtengan todas las transacciones previas sin límite arbitrario.
+    """
     synced = set()
-    url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/ordenes_cambio?select=nota"
-    req = urllib.request.Request(url, headers=HEADERS, method="GET")
+    # 1. Cargar caché local previo si existe
+    if os.path.exists(SYNCED_CACHE_FILE):
+        try:
+            with open(SYNCED_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for item in data:
+                    synced.add((item[0], int(item[1])))
+        except Exception:
+            pass
+
+    # 2. Consultar todas las órdenes con nota que contenga 'Local' paginando
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            rows = json.loads(resp.read().decode())
-            for r in rows:
-                nota = r.get("nota") or ""
-                # Buscar patrón: [Local Inv ID: 123] o [Local Com ID: 123]
-                match = re.search(r"\[Local (Inv|Com) ID:\s*(\d+)\]", nota)
-                if match:
-                    synced.add((match.group(1), int(match.group(2))))
+        encoded_filter = urllib.parse.quote("like.*Local*")
+        page_size = 1000
+        offset = 0
+        while True:
+            url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/ordenes_cambio?nota={encoded_filter}&select=nota&order=id.asc&limit={page_size}&offset={offset}"
+            req = urllib.request.Request(url, headers=HEADERS, method="GET")
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                rows = json.loads(resp.read().decode())
+                if not rows:
+                    break
+                for r in rows:
+                    nota = r.get("nota") or ""
+                    match = re.search(r"\[Local (Inv|Com) ID:\s*(\d+)\]", nota)
+                    if match:
+                        synced.add((match.group(1), int(match.group(2))))
+                if len(rows) < page_size:
+                    break
+                offset += page_size
+
+        # Guardar en caché local
+        with open(SYNCED_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(synced), f)
     except Exception as e:
         print(f"[SYNC AJUSTES] Error consultando ordenes sincronizadas: {e}")
     return synced
@@ -86,6 +113,9 @@ def insert_parent_order(payload) -> int:
             if res and isinstance(res, list) and len(res) > 0:
                 return res[0].get("id")
     except urllib.error.HTTPError as e:
+        if e.code == 409:
+            print(f"[SYNC AJUSTES] Transacción ya registrada previamente en Supabase (evitado duplicado): {payload.get('nota')}")
+            return None
         body = e.read().decode(errors="ignore") if e.fp else ""
         print(f"[SYNC AJUSTES] Error insertando cabecera: HTTP {e.code} - {body}")
     except Exception as e:

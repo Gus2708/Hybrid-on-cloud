@@ -242,10 +242,15 @@ def procesar_compra(compra, n=1, total=1):
 
     items = get_items(cid)
     if not items:
-        update_compra(cid, backend_status="completado",
-                      backend_resultado="Compra sin items.",
-                      backend_aplicado_en=datetime.datetime.now(datetime.timezone.utc).isoformat())
-        log.info("Compra %s sin items -> 'completado' sin tocar HybridLite.", cid)
+        if intentos < 3:
+            update_compra(cid, backend_status="pendiente",
+                          backend_resultado=f"Esperando items (intento {intentos}/3)...")
+            log.warning("Compra %s sin items todavía (intento %s/3) -> permanece 'pendiente' esperando items.", cid, intentos)
+        else:
+            update_compra(cid, backend_status="error",
+                          backend_resultado="Error: Compra emitida sin items tras 3 intentos.",
+                          backend_aplicado_en=datetime.datetime.now(datetime.timezone.utc).isoformat())
+            log.error("Compra %s sin items tras 3 intentos -> marcado 'error'.", cid)
         return
 
     # Número de orden/factura: si el usuario lo escribió en la app (columna

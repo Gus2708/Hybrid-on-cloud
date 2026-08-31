@@ -188,10 +188,15 @@ def procesar_pedido(pedido, n=1, total=1):
 
     items = get_items(pid)
     if not items:
-        update_pedido(pid, backend_status="completado",
-                      backend_resultado="Pedido sin items.",
-                      backend_aplicado_en=datetime.datetime.now(datetime.timezone.utc).isoformat())
-        log.info("Pedido %s sin items -> 'completado' sin tocar HybridLite.", pid)
+        if intentos < 3:
+            update_pedido(pid, backend_status="pendiente",
+                          backend_resultado=f"Esperando items (intento {intentos}/3)...")
+            log.warning("Pedido %s sin items todavía (intento %s/3) -> permanece 'pendiente' esperando items.", pid, intentos)
+        else:
+            update_pedido(pid, backend_status="error",
+                          backend_resultado="Error: Pedido emitido sin items tras 3 intentos.",
+                          backend_aplicado_en=datetime.datetime.now(datetime.timezone.utc).isoformat())
+            log.error("Pedido %s sin items tras 3 intentos -> marcado 'error'.", pid)
         return
 
     log.info("Procesando pedido %s: cliente=%s (%s) %s item(s)",

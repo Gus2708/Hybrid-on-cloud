@@ -33,6 +33,7 @@ def test_load_csv(tmp_path):
 
 def test_sync_incremental_no_changes(mocker):
     # Mocking external calls
+    mocker.patch("network_util.check_drive", return_value=True)
     mocker.patch("sync.run_hybrid_exporter", return_value=True)
     mocker.patch("sync._load_csv", return_value=[{"codigo_interno": "1", "descripcion": "P1", "costo": 1, "precio_venta": 2, "existencia": 3, "codigo_barras": "B1", "referencia": "R1", "unidad": "U1"}])
     mocker.patch("os.path.exists", return_value=True)
@@ -51,6 +52,7 @@ def test_sync_incremental_no_changes(mocker):
     assert mock_upsert.call_count == 0
 
 def test_sync_incremental_with_changes(mocker):
+    mocker.patch("network_util.check_drive", return_value=True)
     mocker.patch("sync.run_hybrid_exporter", return_value=True)
     mocker.patch("sync._load_csv", return_value=[{"codigo_interno": "1", "descripcion": "P1", "costo": 1, "precio_venta": 2, "existencia": 3, "codigo_barras": "B1", "referencia": "R1", "unidad": "U1"}])
     

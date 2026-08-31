@@ -115,6 +115,29 @@ def listar_productos():
         "results": [_enrich(p) for p in pagina]
     })
 
+_RATES_CACHE = {"data": None, "ts": 0.0}
+_RATES_CACHE_TTL = 120.0  # 2 minutos
+
+@app.route("/api/v1/rates", methods=["GET"])
+def get_rates():
+    """Devuelve las tasas de cambio vigentes con caché local en memoria."""
+    global _RATES_CACHE
+    now = time.time()
+    if _RATES_CACHE["data"] and (now - _RATES_CACHE["ts"]) < _RATES_CACHE_TTL:
+        return jsonify(_RATES_CACHE["data"])
+    try:
+        from rates_service import RatesService
+        service = RatesService()
+        rates = service.get_all_rates()
+        if rates:
+            _RATES_CACHE = {"data": rates, "ts": now}
+            return jsonify(rates)
+    except Exception as e:
+        if _RATES_CACHE["data"]:
+            return jsonify(_RATES_CACHE["data"])
+        return jsonify({"error": str(e)}), 500
+    return jsonify(_RATES_CACHE["data"] or {})
+
 @app.route("/api/v1/sync/inventory", methods=["POST", "GET"])
 def sync_inventory():
     auth_err = _require_sync_key()
@@ -182,13 +205,15 @@ def trigger_sync_force():
     return jsonify({"status": "success", "message": "Re-extracción forzada iniciada"})
 
 _COUNT_CACHE = {}
+_SUPABASE_COUNT_CACHE = {}
+_SUPABASE_COUNT_CACHE_TTL = 90.0  # segundos
 
 @app.route("/api/v1/sync/status", methods=["GET"])
 def sync_status():
     """Verifica integridad: compara conteos locales vs nube con caché de disco."""
     import csv
     import urllib.request
-    global _COUNT_CACHE
+    global _COUNT_CACHE, _SUPABASE_COUNT_CACHE
     
     try:
         from config import SUPABASE_REST_URL, SUPABASE_ANON_KEY
@@ -229,13 +254,22 @@ def sync_status():
     def count_supabase(table):
         if not supabase_reachable:
             return -1
+        now = time.time()
+        cached = _SUPABASE_COUNT_CACHE.get(table)
+        if cached and (now - cached["ts"]) < _SUPABASE_COUNT_CACHE_TTL:
+            return cached["count"]
         try:
             url = SUPABASE_REST_URL.rstrip('/') + "/rest/v1/" + table + "?select=count"
             req = urllib.request.Request(url, headers=headers, method="HEAD")
-            with urllib.request.urlopen(req, timeout=2.0) as resp:
+            with urllib.request.urlopen(req, timeout=2.5) as resp:
                 cr = resp.headers.get("content-range", "*/0")
-                return int(cr.split("/")[-1])
-        except: return -1
+                val = int(cr.split("/")[-1])
+                _SUPABASE_COUNT_CACHE[table] = {"count": val, "ts": now}
+                return val
+        except:
+            if cached:
+                return cached["count"]
+            return -1
     
     entities = {
         "productos": {"csv": "MAESTRO_ACTUAL.csv", "table": "productos"},

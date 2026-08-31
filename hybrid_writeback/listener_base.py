@@ -183,8 +183,8 @@ def hay_pendientes_prioritarios():
     return False
 
 
-POLL_INTERVAL = 3          # segundos entre sondeos EN REPOSO (bajado de 5; el sondeo
-                           # ocioso ahora hace 1 sola query a Supabase, ver correr_loop).
+POLL_INTERVAL = int(os.environ.get("WRITEBACK_POLL_INTERVAL", "25"))  # segundos entre sondeos EN REPOSO (subido de 3s a 25s
+                                                                      # para eliminar el consumo masivo continuo de Egress en Supabase).
 POLL_INTERVAL_TRAS_TRABAJO = 1  # tras una pasada que SÍ procesó pendientes, re-sondear
                                 # casi enseguida para DRENAR la cola sin el tiempo muerto
                                 # de "se queda pensando" entre una tarea y la siguiente.
