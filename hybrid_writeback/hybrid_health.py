@@ -58,9 +58,15 @@ from ctypes import wintypes
 
 import pywintypes
 import win32api
-import win32con
 import win32gui
 import win32process
+
+try:
+    h_def = ctypes.windll.user32.OpenDesktopW("Default", 0, False, 0x01FF)
+    if h_def:
+        ctypes.windll.user32.SetThreadDesktop(h_def)
+except Exception:
+    pass
 
 log = logging.getLogger("hybrid_health")
 

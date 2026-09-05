@@ -103,34 +103,22 @@ def _num(s):
 # ── apertura ─────────────────────────────────────────────────────────────────
 def _cerrar_ficha_si_abierta():
     """Cierra la Ficha de items (TTConfigForm) si quedó abierta de un flujo de
-    precio/costo. CONFIRMADO EN VIVO (2026-07-09): con la Ficha delante, el
-    clic al menú 'Ajustes de inventario' no llega y abrir_ajustes() expira.
-    El flujo de precio siempre cierra su diálogo (Salir/Aceptar) antes de
-    terminar, así que la Ficha no tiene cambios pendientes y cerrarla es
-    seguro."""
+    precio/costo de forma instantánea enviando WM_CLOSE."""
     hf = fp._find_hwnd(fp.FICHA_CLASS)
     if not hf:
         return
-    log.info("Cerrando la Ficha de items (quedó abierta de un flujo de precio) "
-             "antes de abrir Ajustes.")
+    log.info("Cerrando la Ficha de items instantáneamente...")
+    import win32con
     try:
-        fi = fp._win(hf)
-        b = fi.child_window(title="&Salir", class_name="TFlatButton")
-        r = b.rectangle()
-        ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-        time.sleep(0.4)
+        win32gui.PostMessage(hf, win32con.WM_CLOSE, 0, 0)
     except Exception:
         pass
-    import win32con
-    for _ in range(3):
-        hf = fp._find_hwnd(fp.FICHA_CLASS)
-        if not hf:
+
+    t0 = time.time()
+    while time.time() - t0 < 1.5:
+        if not fp._find_hwnd(fp.FICHA_CLASS):
             return
-        try:
-            win32gui.PostMessage(hf, win32con.WM_CLOSE, 0, 0)
-        except Exception:
-            pass
-        time.sleep(0.5)
+        time.sleep(0.03)
 
 
 def abrir_ajustes():

@@ -2,7 +2,16 @@
 Espera a que aparezca la ventana de login y la deja lista para inspeccionar/grabar."""
 import time
 import subprocess
+import ctypes
 import win32gui, win32con, win32process
+
+try:
+    h_def = ctypes.windll.user32.OpenDesktopW("Default", 0, False, 0x01FF)
+    if h_def:
+        ctypes.windll.user32.SetThreadDesktop(h_def)
+except Exception:
+    pass
+
 import flujo_precio as fp
 
 EXE = r"C:\HybridLiteEstacion\HybridLiteOS.exe"

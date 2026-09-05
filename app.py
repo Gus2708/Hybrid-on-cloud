@@ -306,6 +306,24 @@ def sync_status():
         "last_monitor": last_mon
     })
 
+@app.route("/api/v1/tunnel/status", methods=["GET"])
+def tunnel_status():
+    """Estado actual de los túneles Cloudflare (n8n/WAHA) para el CRM."""
+    try:
+        import tunnel_heartbeat
+        return jsonify(tunnel_heartbeat.status())
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route("/api/v1/tunnel/urls", methods=["GET"])
+def tunnel_urls():
+    """URLs públicas vigentes de los túneles (para que el CRM las use)."""
+    try:
+        import tunnel_heartbeat
+        return jsonify({"status": "ok", "urls": tunnel_heartbeat.urls()})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 @app.route("/health", methods=["GET"])
 def health():
     """Endpoint de diagnóstico completo con timeouts para no bloquear."""

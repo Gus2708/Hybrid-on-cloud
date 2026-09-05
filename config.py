@@ -99,11 +99,11 @@ RUTA_PROVEEDORES     = r'H:\HybridLite\HybridEmpresa\HybridDataBase\TProveedores
 
 # ─── Listener de Zelle (zelle_listener.py — correo Outlook via Microsoft Graph) ──
 # El puerto IMAP (993) esta bloqueado por el ISP de la tienda (confirmado con pruebas
-# de red); el listener usa Graph API por HTTPS/443 en su lugar (ver docs/ZELLE-LISTENER.md).
+# de red); el listener usa Graph API por HTTPS/443 en su lugar (ver docs/guias/ZELLE-LISTENER.md).
 # ZELLE_EMAIL: cuenta personal de Outlook/Hotmail que recibe los avisos de Zelle
 #   (solo informativa/para logs — Graph identifica la cuenta via el login "/me").
 # ZELLE_CLIENT_ID: Application (client) ID del App Registration de Azure
-#   (cliente público con device-code flow; ver docs/ZELLE-LISTENER.md).
+#   (cliente público con device-code flow; ver docs/guias/ZELLE-LISTENER.md).
 # ZELLE_TRUSTED_SENDERS: direcciones EXACTAS que cuentan como banco real
 #   (anti-spoofing). Los avisos de pago recibido vienen de customerservice@... y
 #   los de "en revisión" de onlinebanking@... (subdominio ealerts.bankofamerica.com).

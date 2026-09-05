@@ -14,7 +14,7 @@ problema de raiz sin depender del router ni de que el ISP abra un puerto.
 
 Autenticacion: OAuth2 con msal — Microsoft elimino la autenticacion basica y los app
 passwords para cuentas personales de outlook.com/hotmail.com. Requiere un App
-Registration gratuito en Azure (ver docs/ZELLE-LISTENER.md) y un login inicial:
+Registration gratuito en Azure (ver docs/guias/ZELLE-LISTENER.md) y un login inicial:
 
   python zelle_listener.py --login    # device-code flow, una sola vez
   python zelle_listener.py --status   # estado de config y token
@@ -552,7 +552,7 @@ def correr_listener():
 
 def cmd_login():
     if not config.ZELLE_CLIENT_ID:
-        print("Falta ZELLE_CLIENT_ID en .env (ver docs/ZELLE-LISTENER.md, paso Azure).")
+        print("Falta ZELLE_CLIENT_ID en .env (ver docs/guias/ZELLE-LISTENER.md, paso Azure).")
         return 1
     token = obtener_token(interactivo=True)
     print("Login OK — token guardado en zelle_token_cache.json")

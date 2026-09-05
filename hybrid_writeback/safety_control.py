@@ -252,18 +252,9 @@ class _Banner:
             return self._texto_actual
 
     def set_lista(self, items):
-        """Actualiza la lista de productos del panel lateral (a la derecha
-        del banner). `items`: iterable de (texto, hecho) — hecho=True tacha
-        ese renglón (ya aplicado en HybridLite). Pensada para llamarse una
-        vez por item a medida que el listener los va completando, para que
-        el operador vea en vivo qué falta y qué ya está.
-
-        Thread-safe: solo guarda la lista bajo lock; el hilo del banner
-        (_loop_tk) es quien redibuja los Labels reales. Si la ventana del
-        panel no llegó a existir (tkinter falló), esta llamada sigue siendo
-        inofensiva, igual que set_texto()."""
-        with self._lock:
-            self._lista_actual = list(items)
+        """Deshabilitado a pedido del usuario: el panel lateral tapaba botones
+        del sistema (como 'Costos y Precios' en la Ficha)."""
+        pass
 
     def _lista_pendiente(self):
         with self._lock:

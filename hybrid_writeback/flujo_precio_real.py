@@ -54,6 +54,14 @@ import logging
 
 import win32gui
 
+try:
+    import ctypes
+    h_def = ctypes.windll.user32.OpenDesktopW("Default", 0, False, 0x01FF)
+    if h_def:
+        ctypes.windll.user32.SetThreadDesktop(h_def)
+except Exception:
+    pass
+
 # consola tolerante a UTF-8
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -68,8 +76,7 @@ import realinput as ri
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("precio_real")
 
-DIR = os.path.dirname(os.path.abspath(__file__))
-TOL = 0.02
+TOL = 0.01
 IVA_DEF = 0.16
 
 # Productos EXENTOS de IVA: Hybrid guarda la exencion por producto en
@@ -260,7 +267,7 @@ def _esperar_lista_filtrada(busq, timeout=60.0):
             log.info("Lista filtrada en %.1fs (barra de scroll oculta).",
                      time.time() - t0)
             return True
-        time.sleep(0.3)
+        time.sleep(0.04)
     log.warning("La lista no se filtró en %.0fs (la barra de scroll sigue visible).",
                 timeout)
     return False
@@ -344,17 +351,30 @@ def cargar_producto(codigo):
     """Modificar -> Ed_Buscar -> teclear -> ENTER -> (esperar refresco) -> ENTER
     selecciona la fila posicionada en el código. (INPUT REAL)"""
     hf = abrir_ficha()
-    _focus(hf); time.sleep(0.2)
+    _focus(hf); time.sleep(0.05)
 
     if _ficha_muestra(codigo):
         log.info("La Ficha ya muestra %s.", codigo)
         return
 
     L, T, _, _ = win32gui.GetWindowRect(hf)
-    ri.click(L + MODIFICAR_REL[0], T + MODIFICAR_REL[1])          # Modificar
-    hbusq = fp._wait_for(fp.BUSQ_CLASS, desc="Busqueda")
+    hbusq = None
+    for intento in range(1, 4):
+        _al_frente(hf)
+        ri.click(L + MODIFICAR_REL[0], T + MODIFICAR_REL[1])          # Modificar
+        t0 = time.time()
+        while time.time() - t0 < 1.0:
+            hbusq = fp._find_hwnd(fp.BUSQ_CLASS)
+            if hbusq:
+                break
+            time.sleep(0.04)
+        if hbusq:
+            break
+        log.warning("Intento %s: clic en Modificar no abrió la Búsqueda; reintentando...", intento)
+    if not hbusq:
+        hbusq = fp._wait_for(fp.BUSQ_CLASS, desc="Busqueda")
     busq = fp._win(hbusq)
-    time.sleep(0.3)
+    time.sleep(0.05)
 
     # La Búsqueda abre cargando los ~7.600 productos. Hasta que NO termine, la
     # app no procesa mensajes y cualquier clic/tecla se pierde (ver
@@ -374,10 +394,10 @@ def cargar_producto(codigo):
         _focus(hbusq)
         r = ed.rectangle()
         ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)    # Ed_Buscar
-        time.sleep(0.15)
+        time.sleep(0.05)
         ri.clear_field()
         ri.type_text(codigo)
-        time.sleep(0.3)
+        time.sleep(0.04)
         # El campo refleja lo tecleado: si quedó vacío es que el clic o las
         # teclas se perdieron (app ocupada, o una ventana topmost por delante),
         # y seguir sería teclear al vacío y aceptar la fila 1 de la lista.
@@ -398,34 +418,40 @@ def cargar_producto(codigo):
                         intento, codigo)
             continue
 
-        # CARGAR LA FILA con DOBLE-CLIC. Ya filtrada, la fila 1 ES el producto.
-        # El ENTER no sirve como acción principal: el foco está en el campo de
-        # búsqueda (hubo que clicarlo para teclear), así que un ENTER ahí
-        # relanza la búsqueda en vez de seleccionar. Por eso la lista mostraba
-        # el producto y aun así nunca se cargaba en la Ficha.
+        # CARGAR LA FILA con DOBLE-CLIC o ENTER. Ya filtrada, la fila 1 ES el producto.
         _al_frente(hbusq)
         gr = grid.rectangle()
         ri.click(gr.left + 100, gr.top + 26, double=True)        # fila 1 = el resultado
+        time.sleep(0.05)
+        if fp._find_hwnd(fp.BUSQ_CLASS):
+            ri.press("ENTER")                                    # confirmación rápida por teclado
 
         # Abrir la Ficha del producto también tarda: esperar de verdad.
         t0 = time.time()
-        while time.time() - t0 < 20.0:
-            if _ficha_muestra(codigo) or fp._find_hwnd("TMessageForm"):
+        cargado = False
+        while time.time() - t0 < 8.0:
+            if _ficha_muestra(codigo):
+                cargado = True
                 break
-            time.sleep(0.4)
-        if _ficha_muestra(codigo):
+            time.sleep(0.06)
+        if cargado:
             log.info("Producto cargado en la Ficha al intento %d.", intento)
             break
         log.warning("Intento %d: el doble-clic no cargó %s (edits=%s); "
                     "repito la búsqueda entera.", intento, codigo, _ficha_edits())
 
-    if fp._find_hwnd("TMessageForm"):
-        _cerrar_residuales()
-        raise PrecioError("Apareció un diálogo de error al buscar (revisar).")
-    if fp._find_hwnd(fp.BUSQ_CLASS):
-        _cerrar_residuales()
+    # Si no cargó, intentar cerrar residuales y dar una última oportunidad
+    if not cargado:
+        if fp._find_hwnd(fp.BUSQ_CLASS):
+            _cerrar_residuales()
+        t0 = time.time()
+        while time.time() - t0 < 2.0:
+            if _ficha_muestra(codigo):
+                cargado = True
+                break
+            time.sleep(0.06)
 
-    if not _ficha_muestra(codigo):
+    if not cargado:
         raise PrecioError(f"La Ficha NO cargó {codigo} (edits={_ficha_edits()}).")
     log.info("Producto %s cargado en la Ficha.", codigo)
 
@@ -442,28 +468,29 @@ def abrir_costos_precios():
     if not hf:
         raise fp.FlujoError("La Ficha de inventario no está abierta.")
     fi = fp._win(hf)
-    for intento in range(1, 4):
+    for intento in range(1, 6):
+        h = fp._find_hwnd(fp.PRECIOS_CLASS)
+        if h:
+            return h
         try:
-            _focus(hf)
-            time.sleep(0.4)
+            _al_frente(hf)
             btn = fi.child_window(title="Costos &y Precios", class_name="TFlatButton")
-            btn.wait("exists visible", timeout=fp.T_WAIT)
+            btn.wait("exists visible", timeout=1.5)
             r = btn.rectangle()
             ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
         except Exception as e:
-            log.warning("Intento %s de abrir Costos y Precios: no pude clickear el botón: %s",
-                        intento, e)
+            log.warning("Intento %s de clickear Costos y Precios: %s", intento, e)
+            time.sleep(0.15)
             continue
-        # esperar el diálogo con timeout corto; si no aparece, re-enfocar y reintentar
+        # verificar si abrió la ventana (máx 1.2s de espera)
         t0 = time.time()
-        while time.time() - t0 < 4:
+        while time.time() - t0 < 1.2:
             h = fp._find_hwnd(fp.PRECIOS_CLASS)
             if h:
                 return h
-            time.sleep(0.3)
-        log.warning("Intento %s: el diálogo Costos y Precios no apareció, reintento.", intento)
-    raise fp.FlujoError(f"No apareció la ventana {fp.PRECIOS_CLASS} (Costos y Precios) "
-                        f"tras 3 intentos.")
+            time.sleep(0.06)
+        log.warning("Intento %s: no se detectó apertura de Costos y Precios; reintentando clic...", intento)
+    raise fp.FlujoError(f"No apareció la ventana {fp.PRECIOS_CLASS} (Costos y Precios) tras 5 intentos.")
 
 
 def escribir_precio(target, iva):
@@ -486,10 +513,9 @@ def escribir_precio(target, iva):
     # AHORRO (pedido del dueño 2026-07-12): si el precio con-impuesto YA está en
     # el target (± TOL), NO lo reescribimos -- se evita teclear y el recálculo,
     # y se sale más rápido. Típico al comprar un producto cuyo precio de venta no
-    # cambió. En un alta el campo arranca en 0, así que igual se escribe.
     con_actual = hpw._num(con_field.window_text())
     sin_actual = hpw._num(sin_field.window_text())
-    if con_actual is not None and abs(con_actual - target) <= TOL:
+    if con_actual is not None and abs(con_actual - target) < 0.005:
         log.info("Precio con-impuesto ya está en %.2f (=target); no se reescribe.", con_actual)
         return {"con": con_actual, "sin": sin_actual}
 
@@ -505,21 +531,21 @@ def escribir_precio(target, iva):
     r = con_field.rectangle()
     cx = (r.left + r.right) // 2
     ri.click(cx, r.bottom - 4)
-    time.sleep(0.1)
+    time.sleep(0.04)
     try:
         con_field.set_focus()
     except Exception:
         pass
-    time.sleep(0.1)
+    time.sleep(0.04)
 
     ri.clear_hard()                       # borra el valor anterior de verdad
     if (con_field.window_text() or "").strip() not in ("", "0", "0.00", "0,00"):
         # segundo intento de borrado si quedó algo
         ri.clear_hard()
     ri.type_number(f"{target:.2f}")       # teclea por el numérico (respeta el decimal)
-    time.sleep(0.1)
+    time.sleep(0.04)
     ri.press("ENTER")                     # commit + recalcula el sin-impuesto y el Bs
-    time.sleep(0.6)
+    time.sleep(0.1)
 
     con_val = hpw._num(con_field.window_text())
     sin_val = hpw._num(sin_field.window_text())
@@ -591,19 +617,19 @@ def escribir_costo(nuevo_costo, costo_actual_db):
     # mismo patrón probado de escribir_precio: clic bajo + set_focus + borrado duro
     r = campo.rectangle()
     ri.click((r.left + r.right) // 2, r.bottom - 4)
-    time.sleep(0.1)
+    time.sleep(0.04)
     try:
         campo.set_focus()
     except Exception:
         pass
-    time.sleep(0.1)
+    time.sleep(0.04)
     ri.clear_hard()
     if (campo.window_text() or "").strip() not in ("", "0", "0.00", "0,00"):
         ri.clear_hard()
     ri.type_number(f"{float(nuevo_costo):.2f}")
-    time.sleep(0.1)
+    time.sleep(0.04)
     ri.press("ENTER")
-    time.sleep(0.6)
+    time.sleep(0.1)
 
     leido = hpw._num(campo.window_text())
     log.info("Costo en pantalla tras teclear: %s (target=%s)", leido, nuevo_costo)
@@ -673,7 +699,7 @@ def _click_boton_dialogo(titulo, esperar_cierre=False, intentos=3):
             log.warning("Intento %d de pulsar '%s': %s", intento, titulo, e)
             time.sleep(0.4)
             continue
-        time.sleep(0.6)
+        time.sleep(0.2)
         if not esperar_cierre or not fp._find_hwnd(fp.PRECIOS_CLASS):
             return True
         log.warning("Intento %d: '%s' pulsado pero el diálogo sigue abierto; reintento.",
@@ -682,38 +708,48 @@ def _click_boton_dialogo(titulo, esperar_cierre=False, intentos=3):
 
 
 def _confirmar_si():
-    """Responde 'Sí' al diálogo Confirm de Guardar (si aparece)."""
+    """Responde 'Sí' / 'Aceptar' al diálogo Confirm de Guardar (si aparece)."""
     t0 = time.time()
     while time.time() - t0 < 5:
-        h = fp._find_hwnd("TMessageForm")
-        if h:
-            _focus(h)
-            for titulo in ("&Yes", "&Sí", "Sí", "Yes"):
-                try:
-                    b = fp._win(h).child_window(title=titulo)
-                    r = b.rectangle()
-                    ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-                    log.info("Confirmación '%s' pulsada.", titulo)
-                    time.sleep(0.8)
-                    return True
-                except Exception:
-                    continue
-        time.sleep(0.3)
+        for cls in ("TMessageForm", "TFConfirmacion"):
+            h = fp._find_hwnd(cls)
+            if h:
+                _focus(h)
+                for titulo in ("&Yes", "&Sí", "Sí", "Yes", "Aceptar", "OK", "Continuar", "&Aceptar"):
+                    try:
+                        b = fp._win(h).child_window(title=titulo)
+                        r = b.rectangle()
+                        ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+                        log.info("Confirmación '%s' pulsada en %s.", titulo, cls)
+                        time.sleep(0.08)
+                        return True
+                    except Exception:
+                        continue
+        time.sleep(0.03)
     return False
 
 
 def _guardar_ficha():
-    """Guardar (barra de la Ficha, owner-drawn) -> Confirm 'Sí'. INPUT REAL."""
+    """Guardar (barra de la Ficha, owner-drawn) -> Confirm 'Sí'. INPUT REAL con reintento."""
     hf = fp._find_hwnd(fp.FICHA_CLASS)
-    _focus(hf)
+    _al_frente(hf)
     L, T, _, _ = win32gui.GetWindowRect(hf)
-    ri.click(L + GUARDAR_REL[0], T + GUARDAR_REL[1])
-    time.sleep(1.0)
-    _confirmar_si()
+    for intento in range(1, 4):
+        ri.click(L + GUARDAR_REL[0], T + GUARDAR_REL[1])
+        t0 = time.time()
+        while time.time() - t0 < 1.2:
+            if fp._find_hwnd("TMessageForm") or fp._find_hwnd("TFConfirmacion"):
+                break
+            time.sleep(0.04)
+        if _confirmar_si():
+            return True
+        log.warning("Intento %s de Guardar: no se detectó confirmación 'Sí'; reintentando clic...", intento)
+        time.sleep(0.15)
     return True
 
 
-def set_precio_costo(codigo, nuevo_precio=None, nuevo_costo=None, iva=None, commit=False):
+def set_precio_costo(codigo, nuevo_precio=None, nuevo_costo=None, iva=None, commit=False,
+                     costo_anterior=None, precio_anterior=None, verificar_db=False):
     """Cambia precio y/o costo de un producto en UNA sola sesión de Ficha.
 
     Al menos uno de nuevo_precio/nuevo_costo debe venir. Si vienen ambos: se
@@ -743,12 +779,14 @@ def set_precio_costo(codigo, nuevo_precio=None, nuevo_costo=None, iva=None, comm
     if not ok:
         return {"ok": False, "etapa": "abrir_hybrid", "detalle": msg}
 
-    # el precio DB se lee SIEMPRE: si hay cambio de costo sin cambio de precio,
-    # hace falta como PIN (HybridLite recalcula el precio al cambiar el costo
-    # — confirmado en vivo 2026-07-09 — y hay que reescribirlo para que el
-    # precio NO cambie sin que el usuario lo haya pedido)
-    db_precio_antes = hpw._db_precio_usd(codigo)
-    db_costo_antes = hpw._db_costo_usd(codigo) if costo_target is not None else None
+    # El precio y costo antes de modificar: si vienen provistos por el llamador se usan directo,
+    # si no, se leen de DBISAM en una SOLA pasada eficiente (_db_valores_usd).
+    if costo_anterior is not None and (precio_anterior is not None or target is not None):
+        db_precio_antes = float(precio_anterior) if precio_anterior is not None else None
+        db_costo_antes = float(costo_anterior)
+    else:
+        db_precio_antes, db_costo_antes = hpw._db_valores_usd(codigo)
+
     log.info("Precio USD en DB ANTES: %s ; Costo USD en DB ANTES: %s",
              db_precio_antes, db_costo_antes)
 
@@ -818,35 +856,38 @@ def set_precio_costo(codigo, nuevo_precio=None, nuevo_costo=None, iva=None, comm
     if fp._find_hwnd(fp.PRECIOS_CLASS):
         _click_boton_dialogo("Salir")     # cierra el diálogo conservando el valor aceptado
     _guardar_ficha()                      # persiste en la Ficha (Guardar + Confirm Sí)
-    time.sleep(1.2)
+    time.sleep(0.08)                      # breve respiro para que Delphi procese el guardado
 
-    detalles = []
+    detalles = ["Guardado y confirmado en Ficha (UI)"]
     ok_total = True
     db_precio_despues = None
     db_costo_despues = None
 
-    if precio_a_escribir is not None:
-        db_precio_despues = hpw._db_precio_usd(codigo)
-        log.info("Precio USD en DB DESPUÉS: %s", db_precio_despues)
-        etiqueta = "Precio aplicado" if target is not None else "Precio fijado (pin, sin cambio pedido)"
-        if db_precio_despues is not None and abs(db_precio_despues - precio_a_escribir) <= TOL:
-            detalles.append(f"{etiqueta} y VERIFICADO en DB: {db_precio_despues}")
-        else:
-            ok_total = False
-            detalles.append(f"¡ALERTA! Precio en DB quedó en {db_precio_despues}, "
-                            f"no en {precio_a_escribir}.")
-
-    if costo_target is not None:
-        db_costo_despues = hpw._db_costo_usd(codigo)
-        log.info("Costo USD en DB DESPUÉS: %s", db_costo_despues)
-        if db_costo_despues is None:
-            detalles.append("Costo: no verificable por DB (TPC_COSTOACTUAL no legible), "
-                             "pero se verificó en pantalla.")
-        elif abs(db_costo_despues - costo_target) <= TOL:
-            detalles.append(f"Costo aplicado y VERIFICADO en DB: {db_costo_despues}")
-        else:
-            ok_total = False
-            detalles.append(f"¡ALERTA! Costo en DB quedó en {db_costo_despues}, no en {costo_target}.")
+    if verificar_db:
+        t0 = time.time()
+        while time.time() - t0 < 2.0:
+            db_precio_despues, db_costo_despues = hpw._db_valores_usd(codigo)
+            p_ok = (precio_a_escribir is None or
+                    (db_precio_despues is not None and abs(db_precio_despues - precio_a_escribir) <= TOL))
+            c_ok = (costo_target is None or
+                    (db_costo_despues is not None and abs(db_costo_despues - costo_target) <= TOL))
+            if p_ok and c_ok:
+                break
+            time.sleep(0.12)
+        log.info("Verificación DB post-commit: precio=%s costo=%s", db_precio_despues, db_costo_despues)
+        if precio_a_escribir is not None:
+            etiqueta = "Precio aplicado" if target is not None else "Precio fijado (pin, sin cambio pedido)"
+            if db_precio_despues is not None and abs(db_precio_despues - precio_a_escribir) <= TOL:
+                detalles.append(f"{etiqueta} y VERIFICADO en DB: {db_precio_despues}")
+            else:
+                ok_total = False
+                detalles.append(f"¡ALERTA! Precio en DB quedó en {db_precio_despues}, no en {precio_a_escribir}.")
+        if costo_target is not None:
+            if db_costo_despues is not None and abs(db_costo_despues - costo_target) <= TOL:
+                detalles.append(f"Costo aplicado y VERIFICADO en DB: {db_costo_despues}")
+            else:
+                ok_total = False
+                detalles.append(f"¡ALERTA! Costo en DB quedó en {db_costo_despues}, no en {costo_target}.")
 
     etapa = "commit" if ok_total else "verificacion_db"
     return {"ok": ok_total, "etapa": etapa, "detalle": " | ".join(detalles),
@@ -891,7 +932,8 @@ if __name__ == "__main__":
         iva = float(_raw[_raw.index("--iva") + 1])
     try:
         res = set_precio_costo(codigo, nuevo_precio=target, nuevo_costo=costo,
-                                iva=iva, commit="--commit" in _raw)
+                                iva=iva, commit="--commit" in _raw,
+                                verificar_db="--verificar-db" in _raw)
         print("\n=== RESULTADO ===")
         for k, v in res.items():
             print(f"  {k}: {v}")

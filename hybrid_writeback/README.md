@@ -35,6 +35,8 @@ el backend lo aplique en el sistema local HybridLite **sin corromper la base de 
 | `flujo_pedido_real.py` | Coreografía de pedidos de cliente (Tipo 10 / Status 4). |
 | `flujo_directorio_real.py` | Coreografía de alta de cliente/proveedor en la Ficha del Directorio. |
 | `flujo_ficha_real.py` | Edición de descripción/referencia de un producto existente (Modificar). |
+| `alias_manager.py` | Resolución y catálogo de equivalencias de códigos de proveedor (`alias_proveedores.json`). |
+| `batch_price_updater.py` | Motor de actualización masiva de precios/costos con checkpoints, telemetría y prefiltrado DBISAM. |
 | `listener_base.py` | Núcleo común de los 4 listeners (config, logging, guards, REST, prioridad `hay_pendientes_prioritarios`, bucle `correr_loop`). |
 | `listener_writeback.py` | Pipeline `ordenes_cambio_items` (stock/precio/costo/ficha), 3 fases globales por pasada. |
 | `listener_compras.py` | Pipeline `compras_app` (una compra = un documento). |
@@ -398,3 +400,31 @@ ejecutó ni se cableó. Retomarla el día que se agregue edición de precio en l
 4. **Integración al watchdog**: decidir si `listener_writeback.py` entra a
    `backend_watchdog.py` (con `HYBRID_WRITE_ENABLED=1` + `HYBRID_WRITE_WINDOW` de
    producción) una vez validado el end-to-end.
+
+---
+
+## Optimización de Latencia y Actualización Masiva (2026-09)
+
+En septiembre de 2026 se completó una refactorización de rendimiento y robustez sobre el flujo de actualización de precios y costos, validada en vivo con los **66 productos de Floripaint** (100% verificados en DBISAM `TCostoPrecioInv.Dat`):
+
+1. **Eliminación de pausas muertas entre productos (de 4.5s a 0.001s):**
+   - En ejecución en caliente se desactiva la lectura individual síncrona por ítem (`verificar_db=False`).
+   - Se añadió `_db_valores_usd_batch(codigos)` en `hybrid_price_writer.py`, que audita lotes enteros de la DBISAM en streaming en una sola pasada de red (**0.68s para 66 ítems** vs >120s antes).
+
+2. **Cierre instantáneo de Ficha (de 6.10s a 0.03s):**
+   - `TTConfigForm` no posee botón `&Salir`. Se reemplazó el intento de búsqueda de pywinauto (timeout de 5.0s) por `win32gui.PostMessage(hf, win32con.WM_CLOSE, 0, 0)`.
+
+3. **Navegación veloz a Compras (de 17s a 5.17s):**
+   - Se reemplazó el chequeo bloqueante `.is_visible()` sobre botones no instanciados por `.exists(timeout=0)`.
+
+4. **Tolerancia estricta (<0.005) contra recálculos de Delphi:**
+   - La constante de comparación en `flujo_precio_real.py` e `hybrid_price_writer.py` se fijó en `TOL = 0.01`, y la omisión de reescritura en `< 0.005`, impidiendo que el redondeo automático del POS altere el precio meta.
+
+5. **Nuevo motor batch con checkpoints (`batch_price_updater.py`):**
+   - Soporte de reanudación automática tras caídas de red o interrupciones.
+   - Resolución automática de equivalencias con `alias_manager.py` (`alias_proveedores.json`).
+   - Prefiltrado en 0.6s para no tocar ítems que ya están al día en la base de datos.
+   - Auditoría final obligatoria y telemetría estructurada en tiempo real.
+
+Para detalles completos, ver [docs/auditorias-y-reportes/auditoria_y_mejoras_hybrid.md](../docs/auditorias-y-reportes/auditoria_y_mejoras_hybrid.md).
+

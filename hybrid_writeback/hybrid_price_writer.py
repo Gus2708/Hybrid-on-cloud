@@ -31,7 +31,7 @@ import read_db_precio  # reutiliza la ruta y lógica de lectura DBISAM
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("price_writer")
 
-TOL = 0.02          # tolerancia de comparación (centavos)
+TOL = 0.01          # tolerancia de comparación (1 centavo exacto)
 MAX_RETRIES = 4
 
 
@@ -160,33 +160,61 @@ def _abort(dlg):
         log.error("No pude pulsar 'Salir' automáticamente: %s. Ciérralo a mano.", e)
 
 
-def _db_precio_usd(codigo):
-    """Lee de DBISAM el PVPCONIMPUESTO1 del registro TIPO=1 (USD)."""
+def _db_valores_usd(codigo):
+    """Lee precio y costo USD en una SOLA pasada de DBISAM. Devuelve (precio, costo)."""
     db = read_db_precio.pydbisam.PyDBISAM(read_db_precio.RUTA)
     campos = db.fields()
     idx = {n: i for i, n in enumerate(campos)}
+    cod_i = idx.get("TPC_CODIGOPRODUCTO")
+    tipo_i = idx.get("TPC_TIPO")
+    pvp_i = idx.get("TPC_PVPCONIMPUESTO1")
+    costo_i = idx.get("TPC_COSTOACTUAL")
+    if cod_i is None or tipo_i is None:
+        return None, None
+    c_target = codigo.strip()
     for row in db.rows():
-        if str(row[idx["TPC_CODIGOPRODUCTO"]]).strip() == codigo and row[idx["TPC_TIPO"]] == 1:
-            return float(row[idx["TPC_PVPCONIMPUESTO1"]])
-    return None
+        if str(row[cod_i]).strip() == c_target and row[tipo_i] == 1:
+            precio = float(row[pvp_i]) if pvp_i is not None and row[pvp_i] is not None else None
+            costo = float(row[costo_i]) if costo_i is not None and row[costo_i] is not None else None
+            return precio, costo
+    return None, None
+
+
+def _db_valores_usd_batch(codigos):
+    """Lee precios y costos USD para una lista de códigos en una SOLA pasada de DBISAM.
+    Devuelve dict {codigo: (precio, costo)}."""
+    cod_set = {str(c).strip() for c in codigos}
+    db = read_db_precio.pydbisam.PyDBISAM(read_db_precio.RUTA)
+    campos = db.fields()
+    idx = {n: i for i, n in enumerate(campos)}
+    cod_i = idx.get("TPC_CODIGOPRODUCTO")
+    tipo_i = idx.get("TPC_TIPO")
+    pvp_i = idx.get("TPC_PVPCONIMPUESTO1")
+    costo_i = idx.get("TPC_COSTOACTUAL")
+    res = {}
+    if cod_i is None or tipo_i is None:
+        return res
+    for row in db.rows():
+        c = str(row[cod_i]).strip()
+        if c in cod_set and row[tipo_i] == 1:
+            precio = float(row[pvp_i]) if pvp_i is not None and row[pvp_i] is not None else None
+            costo = float(row[costo_i]) if costo_i is not None and row[costo_i] is not None else None
+            res[c] = (precio, costo)
+            if len(res) == len(cod_set):
+                break
+    return res
+
+
+def _db_precio_usd(codigo):
+    """Lee de DBISAM el PVPCONIMPUESTO1 del registro TIPO=1 (USD)."""
+    p, _ = _db_valores_usd(codigo)
+    return p
 
 
 def _db_costo_usd(codigo):
-    """Lee de DBISAM el TPC_COSTOACTUAL del registro TIPO=1 (USD), SOLO LECTURA.
-
-    Mismo registro/fila que _db_precio_usd (confirmado: odbc_test.py consulta
-    TPC_COSTOACTUAL y TPC_PVPCONIMPUESTO1 en el mismo SELECT). TPC_COSTOACTUAL
-    es el costo USD sin IVA que maneja la app (campo 'Costo Actual' visible en
-    campos_precio.png bajo 'Costos Moneda Referencial' = 6.06 para ese producto)."""
-    db = read_db_precio.pydbisam.PyDBISAM(read_db_precio.RUTA)
-    campos = db.fields()
-    idx = {n: i for i, n in enumerate(campos)}
-    if "TPC_COSTOACTUAL" not in idx:
-        return None
-    for row in db.rows():
-        if str(row[idx["TPC_CODIGOPRODUCTO"]]).strip() == codigo and row[idx["TPC_TIPO"]] == 1:
-            return float(row[idx["TPC_COSTOACTUAL"]])
-    return None
+    """Lee de DBISAM el TPC_COSTOACTUAL del registro TIPO=1 (USD), SOLO LECTURA."""
+    _, c = _db_valores_usd(codigo)
+    return c
 
 
 def set_price(codigo, target, iva=0.16, commit=False):

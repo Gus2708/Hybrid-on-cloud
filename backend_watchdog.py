@@ -167,6 +167,11 @@ ensure_single_instance()
 #             ni el .env).
 SCRIPTS = [
     ("app.py",              "API Flask"),
+    ("tunnel_heartbeat.py", "Túneles Cloudflare CRM", {
+        # Publica la URL de los quick tunnels de n8n/WAHA en Supabase para
+        # que el CRM de empleados pueda alcanzar n8n/WAHA desde la nube sin
+        # un dominio fijo. Corre como proceso separado.
+    }),
     ("monitor.py",          "Monitor archivos"),
     ("remote_listener.py",  "Listener remoto"),
     ("widget.pyw",          "Widget UI"),

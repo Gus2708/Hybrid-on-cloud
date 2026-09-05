@@ -44,6 +44,14 @@ import subprocess
 
 import win32gui
 import win32process
+import ctypes
+
+try:
+    h_def = ctypes.windll.user32.OpenDesktopW("Default", 0, False, 0x01FF)
+    if h_def:
+        ctypes.windll.user32.SetThreadDesktop(h_def)
+except Exception:
+    pass
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -80,12 +88,24 @@ def _creds():
 
 
 def _focus(hwnd):
+    if not hwnd:
+        return
     try:
-        fp._win(hwnd).set_focus()
+        u32 = ctypes.windll.user32
+        k32 = ctypes.windll.kernel32
+        fg_hwnd = u32.GetForegroundWindow()
+        if fg_hwnd != hwnd:
+            fg_tid = u32.GetWindowThreadProcessId(fg_hwnd, None)
+            cur_tid = k32.GetCurrentThreadId()
+            u32.AttachThreadInput(cur_tid, fg_tid, True)
+            u32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            u32.SetForegroundWindow(hwnd)
+            u32.BringWindowToTop(hwnd)
+            u32.AttachThreadInput(cur_tid, fg_tid, False)
     except Exception:
         pass
     try:
-        win32gui.SetForegroundWindow(hwnd)
+        fp._win(hwnd).set_focus()
     except Exception:
         pass
     time.sleep(0.3)
@@ -221,6 +241,7 @@ def hacer_login(hlogin=None, timeout_main=60, antes_main=None):
 # HybridLite cada vez; si esa ventana ya no existe (se cerró, crasheó) se
 # detecta y se lanza una instancia nueva.
 _AISLADO_PID = None
+_LANZADA_POR_NOSOTROS = False
 
 
 def _pid_de(hwnd):
@@ -257,7 +278,16 @@ def asegurar_hybrid(timeout_login=60, timeout_main=60):
     """Asegura una instancia AISLADA de HybridLite abierta+logueada, sin
     tocar la ventana que un empleado pueda tener abierta (ver docstring del
     módulo). Deja flujo_precio.set_target_pid() apuntando a esa instancia."""
-    global _AISLADO_PID
+    global _AISLADO_PID, _LANZADA_POR_NOSOTROS
+
+    # Fast path: si la Ficha ya está abierta y respondiendo, retorno instantáneo sin chequeos pesados
+    hf = fp._find_hwnd(fp.FICHA_CLASS)
+    if hf and hh.responde(hf, timeout_ms=100):
+        pid = _pid_de(hf)
+        if pid:
+            _AISLADO_PID = pid
+            fp.set_target_pid(pid)
+        return True, "Ficha de inventario ya abierta y lista."
 
     # 0) ¿HybridLite está COLGADO? Antes de cualquier otra cosa: si la app no
     #    responde (o quedó un proceso fantasma sin ventana), reutilizarla o
@@ -291,6 +321,15 @@ def asegurar_hybrid(timeout_login=60, timeout_main=60):
     _AISLADO_PID = None
     fp.clear_target_pid()
 
+    # 1.5) Si ya hay una ventana de MAIN abierta en el sistema, la adoptamos para evitar duplicados
+    h_existente = fp._find_hwnd(MAIN)
+    if h_existente:
+        pid = _pid_de(h_existente)
+        if pid:
+            _AISLADO_PID = pid
+            fp.set_target_pid(pid)
+            return True, "Reutilizando instancia principal de Hybrid ya abierta."
+
     # 2) no hay instancia aislada viva -> lanzar SIEMPRE una instancia NUEVA.
     #    NUNCA se reutiliza el módulo principal/login que ya esté visible:
     #    esa ventana puede ser la de un empleado trabajando ahora mismo.
@@ -300,6 +339,7 @@ def asegurar_hybrid(timeout_login=60, timeout_main=60):
     antes_login = fp._hwnds_de_clase(LOGIN)
     antes_main = fp._hwnds_de_clase(MAIN)
     pids_antes = hh.pids_hybrid()
+    _LANZADA_POR_NOSOTROS = True
     subprocess.Popen([EXE], cwd=EXE_DIR)
 
     hlogin = fp._esperar_ventana_nueva(LOGIN, antes_login, timeout=timeout_login)
@@ -377,10 +417,12 @@ def cerrar_aislada():
     instancias: eso mataría también la del empleado. El cierre SIEMPRE es por
     este PID puntual. (Única excepción en todo el proyecto:
     hybrid_health.matar_todo, y solo con un cuelgue confirmado.)"""
-    global _AISLADO_PID
+    global _AISLADO_PID, _LANZADA_POR_NOSOTROS
     import win32con
     pid = _AISLADO_PID
-    if pid is None:
+    if pid is None or not _LANZADA_POR_NOSOTROS:
+        _AISLADO_PID = None
+        fp.clear_target_pid()
         return
     if not _pid_es_hybrid(pid):
         print(f"PID aislado {pid} ya no es HybridLiteOS (cerrado o reciclado); no se toca nada.")
@@ -393,6 +435,7 @@ def cerrar_aislada():
     except Exception as e:
         print(f"No pude cerrar la instancia aislada (PID {pid}): {e}")
     _AISLADO_PID = None
+    _LANZADA_POR_NOSOTROS = False
     fp.clear_target_pid()
 
 

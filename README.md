@@ -87,7 +87,7 @@ The important property: the mobile app never writes to the catalog tables. It
 writes *intent* to a queue, and the write-back listeners turn intent into real
 POS documents. That keeps a single writer in front of the accounting data and
 makes every change auditable — and it is why the row-level security policies
-([docs/SECURITY-RLS.md](docs/SECURITY-RLS.md)) can restrict catalog writes to
+([docs/base-de-datos/SECURITY-RLS.md](docs/base-de-datos/SECURITY-RLS.md)) can restrict catalog writes to
 `service_role` without breaking either app.
 
 ---
@@ -202,14 +202,15 @@ system assumes failure rather than treating it as exceptional:
 ├── hybrid_writeback/          # Write-back engine
 │   ├── realinput.py           # Win32 SendInput driver (real hardware events)
 │   ├── abrir_hybrid.py        # Isolated POS instance + automated login
-│   ├── safety_control.py      # Mutex, abort hotkey, live banner
+│   ├── batch_price_updater.py # Resilient batch price updater with checkpoints
+│   ├── alias_manager.py       # Supplier SKU alias resolution (alias_proveedores.json)
 │   ├── flujo_*_real.py        # One choreography per operation
 │   ├── listener_*.py          # One queue consumer per operation
 │   └── diagnostico/           # Throwaway UI-inspection scripts
 │
 ├── widget.pyw                 # Desktop status widget (system tray)
 ├── sql/                       # Schema and RLS hardening
-├── plans/                     # Design notes written before each change
+├── docs/                      # Centralized documentation (architecture, guides, plans, audits)
 └── tests/                     # pytest suite (99 tests)
 ```
 
@@ -241,13 +242,15 @@ for every supported variable. No credentials are committed to this repository.
 
 | Document | Contents |
 | :--- | :--- |
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Sync engine internals and data flow |
+| [docs/README.md](docs/README.md) | Centralized documentation index and category structure |
+| [ARCHITECTURE.md](docs/arquitectura/ARCHITECTURE.md) | Sync engine internals and data flow |
 | [hybrid_writeback/README.md](hybrid_writeback/README.md) | Write-back engine, flow by flow |
-| [SECURITY-RLS.md](docs/SECURITY-RLS.md) | Row-level security policies and hardening |
-| [API-SYNC-GUIDE.md](docs/API-SYNC-GUIDE.md) | Local API endpoints |
-| [ZELLE-LISTENER.md](docs/ZELLE-LISTENER.md) | Payment-notification listener and anti-spoofing |
-| [INTEGRACION_SERRUCHO_GO.md](docs/INTEGRACION_SERRUCHO_GO.md) | How the mobile app consumes the unified movement history |
-| [plans/](plans/) | Design notes written before each significant change |
+| [auditoria_y_mejoras_hybrid.md](docs/auditorias-y-reportes/auditoria_y_mejoras_hybrid.md) | Latency audit, batch pricing engine, and DBISAM streaming verification |
+| [SECURITY-RLS.md](docs/base-de-datos/SECURITY-RLS.md) | Row-level security policies and hardening |
+| [API-SYNC-GUIDE.md](docs/guias/API-SYNC-GUIDE.md) | Local API endpoints |
+| [ZELLE-LISTENER.md](docs/guias/ZELLE-LISTENER.md) | Payment-notification listener and anti-spoofing |
+| [INTEGRACION_SERRUCHO_GO.md](docs/guias/INTEGRACION_SERRUCHO_GO.md) | How the mobile app consumes the unified movement history |
+| [docs/planes/](docs/planes/) | Design notes written before each significant change (001 to 021) |
 
 Code comments and internal documents are in Spanish, the working language of the
 business this was built for.

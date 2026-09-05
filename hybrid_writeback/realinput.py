@@ -70,14 +70,11 @@ def _key_input(vk=0, scan=0, flags=0):
                  u=_INPUTunion(ki=KEYBDINPUT(vk, scan, flags, 0, 0)))
 
 
-def press_vk(vk, hold=0.015):
-    # hold/trailing recortados (0.02/0.03 -> 0.015/0.02): esto multiplica en cada
-    # tecla (incluye los 32 borrados de clear_hard). Sigue dando margen a que el OS
-    # registre el keyup. NO afecta a type_code (que mantiene su per_char lento).
+def press_vk(vk, hold=0.01):
     _send(_key_input(vk=vk, flags=0))
     time.sleep(hold)
     _send(_key_input(vk=vk, flags=KEYEVENTF_KEYUP))
-    time.sleep(0.02)
+    time.sleep(0.01)
 
 
 def press(name, hold=0.02):
@@ -127,16 +124,16 @@ def select_all_field():
     time.sleep(0.03)
 
 
-def clear_hard(n=16):
+def clear_hard(n=8):
     """Borra el contenido del campo enfocado: END + N backspaces (+ DELETE hacia
     adelante). Fiable en THybridEditNumber (el select-all a veces no reemplaza)."""
-    press("END")
+    press("END", hold=0.01)
     for _ in range(n):
-        press_vk(VK["BACKSPACE"], hold=0.01)
-    press("HOME")
+        press_vk(VK["BACKSPACE"], hold=0.008)
+    press("HOME", hold=0.01)
     for _ in range(n):
-        press_vk(VK["DELETE"], hold=0.01)
-    time.sleep(0.03)
+        press_vk(VK["DELETE"], hold=0.008)
+    time.sleep(0.02)
 
 
 def type_number(value):

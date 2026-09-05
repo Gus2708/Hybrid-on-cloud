@@ -1,7 +1,7 @@
 # 📊 Auditoría e Integridad de Ventas y Detalles
 
 > [!NOTE]
-> Los cambios detallados en este documento han sido integrados en la rama principal y están resumidos en el [README.md](file:///c:/Proyect/backend%20serrucho/README.md) y [ARCHITECTURE.md](file:///c:/Proyect/backend%20serrucho/ARCHITECTURE.md). Este archivo se mantiene como registro histórico de la auditoría.
+> Los cambios detallados en este documento han sido integrados en la rama principal y están resumidos en el [README.md](../../README.md) y [ARCHITECTURE.md](../arquitectura/ARCHITECTURE.md). Este archivo se mantiene como registro histórico de la auditoría.
 
 Este documento detalla los ajustes realizados en el motor de sincronización para alinear los datos de ventas de la base de datos en la Nube (Supabase) con los reportes de gestión de **HybridLite**.
 

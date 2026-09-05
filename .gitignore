@@ -20,6 +20,7 @@ tests/.pytest_cache/
 # agregarlo aquí con una negación explícita (!archivo.json) y revisar antes
 # que no lleve datos de la tienda ni tokens.
 *.json
+!hybrid_writeback/alias_proveedores.json
 
 # ─── Datos de la tienda (NUNCA se versionan) ─────────────────────────────────
 # Los .dat son la base DBISAM viva del POS y los .csv son extractos con datos

@@ -575,30 +575,44 @@ def abrir_compras():
         raise CompraError("HybridLiteOS no está abierto (no veo el módulo principal).")
     main = fp._win(hmain)
     _focus(hmain)
-    time.sleep(0.2)
+    time.sleep(0.05)
 
+    btn = None
     try:
-        btn = main.child_window(title="Compra de mercancías", class_name="TAdvGlassButton")
-        btn.wait("exists visible", timeout=1.5)
+        cand = main.child_window(title="Compra de mercancías", class_name="TAdvGlassButton")
+        if cand.exists(timeout=0) and cand.is_visible():
+            btn = cand
     except Exception:
-        # el grupo de menú Compras aún no está desplegado -> abrirlo por el
-        # panel lateral (fallback de coordenadas, calcado de abrir_ajustes())
+        pass
+
+    if btn is None:
+        # Menú lateral Compras
         L, T, _, _ = win32gui.GetWindowRect(hmain)
         ri.click(L + MENU_COMPRAS_REL[0], T + MENU_COMPRAS_REL[1])
-        time.sleep(0.8)
-        btn = main.child_window(title="Compra de mercancías", class_name="TAdvGlassButton")
-        btn.wait("exists visible", timeout=8)
+        t0 = time.time()
+        while time.time() - t0 < 2.0:
+            try:
+                cand = main.child_window(title="Compra de mercancías", class_name="TAdvGlassButton")
+                if cand.exists(timeout=0) and cand.is_visible():
+                    btn = cand
+                    break
+            except Exception:
+                pass
+            time.sleep(0.04)
+        if btn is None:
+            btn = main.child_window(title="Compra de mercancías", class_name="TAdvGlassButton")
+            btn.wait("exists visible", timeout=1.5)
 
     r = btn.rectangle()
     ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
 
     t0 = time.time()
-    while time.time() - t0 < 15:
+    while time.time() - t0 < 10:
         ha = fp._find_hwnd(COMPRAS_CLASS)
         if ha:
-            time.sleep(0.5)
+            time.sleep(0.1)
             return ha
-        time.sleep(0.3)
+        time.sleep(0.04)
     raise CompraError("No abrió la ventana de Compras (TFormHTransaccion_Compras).")
 
 
