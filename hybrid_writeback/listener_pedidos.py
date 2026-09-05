@@ -47,7 +47,7 @@ import datetime
 import urllib.error
 
 import listener_base as lb
-
+import alias_manager as am
 import flujo_pedido_real
 
 try:
@@ -113,7 +113,7 @@ def get_items(pedido_id):
 
     return [
         {
-            "codigo": fila["codigo_producto"],
+            "codigo": am.resolver_alias(fila["codigo_producto"]),
             "cantidad": float(fila["cantidad"]),
             "precio": None if fila.get("precio") in (None, "") else float(fila["precio"]),
         }

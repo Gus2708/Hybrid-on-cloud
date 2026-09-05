@@ -32,7 +32,7 @@ el backend lo aplique en el sistema local HybridLite **sin corromper la base de 
 | `abrir_hybrid.py` | Instancia AISLADA de HybridLite: launch, login, `cerrar_aislada()` (solo mata el PID propio). |
 | `hybrid_health.py` | Detección de HybridLite **colgado** y kill de recuperación (ver más abajo). |
 | `safety_control.py` | Banner topmost, F12 aborto, mutex del mouse (`Local\SerruchoBotMouseLock`) que serializa los dos listeners. |
-| `flujo_pedido_real.py` | Coreografía de pedidos de cliente (Tipo 10 / Status 4). |
+| `flujo_pedido_real.py` | Coreografía de pedidos de cliente (Tipo 10 / Status 4) con prevención de colisiones código/referencia, soporte de alias, verificación SMB con reintentos y cero retrasos ociosos. |
 | `flujo_directorio_real.py` | Coreografía de alta de cliente/proveedor en la Ficha del Directorio. |
 | `flujo_ficha_real.py` | Edición de descripción/referencia de un producto existente (Modificar). |
 | `alias_manager.py` | Resolución y catálogo de equivalencias de códigos de proveedor (`alias_proveedores.json`). |
@@ -40,7 +40,7 @@ el backend lo aplique en el sistema local HybridLite **sin corromper la base de 
 | `listener_base.py` | Núcleo común de los 4 listeners (config, logging, guards, REST, prioridad `hay_pendientes_prioritarios`, bucle `correr_loop`). |
 | `listener_writeback.py` | Pipeline `ordenes_cambio_items` (stock/precio/costo/ficha), 3 fases globales por pasada. |
 | `listener_compras.py` | Pipeline `compras_app` (una compra = un documento). |
-| `listener_pedidos.py` | Pipeline `pedidos_app` (un pedido = un documento Tipo 10). |
+| `listener_pedidos.py` | Pipeline `pedidos_app` (un pedido = un documento Tipo 10 con soporte de alias y reintentos). |
 | `listener_directorio.py` | Pipeline `registro_clientes_app` / `registro_proveedores_app` (**prioritario**: los demás listeners le ceden el paso). |
 | `grabar_flujo.py` | Grabadora de coreografías (sesiones con el dueño). |
 | `diagnostico/` | Scripts desechables (ver su propio README). |

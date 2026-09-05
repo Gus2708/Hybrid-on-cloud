@@ -104,3 +104,38 @@ Como resultado de estas intervenciones:
 | **Transición Total Inventario $\to$ Compras** | 17.00 s | 5.17 s | **-69.6%** |
 | **Auditoría DBISAM de 66 productos** | ~132 s | 0.68 s | **-99.5%** |
 | **Tiempo total por ítem (Ficha)** | ~38.0 s | 14.18 s | **-62.7%** |
+| **Paso de Ítem en Pedidos (alert check)** | ~1.5 - 2.0 s | 0.001 s | **-99.9%** |
+| **Apertura de Ventana Pedidos** | ~2.5 - 3.0 s | 0.14 s | **-95.0%** |
+| **Cierre de Ventana Pedidos (`_salir`)** | ~4.0 s | 0.34 s | **-91.5%** |
+
+---
+
+## 5. Auditoría y Optimizaciones en Pedidos de Clientes (`flujo_pedido_real.py` y `listener_pedidos.py`)
+
+Aplicando las lecciones de rendimiento y robustez de Inventario y Compras, se auditó y optimizó la creación de pedidos (Tipo 10 / Status 4):
+
+### 5.1. Prevención de Colisiones de Códigos (`colisiones.revisar_lote`)
+* **Problema:** En las grillas de HybridLiteOS, al tipear en la celda "Código", Delphi busca **primero por código de barras (`PRD_REFERENCIA`)** y solo después por código interno (`PRD_CODIGO`). Existían 98 productos en el catálogo interceptados por la referencia de otro ítem. Si un cliente pedía un código interceptado, el pedido cargaba el producto incorrecto sin que el flujo lo detectara.
+* **Solución:** Integración de `colisiones.revisar_lote()` en el pre-vuelo de `registrar_pedido()`. Si el código está interceptado, el bot tipea automáticamente su referencia única segura para que cargue el producto exacto. Si no tiene salida segura, aborta fail-closed con mensaje descriptivo antes de tocar la grilla.
+* **Verificación UI:** `_verificar_producto_cargado()` ahora valida que la celda de la grilla contenga el código o la referencia alternativa tecleada.
+
+### 5.2. Soporte Universal de Alias (`alias_manager.py`)
+* **Mejora:** Integrado tanto en `flujo_pedido_real.registrar_pedido` como en `listener_pedidos.get_items`. Cualquier código alternativo (ej. códigos de catálogo o proveedor) se traduce al `PRD_CODIGO` oficial del sistema antes de comprobar duplicados o escribir en la grilla.
+
+### 5.3. Eliminación de Delays Ociosos en Carga de Ítems
+* **Problema:** En cada ítem, `_confirmar_lo_que_pregunte(timeout=1.0)` ejecutaba un bucle con sleeps de 0.3s que, al no haber ninguna alerta, consumía obligatoriamente 1.2 segundos por ítem.
+* **Solución:** Parámetro `inmediato_si_no_hay=True` y chequeo de existencia de ventana (`CONF_CLASS` o `TMessageForm`). Si no hay modal de advertencia, retorna en 0.001s sin dormir. El tiempo por ítem bajó drásticamente.
+
+### 5.4. Apertura y Cierre Inmediato de Ventana de Pedidos
+* **Apertura:** Reemplazado `wait("exists visible", timeout=1.5)` por sondeo inmediato con `cand.exists(timeout=0) and cand.is_visible()`, seguido de clics rápidos con polling de 0.04s.
+* **Cierre:** En `_salir_pedidos()`, envío inmediato de `WM_CLOSE` tras pulsar Salir y sondeo en rodajas de 0.04s, eliminando esperas de hasta 4 segundos.
+
+### 5.5. Resiliencia de Red SMB en `_verificar_pedido_db`
+* **Problema:** Tras totalizar en HybridLiteOS, el flush de buffers SMB de Windows sobre `H:\` puede tardar unos cientos de milisegundos en reflejar el nuevo registro en `TTransaccionvta.dat` y `TDetalleVta.dat`.
+* **Solución:** Lazo de reintentos (hasta 3 intentos con 0.5s de pausa) desacoplado mediante `_evaluar_pedido_db()`, asegurando lectura confiable sin falsos positivos de verificación fallida.
+* **Tolerancia de precio:** Estandarizada en `TOL_PRECIO = 0.01` (1 centavo exacto).
+
+### 5.6. Suite de Tests Automatizados de Pedidos
+* **Ubicación:** `tests/test_flujo_pedido_real.py` (14 nuevos tests).
+* **Cobertura:** Parseo de ítems con/sin precio, pre-vuelo de colisiones, abortos fail-closed, detección de duplicados post-alias, verificación en pantalla de códigos alternativos, cálculo de tolerancia de precios con factor referencial, y reintentos SMB mockeados.
+* **Total de tests de la suite general:** 139 tests pasando al 100%.

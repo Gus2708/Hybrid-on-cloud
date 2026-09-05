@@ -62,6 +62,8 @@ except Exception:
 import flujo_precio as fp            # helpers de ventanas + constantes de clase
 import flujo_precio_real as fpr       # _focus, _esperar_refresco, _click_boton_dialogo
 import flujo_stock_real as fsr        # _cerrar_ficha_si_abierta (modelo de apertura)
+import colisiones                     # clave de búsqueda segura (código vs referencia)
+import alias_manager as am            # traducción de códigos de proveedor / alias
 import realinput as ri
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -80,7 +82,7 @@ RUTA_DET = r"H:\HybridLite\HybridEmpresa\HybridDataBase\TDetalleVta.dat"
 
 TIPO_PEDIDO = 10                              # THT_TIPO / TBT_TIPOOPERACION del pedido
 TOL_CANT = 0.001                              # tolerancia de cantidad en la verificación
-TOL_PRECIO = 0.02                             # tolerancia de precio (misma que flujo_compra_real)
+TOL_PRECIO = 0.01                             # tolerancia de precio (1 centavo exacto)
 
 # UNIDADES DEL PRECIO (verificado 2026-07-28 contra el pedido doc 00004749):
 # la celda Precio de la grilla —y TBT_PRECIODEVENTA— van en USD **CON IVA**, las
@@ -124,18 +126,20 @@ def _focus(hwnd):
     time.sleep(0.25)
 
 
-def _confirmar_lo_que_pregunte(timeout=5):
+def _confirmar_lo_que_pregunte(timeout=5, inmediato_si_no_hay=False):
     """Responde afirmativamente a CUALQUIER diálogo de confirmación/alerta
     (TFConfirmacion / TMessageForm). Cubre el 'Cancelar' de Pedidos (responder SÍ)
-    y cualquier alerta que aparezca al Totalizar. Mismo criterio que compras."""
+    y cualquier alerta que aparezca al Totalizar. Mismo criterio que compras.
+    Si inmediato_si_no_hay=True y no hay diálogo en pantalla, retorna False de inmediato
+    sin esperar el timeout."""
     t0 = time.time()
     respondido = False
     while time.time() - t0 < timeout:
         h = fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm")
         if not h:
-            if respondido:
-                return True
-            time.sleep(0.3)
+            if respondido or inmediato_si_no_hay:
+                return respondido
+            time.sleep(0.05)
             continue
         _focus(h)
         m = fp._win(h)
@@ -148,11 +152,11 @@ def _confirmar_lo_que_pregunte(timeout=5):
                 ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
                 log.info("Confirmación '%s' pulsada.", titulo)
                 respondido = True
-                time.sleep(0.6)
+                time.sleep(0.2)
                 break
             except Exception:
                 continue
-        time.sleep(0.3)
+        time.sleep(0.05)
     return respondido
 
 
@@ -261,9 +265,11 @@ def _fila_activa(hped):
     return top, campos
 
 
-def _verificar_producto_cargado(hped, codigo):
+def _verificar_producto_cargado(hped, codigo, clave_busqueda=None):
     """Confirma EN PANTALLA que el código llegó a la grilla y que HybridLite
     resolvió el producto, antes de seguir tecleando cantidad y precio.
+    Acepta que la celda contenga o bien el código original o la clave de búsqueda
+    (referencia/código de barras) tecleada para evitar colisiones.
 
     Este es el chequeo que faltaba el 2026-07-28: una alerta asíncrona ('llegó
     al mínimo' del ítem anterior) robó el foco, las teclas del código 05133 se
@@ -280,8 +286,11 @@ def _verificar_producto_cargado(hped, codigo):
                     "en pantalla.", codigo)
         return
 
-    leido = campos.get("codigo", "")
-    if leido.upper() != str(codigo).strip().upper():
+    leido = campos.get("codigo", "").strip().upper()
+    esperados = {str(codigo).strip().upper()}
+    if clave_busqueda:
+        esperados.add(str(clave_busqueda).strip().upper())
+    if leido not in esperados:
         raise PedidoError(
             f"El código {codigo} no llegó a la grilla (la celda quedó en {leido!r}). "
             f"Casi seguro una alerta de HybridLite robó el foco y se comió las teclas."
@@ -358,29 +367,44 @@ def abrir_pedidos():
         raise PedidoError("HybridLiteOS no está abierto (no veo el módulo principal).")
     main = fp._win(hmain)
     _focus(hmain)
-    time.sleep(0.2)
+    time.sleep(0.1)
 
+    btn = None
     try:
-        btn = main.child_window(title="Pédidos de clientes", class_name="TAdvGlassButton")
-        btn.wait("exists visible", timeout=1.5)
+        cand = main.child_window(title="Pédidos de clientes", class_name="TAdvGlassButton")
+        if cand.exists(timeout=0) and cand.is_visible():
+            btn = cand
     except Exception:
-        # el grupo del menú aún no está desplegado -> abrirlo por el panel (fallback)
+        pass
+
+    if btn is None:
+        # Menú lateral Pedidos
         L, T, _, _ = win32gui.GetWindowRect(hmain)
         ri.click(L + MENU_PEDIDOS_GRUPO_REL[0], T + MENU_PEDIDOS_GRUPO_REL[1])
-        time.sleep(0.8)
-        btn = main.child_window(title="Pédidos de clientes", class_name="TAdvGlassButton")
-        btn.wait("exists visible", timeout=8)
+        t0 = time.time()
+        while time.time() - t0 < 2.0:
+            try:
+                cand = main.child_window(title="Pédidos de clientes", class_name="TAdvGlassButton")
+                if cand.exists(timeout=0) and cand.is_visible():
+                    btn = cand
+                    break
+            except Exception:
+                pass
+            time.sleep(0.04)
+        if btn is None:
+            btn = main.child_window(title="Pédidos de clientes", class_name="TAdvGlassButton")
+            btn.wait("exists visible", timeout=1.5)
 
     r = btn.rectangle()
     ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
 
     t0 = time.time()
-    while time.time() - t0 < 15:
+    while time.time() - t0 < 10:
         ha = fp._find_hwnd(PEDIDOS_CLASS)
         if ha:
-            time.sleep(0.5)
+            time.sleep(0.1)
             return ha
-        time.sleep(0.3)
+        time.sleep(0.04)
     raise PedidoError("No abrió la ventana de Pedidos (TFormHTransaccion_Pedidos).")
 
 
@@ -451,7 +475,7 @@ def seleccionar_cliente(ped, cliente_codigo, cliente_nombre=None):
 
 
 # ── ítems de la grilla ──────────────────────────────────────────────────────
-def cargar_item(codigo, cantidad, precio=None, es_primero=False):
+def cargar_item(codigo, cantidad, precio=None, es_primero=False, clave_busqueda=None):
     """Teclea un ítem en la grilla de Pedidos:
         (solo el 1er ítem) clic en la celda Código de la grilla TAdvStringGrid
         código -> ENTER (carga) -> cantidad -> ENTER -> [precio] -> ENTER (postea)
@@ -464,6 +488,9 @@ def cargar_item(codigo, cantidad, precio=None, es_primero=False):
                  '$', igual que el costo en compras, donde el '$' le indica a
                  HybridLite que el número va en dólares
                  (ver flujo_compra_real.cargar_item: type_number + press_shift('4')).
+
+    `clave_busqueda`: si el código está interceptado en el catálogo por la referencia
+    de otro producto, se teclea su referencia propia única para esquivar la colisión.
 
     Lanza PedidoError ante cualquier diálogo de error; el llamador cancela TODO
     el documento.
@@ -491,18 +518,24 @@ def cargar_item(codigo, cantidad, precio=None, es_primero=False):
         except Exception:
             L, T, _, _ = win32gui.GetWindowRect(hped)
             ri.click(L + ITEM_GRID_REL[0], T + ITEM_GRID_REL[1])
-        time.sleep(0.2)
+        time.sleep(0.15)
 
     # drenar TODA alerta colgada antes de teclear, y esperar a que Pedidos vuelva
     # al frente: teclear con una alerta viva es exactamente lo que perdió el ítem
-    # 05133 del doc 00004751 (2026-07-28).
-    _drenar_alertas(hped)
-    _esperar_foreground(hped)
+    # 05133 del doc 00004751 (2026-07-28). Solo interviene si hay alerta.
+    if fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm"):
+        _drenar_alertas(hped)
+        _esperar_foreground(hped)
 
     # referencia para comprobar después que la fila realmente se posteó
     top_antes, _ = _fila_activa(hped)
 
-    ri.type_code(str(codigo))
+    a_teclear = clave_busqueda or codigo
+    if a_teclear != codigo:
+        log.info("Ítem %s: se teclea %r para esquivar colisión código/referencia.",
+                 codigo, a_teclear)
+
+    ri.type_code(str(a_teclear))
     time.sleep(0.15)
     ri.press("ENTER")                    # carga el producto; el cursor salta a Cantidad
     time.sleep(0.5)
@@ -512,7 +545,7 @@ def cargar_item(codigo, cantidad, precio=None, es_primero=False):
         raise PedidoError(f"Error al cargar el ítem {codigo} (¿código inexistente?).")
 
     # el código llegó y HybridLite resolvió el producto (si no, no seguimos a ciegas)
-    _verificar_producto_cargado(hped, codigo)
+    _verificar_producto_cargado(hped, codigo, clave_busqueda=a_teclear)
 
     ri.type_number(f"{float(cantidad):g}")
     time.sleep(0.1)
@@ -552,9 +585,9 @@ def cargar_item(codigo, cantidad, precio=None, es_primero=False):
             f"(${float(precio):.2f} con IVA). ¿El usuario tiene permiso para cambiar precio?"
         )
 
-    # drenar una alerta tardía (p.ej. 'llegó al mínimo') para que no se cuele al siguiente
-    _confirmar_lo_que_pregunte(timeout=1.0)
-    _drenar_alertas(hped, timeout=1.0)
+    # drenar una alerta tardía (p.ej. 'llegó al mínimo') solo si existe (sin dormir si no hay)
+    if fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm"):
+        _drenar_alertas(hped, timeout=1.0)
 
     # la fila entró de verdad al documento (si no, se cancela todo)
     _verificar_fila_posteada(hped, codigo, top_antes)
@@ -583,12 +616,12 @@ def _cancelar_pedido(hped):
             r = b.rectangle()
             ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
             cancelado = True
-            time.sleep(0.8)
+            time.sleep(0.3)
             break
         except Exception:
             continue
     if cancelado:
-        _confirmar_lo_que_pregunte(timeout=5)
+        _confirmar_lo_que_pregunte(timeout=3, inmediato_si_no_hay=False)
     else:
         log.warning("No encontré botón 'Cancelar' en Pedidos; salgo con Salir "
                     "(el documento sin totalizar no debería persistir). # CALIBRAR")
@@ -607,16 +640,16 @@ def _salir_pedidos():
             b = ped.child_window(title=titulo, class_name="TFlatButton")
             r = b.rectangle()
             ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-            time.sleep(0.8)
+            time.sleep(0.3)
             break
         except Exception:
             continue
     else:
         L, T, _, _ = win32gui.GetWindowRect(hped)
         ri.click(L + SALIR_REL[0], T + SALIR_REL[1])
-        time.sleep(0.8)
-    _confirmar_lo_que_pregunte(timeout=3)
-    for _ in range(3):
+        time.sleep(0.3)
+    _confirmar_lo_que_pregunte(timeout=1.5, inmediato_si_no_hay=True)
+    for _ in range(10):
         h = fp._find_hwnd(PEDIDOS_CLASS)
         if not h:
             return
@@ -624,7 +657,7 @@ def _salir_pedidos():
             win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
         except Exception:
             pass
-        time.sleep(0.4)
+        time.sleep(0.04)
 
 
 def _totalizar_pedido(hped):
@@ -634,7 +667,7 @@ def _totalizar_pedido(hped):
     htot = None
     for intento in range(1, 4):
         _focus(hped)
-        time.sleep(0.4)
+        time.sleep(0.2)
         ped = fp._win(hped)
         try:
             b = ped.child_window(title="&Totalizar", class_name="TFlatButton")
@@ -643,13 +676,13 @@ def _totalizar_pedido(hped):
         except Exception:
             L, T, _, _ = win32gui.GetWindowRect(hped)
             ri.click(L + TOTALIZAR_REL[0], T + TOTALIZAR_REL[1])
-        _confirmar_lo_que_pregunte(timeout=2)
+        _confirmar_lo_que_pregunte(timeout=1.5, inmediato_si_no_hay=False)
         t0 = time.time()
         while time.time() - t0 < 5:
             htot = fp._find_hwnd(TOTAL_CLASS)
             if htot:
                 break
-            time.sleep(0.3)
+            time.sleep(0.05)
         if htot:
             break
         log.warning("Intento %s: Total Operación no apareció tras Totalizar, reintento.", intento)
@@ -666,7 +699,7 @@ def _totalizar_pedido(hped):
     except Exception:
         L, T, _, _ = win32gui.GetWindowRect(htot)
         ri.click(L + TOTAL_OPERAR_REL[0], T + TOTAL_OPERAR_REL[1])
-    time.sleep(0.5)
+    time.sleep(0.4)
 
     # esta PC no tiene impresora fiscal -> no debería abrir Vista Previa; por si
     # acaso, se cierra igual que en compras.
@@ -676,15 +709,15 @@ def _totalizar_pedido(hped):
             break
         try:
             win32gui.SetForegroundWindow(h)
-            time.sleep(0.2)
+            time.sleep(0.1)
             ri.press("ESC")
-            time.sleep(0.3)
+            time.sleep(0.1)
             win32gui.PostMessage(h, win32con.WM_CLOSE, 0, 0)
         except Exception:
             pass
-        time.sleep(0.4)
+        time.sleep(0.1)
 
-    _confirmar_lo_que_pregunte(timeout=2)
+    _confirmar_lo_que_pregunte(timeout=1.5, inmediato_si_no_hay=False)
     if fp._find_hwnd(TOTAL_CLASS):
         raise PedidoError("La ventana Total Operación no se cerró tras totalizar.")
     return True
@@ -746,14 +779,8 @@ def _ultimo_pedido_db():
     return header, detalle
 
 
-def _verificar_pedido_db(cliente_codigo, items, cliente_nombre=None):
-    """Confirma que el último pedido Tipo 10 en DBISAM corresponde a lo pedido:
-    cliente (rif/nombre) + un ítem por código con la cantidad correcta.
-    Devuelve (ok: bool, detalle: str, documento: str|None)."""
-    header, detalle = _ultimo_pedido_db()
-    if header is None:
-        return False, "no hay ningún documento Tipo 10 en la base tras totalizar.", None
-
+def _evaluar_pedido_db(header, detalle, cliente_codigo, items, cliente_nombre=None):
+    """Evalúa si header y detalle de DBISAM corresponden al pedido registrado."""
     doc = header.get("THT_DOCUMENTO")
     rif = str(header.get("THT_RIFCLIENTE") or "").strip()
     persona = str(header.get("THT_PERSONACONTACTO") or "").strip()
@@ -811,6 +838,32 @@ def _verificar_pedido_db(cliente_codigo, items, cliente_nombre=None):
                   f"{len(items)} ítem(s), status={header.get('THT_STATUS')})."), doc
 
 
+def _verificar_pedido_db(cliente_codigo, items, cliente_nombre=None, max_intentos=3):
+    """Confirma que el último pedido Tipo 10 en DBISAM corresponde a lo pedido:
+    cliente (rif/nombre) + un ítem por código con la cantidad correcta.
+    Implementa reintentos con pausa para absorber posibles retrasos de flush SMB en red H:.
+    Devuelve (ok: bool, detalle: str, documento: str|None)."""
+    ultimo_error = (False, "no hay ningún documento Tipo 10 en la base tras totalizar.", None)
+    for intento in range(1, max_intentos + 1):
+        try:
+            header, detalle = _ultimo_pedido_db()
+            if header is not None:
+                ok, msg, doc = _evaluar_pedido_db(header, detalle, cliente_codigo, items, cliente_nombre)
+                if ok:
+                    return True, msg, doc
+                ultimo_error = (ok, msg, doc)
+            else:
+                ultimo_error = (False, "no hay ningún documento Tipo 10 en la base tras totalizar.", None)
+        except Exception as e:
+            log.warning("Intento %s/%s: error leyendo DBISAM de pedidos (%s)", intento, max_intentos, e)
+            ultimo_error = (False, f"Error leyendo DBISAM: {e}", None)
+
+        if intento < max_intentos:
+            time.sleep(0.5)
+
+    return ultimo_error
+
+
 # ── orquestador ──────────────────────────────────────────────────────────────
 def registrar_pedido(cliente_codigo, items, commit=False, cliente_nombre=None):
     """items: list[dict] {"codigo": str, "cantidad": float, "precio": float|None}.
@@ -826,13 +879,46 @@ def registrar_pedido(cliente_codigo, items, commit=False, cliente_nombre=None):
     if not items:
         return {"ok": False, "etapa": "navegacion", "detalle": "La lista de items está vacía."}
 
-    codigos_norm = [str(it["codigo"]).strip().lower() for it in items]
+    # 1. Resolver alias de proveedores/códigos para cada ítem
+    items_procesados = []
+    for it in items:
+        cod_orig = str(it["codigo"]).strip()
+        cod_resuelto = am.resolver_alias(cod_orig)
+        it_copia = dict(it)
+        it_copia["codigo"] = cod_resuelto
+        if cod_resuelto != cod_orig:
+            log.info("Ítem con alias resuelto: %s -> %s", cod_orig, cod_resuelto)
+        items_procesados.append(it_copia)
+
+    # 2. Validar códigos duplicados sobre los códigos ya resueltos
+    codigos_norm = [str(it["codigo"]).strip().lower() for it in items_procesados]
     vistos, dups = set(), set()
     for c in codigos_norm:
         (dups if c in vistos else vistos).add(c)
     if dups:
         return {"ok": False, "etapa": "navegacion",
                 "detalle": f"Códigos duplicados en el pedido: {sorted(dups)}. Nada se tocó."}
+
+    # 3. Pre-vuelo de colisiones código vs referencia (ver colisiones.py).
+    # Se evalúa ANTES de abrir la UI de Pedidos. Si algún producto está interceptado
+    # y carece de clave segura, aborta limpio sin tocar la grilla.
+    codigos_a_revisar = [it["codigo"] for it in items_procesados]
+    try:
+        claves_busqueda, problemas = colisiones.revisar_lote(codigos_a_revisar)
+    except colisiones.CatalogoIlegible as e:
+        return {"ok": False, "etapa": "navegacion",
+                "detalle": f"No pude verificar colisiones código/referencia: {e}. "
+                           f"Nada se tocó (fail-closed)."}
+    if problemas:
+        detalle = " | ".join(f"{c}: {m}" for c, m in problemas.items())
+        log.error("Pedido ABORTADO por colisión sin salida: %s", detalle)
+        return {"ok": False, "etapa": "navegacion",
+                "detalle": f"Pedido CANCELADO antes de tocar nada: "
+                           f"{len(problemas)} ítem(s) sin clave de búsqueda segura. "
+                           f"{detalle}"}
+    for codigo, clave in claves_busqueda.items():
+        if clave != codigo:
+            log.warning("Ítem %s se tecleará como %r (colisión evitada).", codigo, clave)
 
     import abrir_hybrid
     ok, msg = abrir_hybrid.asegurar_hybrid()
@@ -852,22 +938,24 @@ def registrar_pedido(cliente_codigo, items, commit=False, cliente_nombre=None):
 
     # ítems: cualquier fallo cancela el DOCUMENTO COMPLETO (todo-o-nada)
     primero = True
-    for it in items:
+    for it in items_procesados:
+        cod = it["codigo"]
+        clave = claves_busqueda.get(str(cod).strip(), cod)
         try:
-            cargar_item(it["codigo"], it["cantidad"], precio=it.get("precio"), es_primero=primero)
+            cargar_item(cod, it["cantidad"], precio=it.get("precio"), es_primero=primero, clave_busqueda=clave)
             primero = False
         except PedidoError as e:
             _cancelar_pedido(fp._find_hwnd(PEDIDOS_CLASS))
             _salir_pedidos()
             return {"ok": False, "etapa": "carga_item",
                     "detalle": f"Pedido CANCELADO completo (todo-o-nada), fallo en "
-                               f"{it['codigo']}: {e}"}
+                               f"{cod}: {e}"}
 
     if not commit:
         _cancelar_pedido(fp._find_hwnd(PEDIDOS_CLASS))
         _salir_pedidos()
         return {"ok": True, "etapa": "preview",
-                "detalle": f"Preview de {len(items)} ítem(s) armado en pantalla y "
+                "detalle": f"Preview de {len(items_procesados)} ítem(s) armado en pantalla y "
                            f"DESCARTADO (sin --commit; documento cancelado)."}
 
     # COMMIT: Totalizar (etapa AMBIGUA si falla)
@@ -879,10 +967,10 @@ def registrar_pedido(cliente_codigo, items, commit=False, cliente_nombre=None):
                 "detalle": f"No pude confirmar la totalización del pedido: {e}"}
 
     _salir_pedidos()
-    time.sleep(0.8)
+    time.sleep(0.4)
 
     try:
-        ok_db, detalle_db, documento = _verificar_pedido_db(cliente_codigo, items, cliente_nombre)
+        ok_db, detalle_db, documento = _verificar_pedido_db(cliente_codigo, items_procesados, cliente_nombre)
     except Exception as e:
         return {"ok": False, "etapa": "verificacion_db",
                 "detalle": f"Pedido totalizado pero no pude verificar en DB: {e}"}
