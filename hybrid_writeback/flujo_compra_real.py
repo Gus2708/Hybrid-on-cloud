@@ -701,32 +701,34 @@ def seleccionar_proveedor(com, proveedor_codigo, proveedor_nombre=None):
 
     hbusq = fp._wait_for(fp.BUSQ_CLASS, desc="Busqueda De Proveedores")
     busq = fp._win(hbusq)
-    time.sleep(0.25)
+    fpr._esperar_desocupada(hbusq, que="la lista de proveedores")
     _focus(hbusq)
 
     ed = busq.child_window(class_name="THybridEdit", found_index=0)
     r = ed.rectangle()
     ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-    time.sleep(0.15)
+    time.sleep(0.05)
     ri.clear_field()
     ri.type_text(proveedor_codigo)
-    time.sleep(0.2)
+    time.sleep(0.04)
     ri.press("ENTER")                                    # ejecuta la búsqueda
 
-    posicionado = fpr._esperar_refresco(busq, proveedor_codigo, timeout=6.0)
-    log.info("Busqueda De Proveedores posicionada en %s: %s", proveedor_codigo, posicionado)
+    fpr._esperar_desocupada(hbusq, que="el filtro de proveedores")
+    filtrada = fpr._esperar_lista_filtrada(busq, timeout=60.0)
+    log.info("Busqueda De Proveedores filtrada para %s: %s (scrollbar)", proveedor_codigo, filtrada)
 
     if fp._find_hwnd(fp.BUSQ_CLASS):
         _focus(hbusq)
-        ri.press("ENTER")                                # selecciona la fila posicionada
-        time.sleep(0.5)
-
-    if fp._find_hwnd(fp.BUSQ_CLASS):
-        # fallback: doble-clic en la fila posicionada (arriba del grid)
         grid = busq.child_window(class_name="TDBGrid")
         gr = grid.rectangle()
-        ri.click(gr.left + 100, gr.top + 26, double=True)
-        time.sleep(0.5)
+        ri.click(gr.left + 100, gr.top + 26, double=True)  # fila 1 = el resultado
+        time.sleep(0.05)
+
+    if fp._find_hwnd(fp.BUSQ_CLASS):
+        # fallback: ENTER por teclado si el doble-clic no cerró la búsqueda
+        _focus(hbusq)
+        ri.press("ENTER")
+        time.sleep(0.3)
 
     if fp._find_hwnd("TMessageForm"):
         raise CompraError(f"Apareció un diálogo de error buscando el proveedor {proveedor_codigo}.")

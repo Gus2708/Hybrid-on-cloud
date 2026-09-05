@@ -427,35 +427,34 @@ def seleccionar_cliente(ped, cliente_codigo, cliente_nombre=None):
 
     hbusq = fp._wait_for(fp.BUSQ_CLASS, desc="Busqueda De Clientes")
     busq = fp._win(hbusq)
-    time.sleep(0.25)
+    fpr._esperar_desocupada(hbusq, que="la lista de clientes")
     _focus(hbusq)
 
     ed = busq.child_window(class_name="THybridEdit", found_index=0)
     r = ed.rectangle()
     ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-    time.sleep(0.15)
+    time.sleep(0.05)
     ri.clear_field()
     ri.type_text(str(cliente_codigo))
-    time.sleep(0.2)
+    time.sleep(0.04)
     ri.press("ENTER")                                    # ejecuta la búsqueda
 
-    posicionado = fpr._esperar_refresco(busq, str(cliente_codigo), timeout=6.0)
-    log.info("Busqueda De Clientes posicionada en %s: %s", cliente_codigo, posicionado)
+    fpr._esperar_desocupada(hbusq, que="el filtro de clientes")
+    filtrada = fpr._esperar_lista_filtrada(busq, timeout=60.0)
+    log.info("Busqueda De Clientes filtrada para %s: %s (scrollbar)", cliente_codigo, filtrada)
 
     if fp._find_hwnd(fp.BUSQ_CLASS):
         _focus(hbusq)
-        ri.press("ENTER")                                # selecciona la fila posicionada
-        time.sleep(0.5)
+        grid = busq.child_window(class_name="TDBGrid")
+        gr = grid.rectangle()
+        ri.click(gr.left + 100, gr.top + 26, double=True)  # fila 1 = el resultado
+        time.sleep(0.05)
 
     if fp._find_hwnd(fp.BUSQ_CLASS):
-        # fallback: doble-clic en la fila posicionada (patrón grabado)
-        try:
-            grid = busq.child_window(class_name="TDBGrid")
-            gr = grid.rectangle()
-            ri.click(gr.left + 100, gr.top + 26, double=True)
-            time.sleep(0.5)
-        except Exception:
-            pass
+        # fallback: ENTER por teclado si el doble-clic no cerró la búsqueda
+        _focus(hbusq)
+        ri.press("ENTER")
+        time.sleep(0.3)
 
     if fp._find_hwnd("TMessageForm"):
         raise PedidoError(f"Apareció un diálogo de error buscando el cliente {cliente_codigo}.")
