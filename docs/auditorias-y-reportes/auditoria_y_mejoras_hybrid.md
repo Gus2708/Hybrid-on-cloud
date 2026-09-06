@@ -136,6 +136,40 @@ Aplicando las lecciones de rendimiento y robustez de Inventario y Compras, se au
 * **Tolerancia de precio:** Estandarizada en `TOL_PRECIO = 0.01` (1 centavo exacto).
 
 ### 5.6. Suite de Tests Automatizados de Pedidos
-* **Ubicación:** `tests/test_flujo_pedido_real.py` (14 nuevos tests).
+* **Ubicación:** `tests/test_flujo_pedido_real.py`.
 * **Cobertura:** Parseo de ítems con/sin precio, pre-vuelo de colisiones, abortos fail-closed, detección de duplicados post-alias, verificación en pantalla de códigos alternativos, cálculo de tolerancia de precios con factor referencial, y reintentos SMB mockeados.
-* **Total de tests de la suite general:** 139 tests pasando al 100%.
+
+---
+
+## 6. Detección por Scrollbar (`TScrollWindow`) y Tracker E2E Instrumentado
+
+### 6.1. Detección por Scrollbar en Búsqueda de Clientes y Proveedores
+* **Problema:** Tanto en `seleccionar_cliente` (`flujo_pedido_real.py`) como en `seleccionar_proveedor` (`flujo_compra_real.py`), se llamaba a `_esperar_refresco()` que intentaba inspeccionar el texto del `TDBGrid`. Como las celdas de este control son opacas y Delphi no expone los textos por API estándar, la función quemaba un timeout de 1.5s + 0.5s de espera fija (~2s ociosos por cada búsqueda).
+* **Solución:** Se implementó la misma técnica probada en `cargar_producto()` de inventario:
+  1. `_esperar_desocupada()` para que el proceso Delphi termine de filtrar.
+  2. `_esperar_lista_filtrada()`: detecta cuándo la barra de scroll vertical (`TScrollWindow`) se oculta (`is_visible() == False`). Al quedar 1 solo resultado filtrado, la barra sobra y Delphi la oculta de inmediato.
+  3. Selección primaria mediante doble-clic rápido en fila 1, con `ENTER` como fallback.
+* **Resultado:** Detección determinista y eliminación de ~2s de tiempo muerto por búsqueda de cliente y proveedor.
+
+### 6.2. Auditoría E2E Instrumentada con `FlowTracker` (`scratch/e2e_tracker_pedidos.py`)
+Se construyó un arnés de prueba de extremo a extremo que instrumenta cada fase del ciclo de vida de un pedido con medición en milisegundos:
+
+```
+================================================================================
+ REPORTE DE AUDITORIA Y TRACKER E2E: PIPELINE COMPLETO PEDIDOS
+================================================================================
+ETAPA                                      |         TIEMPO | ESTADO   | DETALLES
+--------------------------------------------------------------------------------
+1. Listener: Parseo & Alias                |        1.53 ms | OK       | 2 items procesados (THINNER-01 -> THINNER-M)
+2. Pre-vuelo: Validacion Duplicados        |        0.01 ms | OK       | 0 duplicados detectados
+3. Pre-vuelo: Revision Colisiones          |     1029.77 ms | OK       | 2 claves seguras asignadas
+4. DBISAM : Lectura Ultimo Pedido          |     2575.71 ms | OK       | Doc: 00004949 (1 lineas)
+5. DBISAM : Evaluacion de Reglas           |        0.03 ms | OK       | Verificado: ok=True
+--------------------------------------------------------------------------------
+TIEMPO TOTAL DEL PIPELINE                  |     3607.27 ms (3.607s)
+================================================================================
+```
+
+### 6.3. Estado de la Suite de Tests
+* **Total:** 140 tests automatizados passing al 100%.
+* Incluye test de regresión `test_e2e_pipeline_tracker` integrado en `pytest`.

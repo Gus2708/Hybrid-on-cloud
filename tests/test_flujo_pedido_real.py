@@ -255,3 +255,22 @@ def test_listener_pedidos_get_items_aplica_alias(monkeypatch):
     assert len(items) == 2
     assert items[0] == {"codigo": "THINNER-M", "cantidad": 5.0, "precio": 3.50}
     assert items[1] == {"codigo": "01404", "cantidad": 2.0, "precio": None}
+
+
+# ─── 9. Tracker E2E: Auditoría de Tiempos e Integridad ───────────────────────
+def test_e2e_pipeline_tracker():
+    """Ejecuta el pipeline E2E instrumentado con FlowTracker y audita tiempos de cada fase."""
+    from diagnostico.diag_e2e_pedidos import correr_audit_e2e
+
+    tracker = correr_audit_e2e()
+    assert len(tracker.records) >= 5
+    for r in tracker.records:
+        assert r.status == "OK"
+        assert r.duration_ms >= 0.0
+    # Verifica que las etapas críticas estén presentes
+    nombres = [r.name for r in tracker.records]
+    assert any("Parseo & Alias" in n for n in nombres)
+    assert any("Duplicados" in n for n in nombres)
+    assert any("Colisiones" in n for n in nombres)
+    assert any("Lectura Ultimo Pedido" in n for n in nombres)
+    assert any("Evaluacion de Reglas" in n for n in nombres)
