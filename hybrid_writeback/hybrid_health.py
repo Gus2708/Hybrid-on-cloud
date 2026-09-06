@@ -58,6 +58,7 @@ from ctypes import wintypes
 
 import pywintypes
 import win32api
+import win32con
 import win32gui
 import win32process
 

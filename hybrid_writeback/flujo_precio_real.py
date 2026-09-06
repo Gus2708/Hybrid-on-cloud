@@ -52,6 +52,8 @@ import sys
 import time
 import logging
 
+DIR = os.path.dirname(os.path.abspath(__file__))
+
 import win32gui
 
 try:

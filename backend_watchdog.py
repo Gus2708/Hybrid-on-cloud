@@ -159,8 +159,6 @@ def ensure_single_instance():
         atexit.register(_cleanup)
     except: pass
 
-ensure_single_instance()
-
 # Cada entrada: (script, nombre) o (script, nombre, opts). opts puede traer:
 #   "subdir": subcarpeta (relativa a BASE_DIR) donde vive el script; también su cwd.
 #   "env":    variables de entorno extra SOLO para ese proceso (no tocan el resto
@@ -315,92 +313,98 @@ def is_hung(script):
             return False
         _APP_PORT_FAILS += 1
         return _APP_PORT_FAILS >= 4  # ~1 minuto sin responder
-    return False
+def main():
+    global _APP_PORT_FAILS
+    log("=== Watchdog robusto iniciado ===")
 
-log("=== Watchdog robusto iniciado ===")
+    while True:
+        now = time.time()
 
-while True:
-    now = time.time()
+        for entry in SCRIPTS:
+            script, name = entry[0], entry[1]
+            opts = entry[2] if len(entry) > 2 else {}
+            # 1. Verificar si ya tenemos un PID en caché y si sigue vivo
+            pid = _PID_MAP.get(script)
+            alive = is_alive(pid)
 
-    for entry in SCRIPTS:
-        script, name = entry[0], entry[1]
-        opts = entry[2] if len(entry) > 2 else {}
-        # 1. Verificar si ya tenemos un PID en caché y si sigue vivo
-        pid = _PID_MAP.get(script)
-        alive = is_alive(pid)
+            # 2. Si no está en caché o está muerto, buscar en el sistema (WMI)
+            if not alive:
+                found_pids = find_pids_by_script_name(script)
+                # Filtrar el propio proceso del watchdog si coincide
+                found_pids = [p for p in found_pids if p != os.getpid()]
 
-        # 2. Si no está en caché o está muerto, buscar en el sistema (WMI)
-        if not alive:
-            found_pids = find_pids_by_script_name(script)
-            # Filtrar el propio proceso del watchdog si coincide
-            found_pids = [p for p in found_pids if p != os.getpid()]
+                if found_pids:
+                    pid = found_pids[0]
+                    # Nunca debe haber dos instancias del mismo script: los
+                    # duplicados de app.py se roban el puerto entre sí y la API
+                    # deja de responder aunque los procesos sigan vivos.
+                    for extra in found_pids[1:]:
+                        log(f"[DUP] Instancia duplicada de {name} ({script}, PID {extra}). Matando...")
+                        kill_pid(extra)
+                    _PID_MAP[script] = pid
+                    alive = True
 
-            if found_pids:
-                pid = found_pids[0]
-                # Nunca debe haber dos instancias del mismo script: los
-                # duplicados de app.py se roban el puerto entre sí y la API
-                # deja de responder aunque los procesos sigan vivos.
-                for extra in found_pids[1:]:
-                    log(f"[DUP] Instancia duplicada de {name} ({script}, PID {extra}). Matando...")
-                    kill_pid(extra)
-                _PID_MAP[script] = pid
-                alive = True
-
-        # 2b. Si está vivo pero congelado, matarlo para que se reinicie limpio
-        if alive and now - _HUNG_KILL_TS.get(script, 0) > _HUNG_KILL_COOLDOWN and is_hung(script):
-            log(f"[HUNG] {name} ({script}) vivo pero sin responder. Matando PID {pid} para reiniciar...")
-            kill_pid(pid)
-            if script == "app.py":
-                for extra in find_pids_by_script_name(script):
-                    kill_pid(extra)
-                free_api_port()
-            _HUNG_KILL_TS[script] = now
-            _PID_MAP.pop(script, None)
-            alive = False
-
-        # 3. Si sigue sin aparecer, reiniciar (respetando cooldown)
-        if not alive:
-            if script == "app.py" and _api_responds():
-                # Hay una API sana atendiendo el puerto aunque no se detecte
-                # por línea de comandos; lanzar otra solo crearía un duplicado
-                # que moriría al no poder enlazarse.
-                continue
-
-            last_restart = _RESTART_COOLDOWN.get(script, 0)
-            if now - last_restart < 30:
-                continue # Cooldown de 30s para no saturar si crashea al inicio
-
-            log(f"[RESTART] {name} ({script}) no detectado. Iniciando...")
-            try:
+            # 2b. Si está vivo pero congelado, matarlo para que se reinicie limpio
+            if alive and now - _HUNG_KILL_TS.get(script, 0) > _HUNG_KILL_COOLDOWN and is_hung(script):
+                log(f"[HUNG] {name} ({script}) vivo pero sin responder. Matando PID {pid} para reiniciar...")
+                kill_pid(pid)
                 if script == "app.py":
-                    free_api_port()  # garantizar que el puerto esté libre antes de enlazar
-                subdir = opts.get("subdir")
-                work_dir = os.path.join(BASE_DIR, subdir) if subdir else BASE_DIR
-                script_path = os.path.join(work_dir, script)
-                pythonw = sys.executable.replace("python.exe", "pythonw.exe")
-                if not os.path.exists(pythonw): pythonw = sys.executable
+                    for extra in find_pids_by_script_name(script):
+                        kill_pid(extra)
+                    free_api_port()
+                _HUNG_KILL_TS[script] = now
+                _PID_MAP.pop(script, None)
+                alive = False
 
-                # Entorno extra por-proceso (p. ej. HYBRID_WRITE_ENABLED del listener).
-                # env=None hereda el entorno del watchdog, como el resto de scripts.
-                proc_env = {**os.environ, **opts["env"]} if opts.get("env") else None
+            # 3. Si sigue sin aparecer, reiniciar (respetando cooldown)
+            if not alive:
+                if script == "app.py" and _api_responds():
+                    # Hay una API sana atendiendo el puerto aunque no se detecte
+                    # por línea de comandos; lanzar otra solo crearía un duplicado
+                    # que moriría al no poder enlazarse.
+                    continue
 
-                # Usar rutas absolutas para mayor claridad en el futuro
-                proc = subprocess.Popen(
-                    [pythonw, script_path],
-                    cwd=work_dir,
-                    creationflags=0x08000000,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    env=proc_env
-                )
-                _PID_MAP[script] = proc.pid
-                _RESTART_COOLDOWN[script] = now
-                if script == "app.py":
-                    _APP_PORT_FAILS = 0  # darle tiempo a Flask de levantar
-                log(f"[OK] {name} iniciado (PID {proc.pid}).")
-            except Exception as e:
-                log(f"[ERROR] No se pudo iniciar {name}: {e}")
-                _RESTART_COOLDOWN[script] = now # Marcar cooldown incluso si falla
+                last_restart = _RESTART_COOLDOWN.get(script, 0)
+                if now - last_restart < 30:
+                    continue # Cooldown de 30s para no saturar si crashea al inicio
 
-    time.sleep(15)
+                log(f"[RESTART] {name} ({script}) no detectado. Iniciando...")
+                try:
+                    if script == "app.py":
+                        free_api_port()  # garantizar que el puerto esté libre antes de enlazar
+                    subdir = opts.get("subdir")
+                    work_dir = os.path.join(BASE_DIR, subdir) if subdir else BASE_DIR
+                    script_path = os.path.join(work_dir, script)
+                    pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+                    if not os.path.exists(pythonw): pythonw = sys.executable
+
+                    # Entorno extra por-proceso (p. ej. HYBRID_WRITE_ENABLED del listener).
+                    # env=None hereda el entorno del watchdog, como el resto de scripts.
+                    proc_env = {**os.environ, **opts["env"]} if opts.get("env") else None
+
+                    # Usar rutas absolutas para mayor claridad en el futuro
+                    proc = subprocess.Popen(
+                        [pythonw, script_path],
+                        cwd=work_dir,
+                        creationflags=0x08000000,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        env=proc_env
+                    )
+                    _PID_MAP[script] = proc.pid
+                    _RESTART_COOLDOWN[script] = now
+                    if script == "app.py":
+                        _APP_PORT_FAILS = 0  # darle tiempo a Flask de levantar
+                    log(f"[OK] {name} iniciado (PID {proc.pid}).")
+                except Exception as e:
+                    log(f"[ERROR] No se pudo iniciar {name}: {e}")
+                    _RESTART_COOLDOWN[script] = now # Marcar cooldown incluso si falla
+
+        time.sleep(15)
+
+
+if __name__ == "__main__":
+    ensure_single_instance()
+    main()
+
 

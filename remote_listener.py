@@ -128,9 +128,6 @@ def update_command_status(cmd_id, status):
         return False
 
 def execute_local_sync(comando):
-    import subprocess
-    import sys
-
     scripts = {
         "sync_inventory": "sync.py",
         "sync_sales": "sync_ventas.py",
