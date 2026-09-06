@@ -129,12 +129,14 @@ FACTOR_USD_DEFAULT = 489.55
 
 def get_current_rate():
     try:
-        from rates_service import RatesService
-        service = RatesService()
+        import rates_service
+        service = rates_service.RatesService()
         rates = service.get_all_rates()
         # Intentar obtener BCV USD primero, luego Binance P2P como fallback
-        return rates.get("bcv_usd", rates.get("binance_p2p", FACTOR_USD_DEFAULT))
-    except:
+        bcv = rates.get("bcv_usd") or 0.0
+        binance = rates.get("binance_p2p") or 0.0
+        return bcv or binance or FACTOR_USD_DEFAULT
+    except Exception:
         return FACTOR_USD_DEFAULT
 
 def to_float(val):

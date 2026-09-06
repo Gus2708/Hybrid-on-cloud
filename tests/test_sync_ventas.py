@@ -40,6 +40,7 @@ class TestSyncVentas:
         assert [2] in calls
 
     def test_get_current_rate_fallback(self, monkeypatch):
-        monkeypatch.setattr(sync_ventas, "RatesService", lambda: (_ for _ in ()).throw(Exception("down")), raising=False)
+        import rates_service
+        monkeypatch.setattr(rates_service, "RatesService", lambda: (_ for _ in ()).throw(Exception("down")))
         rate = sync_ventas.get_current_rate()
-        assert rate > 0
+        assert rate == sync_ventas.FACTOR_USD_DEFAULT

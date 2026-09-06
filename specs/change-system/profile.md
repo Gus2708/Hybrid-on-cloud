@@ -18,5 +18,11 @@ testing:
 quality:
   lint_command: python -m ruff check .
   typecheck_command: null
-notes: []
-updated_at: '2026-09-06T04:35:00.000000+00:00'
+ci_cd:
+  provider: github-actions
+  runner: windows-latest
+  workflows: [.github/workflows/ci.yml, .github/workflows/release.yml]
+notes:
+  - CI ejecuta linter Ruff y pytest completo en cada push/PR a main
+  - CD compila Nuitka y empaqueta instalador Inno Setup en tags v*
+updated_at: '2026-09-06T05:22:00.000000+00:00'
