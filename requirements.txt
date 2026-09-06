@@ -7,6 +7,7 @@ Pillow==12.2.0
 pystray==0.19.5
 beautifulsoup4==4.14.3
 pywin32==312
+pywinauto==0.6.9
 watchdog==6.0.0
 pydbisam==1.2.1
 waitress==3.0.2

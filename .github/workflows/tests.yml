@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    # Windows y no Linux: requirements.txt trae pywin32, porque el motor de
+    # write-back maneja la UI del POS con eventos reales de la Win32 SendInput.
+    # En ubuntu la instalacion de dependencias ni siquiera termina.
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # -m "not integration" deja fuera el unico test que lee TInventario.dat
+      # de la unidad H: real. El resto mockea check_drive y las llamadas REST,
+      # asi que corre contra los invariantes y no contra la red del negocio.
+      - name: Run tests
+        run: python -m pytest -m "not integration"
