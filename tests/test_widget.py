@@ -12,13 +12,18 @@ sys.modules['PIL.ImageTk'] = MagicMock()
 
 from widget import SerruchoPremiumWidget
 
-@pytest.fixture
+# Scope de modulo a proposito: crear y destruir una raiz Tk por test hace que
+# la segunda tk.Tk() del archivo falle de forma intermitente con
+# "Can't find a usable tk.tcl". Con una sola raiz para todo el modulo el
+# problema desaparece.
+@pytest.fixture(scope="module")
 def root():
     r = tk.Tk()
     yield r
     try:
         r.destroy()
-    except: pass
+    except Exception:
+        pass
 
 def test_widget_init(root):
     app = SerruchoPremiumWidget(root)

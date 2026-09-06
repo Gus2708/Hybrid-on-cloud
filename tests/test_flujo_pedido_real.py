@@ -258,6 +258,9 @@ def test_listener_pedidos_get_items_aplica_alias(monkeypatch):
 
 
 # ─── 9. Tracker E2E: Auditoría de Tiempos e Integridad ───────────────────────
+# Lee TInventario.dat de la unidad H: real, asi que solo corre en la maquina
+# del negocio con la red arriba. En CI se deselecciona con -m "not integration".
+@pytest.mark.integration
 def test_e2e_pipeline_tracker():
     """Ejecuta el pipeline E2E instrumentado con FlowTracker y audita tiempos de cada fase."""
     from diagnostico.diag_e2e_pedidos import correr_audit_e2e
