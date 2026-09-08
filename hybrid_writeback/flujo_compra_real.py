@@ -192,6 +192,32 @@ def _leer_item_db(codigo):
             time.sleep(ESPERA_LECTURA_DB)
 
 
+def _leer_items_db_batch(codigos):
+    """(existencias, precios, costos) de una lista de ítems en DBISAM en solo 2 pasadas
+    (1 en TExistenciaInv + 1 en TInventario), con reintentos defensivos.
+    Devuelve dict {codigo: (existencia, costo, precio)}."""
+    for intento in range(1, REINTENTOS_LECTURA_DB + 1):
+        try:
+            ex_map = dbex.existencia_batch(codigos)
+            pc_map = hpw._db_valores_usd_batch(codigos)
+            res = {}
+            for c in codigos:
+                c_str = str(c).strip()
+                tot_ex = ex_map.get(c_str, (0.0, []))[0]
+                precio, costo = pc_map.get(c_str, (None, None))
+                res[c_str] = (tot_ex, costo, precio)
+            return res
+        except OSError as e:
+            if intento == REINTENTOS_LECTURA_DB:
+                raise VerificacionIndisponible(
+                    f"la DBISAM no responde tras {REINTENTOS_LECTURA_DB} intentos ({e!r}); "
+                    f"probablemente se cayó la unidad H:") from e
+            log.warning("Lectura batch DB de %s ítems falló (%r); reintento %s/%s en %ss.",
+                        len(codigos), e, intento + 1, REINTENTOS_LECTURA_DB, ESPERA_LECTURA_DB)
+            time.sleep(ESPERA_LECTURA_DB)
+
+
+
 # ── utilidades compartidas (mismo patrón que flujo_precio_real/flujo_stock_real) ──
 def _focus(hwnd):
     """Fuerza que la ventana esté al frente antes de disparar input real."""
@@ -1274,17 +1300,24 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
         if clave != codigo:
             log.warning("Ítem %s se tecleará como %r (colisión evitada).", codigo, clave)
 
-    # existencia ANTES de cada ítem (para la verificación post-commit). Para
-    # ítems es_nuevo en preview el producto no existe todavía -> existencia
-    # ANTES no es legible (None), esperado y no bloqueante.
+    # existencia ANTES de cada ítem (en lote para reducir I/O sobre la red H:).
     existencias_antes = {}
-    for it in items:
-        try:
-            total_antes, _ = dbex.existencia(it["codigo"])
-        except Exception:
-            total_antes = None
-        existencias_antes[it["codigo"]] = total_antes
-        log.info("Existencia DB ANTES de %s: %s", it["codigo"], total_antes)
+    try:
+        ex_batch = dbex.existencia_batch([it["codigo"] for it in items])
+        for it in items:
+            c = it["codigo"]
+            existencias_antes[c] = ex_batch.get(c, (None, []))[0]
+            log.info("Existencia DB ANTES de %s: %s", c, existencias_antes[c])
+    except Exception as e:
+        log.warning("Lectura batch existencia ANTES falló (%r), usando fallback individual.", e)
+        for it in items:
+            try:
+                total_antes, _ = dbex.existencia(it["codigo"])
+            except Exception:
+                total_antes = None
+            existencias_antes[it["codigo"]] = total_antes
+            log.info("Existencia DB ANTES de %s: %s", it["codigo"], total_antes)
+
 
     # navegación PRE-escritura: abrir Compras + clasificación + proveedor.
     # Cualquier fallo aquí es 100% reintentable -- nada se ha escrito todavía
@@ -1353,24 +1386,28 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
     _salir_compras()
     time.sleep(0.8)
 
-    # verificación DB por ítem
+    # verificación DB por ítem (en lote: solo 2 lecturas de archivo sobre la red H:)
     resultados = {}
     todos_ok = True
+    codigos_items = [it["codigo"] for it in items]
+    try:
+        db_batch = _leer_items_db_batch(codigos_items)
+    except VerificacionIndisponible as e:
+        detalle = (f"Compra TOTALIZADA (doc={doc_numero}) con {len(items)} ítem(s), pero la "
+                   f"verificación quedó a medias: {e}. La compra YA ESTÁ "
+                   f"REGISTRADA en HybridLite — NO reencolar (sería una compra doble); "
+                   f"revisar existencias a mano y cerrar la solicitud.")
+        log.error("Verificación incompleta de la compra doc=%s: %s", doc_numero, detalle)
+        return {"ok": False, "etapa": "verificacion_indisponible",
+                "detalle": detalle, "resultados": resultados}
+
     for it in items:
         codigo = it["codigo"]
         existencia_antes = existencias_antes.get(codigo)
         existencia_esperada = (existencia_antes + float(it["cantidad"])
                                if existencia_antes is not None else None)
-        try:
-            existencia_despues, costo_despues, precio_despues = _leer_item_db(codigo)
-        except VerificacionIndisponible as e:
-            detalle = (f"Compra TOTALIZADA (doc={doc_numero}) con {len(items)} ítem(s), pero la "
-                       f"verificación quedó a medias en {codigo}: {e}. La compra YA ESTÁ "
-                       f"REGISTRADA en HybridLite — NO reencolar (sería una compra doble); "
-                       f"revisar existencias a mano y cerrar la solicitud.")
-            log.error("Verificación incompleta de la compra doc=%s: %s", doc_numero, detalle)
-            return {"ok": False, "etapa": "verificacion_indisponible",
-                    "detalle": detalle, "resultados": resultados}
+        existencia_despues, costo_despues, precio_despues = db_batch.get(codigo, (None, None, None))
+
 
         fallos = []
         if existencia_esperada is None:

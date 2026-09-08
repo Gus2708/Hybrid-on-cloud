@@ -47,3 +47,38 @@ def test_verificar_producto_cargado_aborta_si_falta_descripcion(monkeypatch):
     monkeypatch.setattr(fcr, "_fila_activa", lambda h: (325, {"codigo": "VT-2474", "descripcion": ""}))
     with pytest.raises(fcr.CompraError, match="quedó sin descripción"):
         fcr._verificar_producto_cargado(1234, "VT-2474")
+
+
+def test_leer_items_db_batch_exitoso(monkeypatch):
+    """Verifica que _leer_items_db_batch combine existencia y precios correctamente."""
+    monkeypatch.setattr(fcr.dbex, "existencia_batch", lambda cods: {
+        "A": (10.0, []), "B": (20.0, [])
+    })
+    monkeypatch.setattr(fcr.hpw, "_db_valores_usd_batch", lambda cods: {
+        "A": (100.0, 50.0), "B": (200.0, 150.0)
+    })
+    res = fcr._leer_items_db_batch(["A", "B"])
+    assert res == {
+        "A": (10.0, 50.0, 100.0),   # (existencia, costo, precio)
+        "B": (20.0, 150.0, 200.0),
+    }
+
+
+def test_leer_items_db_batch_reintenta_y_recupera(monkeypatch):
+    """Verifica resiliencia ante OSError temporal en share de red H:."""
+    intentos = [0]
+    monkeypatch.setattr(fcr, "ESPERA_LECTURA_DB", 0.001)
+
+    def mock_existencia(cods):
+        intentos[0] += 1
+        if intentos[0] == 1:
+            raise OSError("Share de red H: no accesible")
+        return {"A": (5.0, [])}
+
+    monkeypatch.setattr(fcr.dbex, "existencia_batch", mock_existencia)
+    monkeypatch.setattr(fcr.hpw, "_db_valores_usd_batch", lambda cods: {"A": (10.0, 2.0)})
+
+    res = fcr._leer_items_db_batch(["A"])
+    assert res["A"] == (5.0, 2.0, 10.0)
+    assert intentos[0] == 2
+
