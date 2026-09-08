@@ -431,6 +431,74 @@ def _cancelar_ficha_alta(hf):
         time.sleep(0.4)
 
 
+def _guardar_ficha_alta():
+    """Guarda la Ficha en modo ALTA (nuevo producto) y cancela el registro vacío sobrante.
+
+    En HybridLite, al dar de alta un producto nuevo ('Incluir' -> llenar campos -> 'Guardar'):
+    1. 'Guardar' persiste el nuevo producto en DBISAM de inmediato sin diálogo de confirmación.
+       Reintentar el clic a ciegas (como hace _guardar_ficha de modificación) vuelve a pulsar
+       'Guardar' sobre un registro nuevo en blanco, disparando el modal:
+       'Information: Existen campos obligatorios no procesados'.
+    2. Por tanto, se pulsa Guardar EXACTAMENTE UNA VEZ.
+    3. Si aparece algún diálogo de confirmación o aviso de Hybrid, se responde afirmativamente.
+    4. Tras guardar, HybridLite permanece en 'Modo Inserción' con campos vacíos.
+       Para dejar la Ficha limpia y salir de 'Modo Inserción', se pulsa 'Cancelar' (CANCELAR_REL),
+       descartando el registro en blanco sin afectar al producto ya guardado en DBISAM.
+    5. Finalmente se cierra la Ficha de Inventario con fsr._cerrar_ficha_si_abierta().
+    """
+    hf = fp._find_hwnd(fp.FICHA_CLASS)
+    if not hf:
+        raise CompraError("No encontré la Ficha de Inventario para guardar el alta.")
+    fpr._focus(hf)
+    L, T, _, _ = win32gui.GetWindowRect(hf)
+
+    # 1. Pulsar Guardar EXACTAMENTE UNA VEZ
+    ri.click(L + fpr.GUARDAR_REL[0], T + fpr.GUARDAR_REL[1])
+    time.sleep(0.4)
+
+    # 2. Si aparece algún diálogo de confirmación o aviso de Hybrid, responder
+    t0 = time.time()
+    while time.time() - t0 < 1.2:
+        h = fp._find_hwnd("TMessageForm") or fp._find_hwnd(CONF_CLASS)
+        if not h:
+            break
+        fpr._focus(h)
+        for titulo in ("&Yes", "&Sí", "Sí", "Yes", "Aceptar", "&Aceptar", "OK", "&OK", "Ok", "&Ok", "Continuar"):
+            try:
+                b = fp._win(h).child_window(title=titulo)
+                r = b.rectangle()
+                ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+                log.info("Diálogo post-guardar '%s' pulsado.", titulo)
+                time.sleep(0.15)
+                break
+            except Exception:
+                continue
+        time.sleep(0.05)
+
+    # 3. Cancelar el registro vacío sobrante para salir de 'Modo Inserción'
+    ri.click(L + CANCELAR_REL[0], T + CANCELAR_REL[1])
+    time.sleep(0.4)
+    t0 = time.time()
+    while time.time() - t0 < 1.0:
+        h = fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm")
+        if not h:
+            break
+        m = fp._win(h)
+        for titulo in ("&NO", "No", "&No", "&SI", "SI", "&Sí", "Sí", "OK", "&OK"):
+            try:
+                b = m.child_window(title=titulo)
+                r = b.rectangle()
+                ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+                time.sleep(0.15)
+                break
+            except Exception:
+                continue
+        time.sleep(0.05)
+
+    # 4. Cerrar la Ficha de Inventario para dejar el escritorio libre
+    fsr._cerrar_ficha_si_abierta()
+
+
 def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False):
     """Da de alta un producto NUEVO en la Ficha de Inventario, para ítems de
     compra con es_nuevo=True. Return: {"ok": bool, "etapa": str, "detalle": str}.
@@ -516,6 +584,7 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False)
     if not commit:
         fpr._click_boton_dialogo("Salir")        # descarta Costos y Precios
         _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))   # descarta la Ficha, SIN guardar
+        fsr._cerrar_ficha_si_abierta()
         return {"ok": True, "etapa": "preview",
                 "detalle": f"Alta de {codigo} ({descripcion}) verificada en pantalla "
                            f"(costo={costo}, precio={precio}) y DESCARTADA (sin --commit; "
@@ -528,8 +597,8 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False)
     if fp._find_hwnd(fp.PRECIOS_CLASS):
         fpr._click_boton_dialogo("Salir")
 
-    fpr._guardar_ficha()
-    time.sleep(0.8)
+    _guardar_ficha_alta()
+    time.sleep(0.5)
 
     try:
         existencia_db, costo_db, precio_db = _leer_item_db(codigo)
