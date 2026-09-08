@@ -132,6 +132,8 @@ CLASIFICACION_F1_REL = (292, 119)  # botón 'F&1' junto al campo Clasificación
 PROVEEDOR_F1_REL = (296, 146)      # botón 'F1' de la fila Proveedor
 TOTALIZAR_REL = (644, 691)         # botón '&Totalizar' (barra inferior de Compras)
 TOTAL_OPERAR_REL = (584, 660)      # botón 'T&otalizar' de TFrmTotalOperacion
+ITEM_GRID_REL = (72, 325)          # celda Código de la grilla (TAdvStringGrid), 1er ítem
+GRID_EDIT_CLASSES = ("THybridEdit", "THybridEditNumber")   # editores de la fila activa
 
 # ── ALTA DE PRODUCTO NUEVO (crear_producto) ─────────────────────────────────
 # Barra superior de la Ficha de Inventario (owner-drawn, sin título): botones
@@ -818,34 +820,105 @@ def seleccionar_proveedor(com, proveedor_codigo, proveedor_nombre=None):
 
 
 # ── ítems de la grilla ──────────────────────────────────────────────────────
+def _fila_activa(hcom):
+    """Inspecciona los controles de edición de la fila activa en la grilla de Compras.
+    Devuelve (top_px, {"codigo": str, "descripcion": str, "cantidad": str, "costo": str}).
+    Si la fila no tiene editores visibles (no está en edición), devuelve (None, {})."""
+    if not hcom:
+        return None, {}
+    try:
+        com = fp._win(hcom)
+        grid = com.child_window(class_name="TAdvStringGrid", found_index=0)
+        gr = grid.rectangle()
+        ctrls = []
+        for c in com.descendants():
+            cls = c.class_name()
+            if cls not in GRID_EDIT_CLASSES:
+                continue
+            r = c.rectangle()
+            if gr.left <= r.left < gr.right and gr.top <= r.top < gr.bottom:
+                ctrls.append((r.top, r.left, cls, c))
+    except Exception as e:
+        log.debug("No pude inspeccionar la grilla de Compras: %r", e)
+        return None, {}
+
+    bandas = {}
+    for top, left, cls, c in ctrls:
+        clave = next((k for k in bandas if abs(k - top) <= 3), top)
+        bandas.setdefault(clave, []).append((left, cls, c))
+
+    candidatas = {k: v for k, v in bandas.items() if len(v) >= 3}
+    if not candidatas:
+        return None, {}
+
+    top = max(candidatas)
+    fila = sorted(candidatas[top], key=lambda x: x[0])
+
+    def txt(c):
+        try:
+            return (c.window_text() or "").strip()
+        except Exception:
+            return ""
+
+    edits = [c for _, cls, c in fila if cls == "THybridEdit"]
+    nums = [c for _, cls, c in fila if cls == "THybridEditNumber"]
+
+    campos = {
+        "codigo":      txt(edits[0]) if len(edits) >= 1 else "",
+        "descripcion": txt(edits[1]) if len(edits) >= 2 else "",
+        "cantidad":    txt(nums[0]) if len(nums) >= 1 else "",
+        "costo":       txt(nums[1]) if len(nums) >= 2 else "",
+    }
+    return top, campos
+
+
+def _verificar_producto_cargado(hcom, codigo, clave_busqueda=None):
+    """Confirma EN PANTALLA que el código llegó a la grilla de Compras y que
+    HybridLite resolvió el producto correcto, antes de seguir tecleando cantidad y costo.
+    Acepta el código original o la clave de búsqueda (referencia/código de barras)."""
+    _, campos = _fila_activa(hcom)
+    if not campos:
+        log.warning("No pude leer la fila en curso del ítem %s: queda sin verificar en pantalla.", codigo)
+        return
+
+    leido = campos.get("codigo", "").strip().upper()
+    esperados = {str(codigo).strip().upper()}
+    if clave_busqueda:
+        esperados.add(str(clave_busqueda).strip().upper())
+    if leido not in esperados:
+        raise CompraError(
+            f"El código {codigo} no llegó a la grilla de Compras (la celda quedó en {leido!r}). "
+            f"El foco no estaba en la grilla o se cargó un producto incorrecto."
+        )
+    if not campos.get("descripcion"):
+        raise CompraError(
+            f"El ítem {codigo} quedó sin descripción en la grilla: HybridLite no resolvió el producto."
+        )
+
+
 def cargar_item(codigo, cantidad, costo, precio, commit, es_primero=False,
                 clave_busqueda=None):
-    """Teclea un ítem completo en la grilla de Compras (el foco ya está en la
-    celda Código, sin clic previo, replicando la grabación):
-        código -> ENTER (carga)
+    """Teclea un ítem completo en la grilla de Compras:
+        (solo el 1er ítem) clic en la celda Código de la grilla TAdvStringGrid
+        código -> ENTER (carga y verifica en pantalla)
         cantidad -> ENTER
-        costo (numérico) + Shift+4 ('$') -> ENTER  -> abre TFHCostosPrecios
-        precio (escribir_precio, reutilizado de flujo_precio_real) -> Aceptar+Salir
-        (commit) o solo Salir (preview, descarta el ítem)
+        costo (numérico) + Shift+4 ('$') -> ENTER -> abre TFHCostosPrecios (o ítem at-min)
+        precio (escribir_precio) -> Aceptar+Salir (commit) o solo Salir (preview)
     Lanza CompraError ante cualquier desviación; el llamador cancela TODO el
-    documento (política todo-o-nada).
-
-    SOLO el PRIMER ítem (`es_primero`) activa la ventana de Compras. Al salir de
-    Costos y Precios, HybridLite deja el cursor en la celda Código del siguiente
-    ítem automáticamente (confirmado por el dueño 2026-07-12), así que los ítems
-    siguientes NO se re-enfocan ni se clickea celda alguna -- re-activar la
-    ventana perturbaría ese cursor auto-posicionado.
-
-    `clave_busqueda`: string a TECLEAR para que la grilla cargue `codigo`. Puede
-    diferir del código cuando éste es la referencia de otro producto y teclearlo
-    cargaría ese otro (ver colisiones.py); lo calcula el pre-vuelo de
-    registrar_compra. `codigo` sigue siendo el producto REAL para todo lo demás
-    (IVA, verificación contra la DBISAM). None -> se teclea el código tal cual
-    (comportamiento previo, usado por el preview)."""
+    documento (política todo-o-nada)."""
     a_teclear = clave_busqueda or codigo
     hcom = fp._find_hwnd(COMPRAS_CLASS)
     if es_primero:
         _focus(hcom)
+        try:
+            com = fp._win(hcom)
+            grid = com.child_window(class_name="TAdvStringGrid", found_index=0)
+            gr = grid.rectangle()
+            ri.click(gr.left + 60, gr.top + 34)
+        except Exception:
+            L, T, _, _ = win32gui.GetWindowRect(hcom)
+            ri.click(L + ITEM_GRID_REL[0], T + ITEM_GRID_REL[1])
+        time.sleep(0.25)
 
     # Un ítem que quedó en/bajo su mínimo dispara una alerta 'llegó al mínimo'
     # de forma ASÍNCRONA/TARDÍA, que puede aparecer ya empezado el siguiente
@@ -864,6 +937,9 @@ def cargar_item(codigo, cantidad, costo, precio, commit, es_primero=False,
     time.sleep(0.15)
     ri.press("ENTER")
     time.sleep(0.6)
+
+    # VERIFICACIÓN EN PANTALLA: confirmar que el producto cargado es el pedido
+    _verificar_producto_cargado(hcom, codigo, clave_busqueda=a_teclear)
 
     ri.type_number(f"{float(cantidad):g}")
     time.sleep(0.15)
@@ -885,25 +961,19 @@ def cargar_item(codigo, cantidad, costo, precio, commit, es_primero=False,
     #       queda por acople al costo. Se pasa directo al siguiente ítem.
     #   (b) producto normal -> se abre Costos y Precios (TFHCostosPrecios) para
     #       teclear el precio.
-    # CLAVE: NO se rompe el bucle al ver una alerta. La alerta 'llegó al mínimo'
-    # de un ítem previo (at-min) llega tarde/asíncrona y puede colarse aquí; se
-    # drena (Ok) pero se SIGUE esperando a que abra Costos y Precios de ESTE
-    # ítem. Solo si tras el timeout nunca abrió, se concluye caso (a).
     precios_h = None
     t0 = time.time()
-    while time.time() - t0 < 8:
+    while time.time() - t0 < 2.5:
         precios_h = fp._find_hwnd(fp.PRECIOS_CLASS)
         if precios_h:
             break                                   # caso (b): abrió el diálogo
         if fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm"):
-            _confirmar_lo_que_pregunte(timeout=3)    # Ok a 'llegó al mínimo'
+            _confirmar_lo_que_pregunte(timeout=1.5, inmediato_si_no_hay=True)
             _focus(hcom)
-        time.sleep(0.3)
+        time.sleep(0.05)
 
     if not precios_h:
         # caso (a): nunca abrió Costos y Precios -> ítem at-min agregado directo.
-        # (Si en realidad no se agregó, la verificación final contra la DBISAM
-        # lo detecta por existencia y aborta todo-o-nada.)
         log.info("Ítem %s en el mínimo: agregado directo (costo=%s), Costos y "
                  "Precios NO abre; se continúa (commit=%s).",
                  codigo, costo, commit)
