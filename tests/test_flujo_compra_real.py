@@ -82,3 +82,26 @@ def test_leer_items_db_batch_reintenta_y_recupera(monkeypatch):
     assert res["A"] == (5.0, 2.0, 10.0)
     assert intentos[0] == 2
 
+
+
+def test_confirmar_lo_que_pregunte_acepta_inmediato_si_no_hay(monkeypatch):
+    """Regresión: cargar_item invoca _confirmar_lo_que_pregunte con el kwarg
+    inmediato_si_no_hay. La firma local debe aceptarlo (antes solo existía en
+    flujo_pedido_real, y el TypeError escapaba del `except CompraError` de
+    registrar_compra, saltándose el cancelado todo-o-nada)."""
+    import inspect
+
+    params = inspect.signature(fcr._confirmar_lo_que_pregunte).parameters
+    assert "inmediato_si_no_hay" in params
+    assert params["inmediato_si_no_hay"].default is False
+
+    monkeypatch.setattr(fcr.fp, "_find_hwnd", lambda cls: None)
+    # Sin diálogo en pantalla debe volver ya mismo, sin agotar el timeout.
+    assert fcr._confirmar_lo_que_pregunte(timeout=30, inmediato_si_no_hay=True) is False
+
+
+def test_espera_costos_precios_no_se_recorta():
+    """Recortar este presupuesto hace concluir 'ítem at-min' por impaciencia y
+    saltarse el tecleo del precio, algo que la verificación contra DBISAM no
+    detecta (valida existencia, no precio)."""
+    assert fcr.ESPERA_COSTOS_PRECIOS >= 8

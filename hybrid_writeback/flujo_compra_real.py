@@ -154,6 +154,12 @@ TOL_ALTA = 0.02   # misma tolerancia que TOL_COSTO_PRECIO, usada en la verificac
 REINTENTOS_LECTURA_DB = 3
 ESPERA_LECTURA_DB = 20    # segundos entre reintentos
 
+# Presupuesto para que HybridLite abra Costos y Precios (TFHCostosPrecios) tras
+# confirmar el costo de un ítem. Agotarlo significa "ítem at-min, agregado
+# directo" y SE SALTA el tecleo del precio, así que quedarse corto corrompe el
+# precio en silencio (ver bifurcación (a)/(b) en cargar_item).
+ESPERA_COSTOS_PRECIOS = 8   # segundos
+
 
 class CompraError(Exception):
     pass
@@ -234,7 +240,7 @@ def _focus(hwnd):
     time.sleep(0.25)
 
 
-def _confirmar_lo_que_pregunte(timeout=5):
+def _confirmar_lo_que_pregunte(timeout=5, inmediato_si_no_hay=False):
     """Responde afirmativamente a CUALQUIER diálogo de confirmación/alerta que
     aparezca (TFConfirmacion o TMessageForm), probando una lista amplia de
     títulos de botón. Cubre dos casos del flujo de compra:
@@ -243,14 +249,20 @@ def _confirmar_lo_que_pregunte(timeout=5):
       - Alerta 'el producto llegó al mínimo' al Totalizar/agregar un producto
         (típico de productos con existencia baja/nueva): solo hay que darle
         OK/Aceptar y CONTINUAR (confirmado por el dueño 2026-07-12). Por eso se
-        incluyen 'Aceptar'/'OK'/'Continuar' en la lista."""
+        incluyen 'Aceptar'/'OK'/'Continuar' en la lista.
+
+    Si inmediato_si_no_hay=True y no hay diálogo en pantalla, retorna False de
+    inmediato sin agotar el timeout (mismo contrato que
+    flujo_pedido_real._confirmar_lo_que_pregunte). Se usa dentro de bucles de
+    sondeo, donde bloquear el timeout completo por un diálogo que no está
+    frenaría el flujo."""
     t0 = time.time()
     respondido = False
     while time.time() - t0 < timeout:
         h = fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm")
         if not h:
-            if respondido:
-                return True
+            if respondido or inmediato_si_no_hay:
+                return respondido
             time.sleep(0.3)
             continue
         _focus(h)
@@ -987,9 +999,20 @@ def cargar_item(codigo, cantidad, costo, precio, commit, es_primero=False,
     #       queda por acople al costo. Se pasa directo al siguiente ítem.
     #   (b) producto normal -> se abre Costos y Precios (TFHCostosPrecios) para
     #       teclear el precio.
+    # CLAVE: NO se rompe el bucle al ver una alerta. La alerta 'llegó al mínimo'
+    # de un ítem previo (at-min) llega tarde/asíncrona y puede colarse aquí; se
+    # drena (Ok) pero se SIGUE esperando a que abra Costos y Precios de ESTE
+    # ítem. Solo si tras el timeout nunca abrió, se concluye caso (a).
+    #
+    # El presupuesto es de ESPERA_COSTOS_PRECIOS segundos y NO debe recortarse:
+    # concluir caso (a) por impaciencia se salta el tecleo del precio en un
+    # producto normal, y eso la verificación final contra la DBISAM NO lo
+    # detecta (valida existencia, no precio) -> el ítem queda con el precio
+    # viejo en silencio. El sondeo sí es rápido (50 ms), así que el caso (b)
+    # sale apenas abre el diálogo; los segundos solo se gastan en at-min real.
     precios_h = None
     t0 = time.time()
-    while time.time() - t0 < 2.5:
+    while time.time() - t0 < ESPERA_COSTOS_PRECIOS:
         precios_h = fp._find_hwnd(fp.PRECIOS_CLASS)
         if precios_h:
             break                                   # caso (b): abrió el diálogo
