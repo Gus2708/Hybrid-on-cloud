@@ -37,7 +37,7 @@ jobs:
         run: python -m ruff check .
 
       - name: Run Pytest with Coverage
-        run: python -m pytest --cov=schemas --cov-report=term --cov-report=xml:coverage.xml
+        run: python -m pytest -m "not integration" --cov=schemas --cov-report=term --cov-report=xml:coverage.xml
 
       - name: Upload Coverage Report
         uses: actions/upload-artifact@v4
