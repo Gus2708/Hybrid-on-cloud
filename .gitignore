@@ -5,6 +5,9 @@ venv/
 __pycache__/
 tests/.pytest_cache/
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
 
 # ─── Secretos y configuración local ──────────────────────────────────────────
 # Las credenciales viven solo aquí; la plantilla versionada es .env.example.

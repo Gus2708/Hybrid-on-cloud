@@ -52,6 +52,8 @@ import sys
 import time
 import logging
 
+DIR = os.path.dirname(os.path.abspath(__file__))
+
 import win32gui
 
 try:
@@ -715,7 +717,7 @@ def _confirmar_si():
             h = fp._find_hwnd(cls)
             if h:
                 _focus(h)
-                for titulo in ("&Yes", "&Sí", "Sí", "Yes", "Aceptar", "OK", "Continuar", "&Aceptar"):
+                for titulo in ("&Yes", "&Sí", "Sí", "Yes", "Aceptar", "OK", "&OK", "Ok", "&Ok", "Continuar", "&Aceptar"):
                     try:
                         b = fp._win(h).child_window(title=titulo)
                         r = b.rectangle()

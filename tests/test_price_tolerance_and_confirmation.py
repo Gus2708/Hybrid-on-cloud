@@ -76,3 +76,55 @@ def test_confirmar_si_atiende_ambas_clases_de_dialogo(monkeypatch):
     assert res is True
     assert "TMessageForm" in clases_buscadas
     assert "TFConfirmacion" in clases_buscadas
+
+
+def test_confirmar_si_soporta_variantes_ok(monkeypatch):
+    """_confirmar_si debe reconocer títulos de botón como &OK, Ok, &Ok."""
+    titulos_intentados = []
+
+    class DummyWin:
+        def child_window(self, title):
+            titulos_intentados.append(title)
+            if title == "&OK":
+                class DummyButton:
+                    def rectangle(self):
+                        class Rect:
+                            left, right, top, bottom = 10, 20, 10, 20
+                        return Rect()
+                return DummyButton()
+            raise Exception("No coincide")
+
+    monkeypatch.setattr("flujo_precio._find_hwnd", lambda cls: 8888 if cls == "TMessageForm" else None)
+    monkeypatch.setattr("flujo_precio._win", lambda hwnd: DummyWin())
+    monkeypatch.setattr("realinput.click", lambda x, y: None)
+    monkeypatch.setattr("flujo_precio_real._focus", lambda hwnd: None)
+
+    res = fpr._confirmar_si()
+    assert res is True
+    assert "&OK" in titulos_intentados
+
+
+def test_guardar_ficha_alta_un_solo_guardar_y_limpieza(monkeypatch):
+    """_guardar_ficha_alta debe pulsar Guardar UNA SOLA VEZ, cancelar el insert sobrante y cerrar la Ficha."""
+    import flujo_compra_real as fcr
+
+    clics = []
+    def mock_click(x, y):
+        clics.append((x, y))
+
+    cerrada = []
+    monkeypatch.setattr(fcr.fp, "_find_hwnd", lambda cls: 5555 if cls == fcr.fp.FICHA_CLASS else None)
+    monkeypatch.setattr(fcr.win32gui, "GetWindowRect", lambda hwnd: (100, 100, 900, 700))
+    monkeypatch.setattr(fcr.fpr, "_focus", lambda hwnd: None)
+    monkeypatch.setattr(fcr.ri, "click", mock_click)
+    monkeypatch.setattr(fcr.fsr, "_cerrar_ficha_si_abierta", lambda: cerrada.append(True))
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    fcr._guardar_ficha_alta()
+
+    # Debe haber exactamente 2 clics principales: Guardar (x=100+240, y=100+60) y Cancelar (x=100+175, y=100+62)
+    assert len(clics) == 2
+    assert clics[0] == (100 + fcr.fpr.GUARDAR_REL[0], 100 + fcr.fpr.GUARDAR_REL[1])
+    assert clics[1] == (100 + fcr.CANCELAR_REL[0], 100 + fcr.CANCELAR_REL[1])
+    # Y la Ficha debe quedar cerrada
+    assert cerrada == [True]

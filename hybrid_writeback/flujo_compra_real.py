@@ -132,6 +132,8 @@ CLASIFICACION_F1_REL = (292, 119)  # botón 'F&1' junto al campo Clasificación
 PROVEEDOR_F1_REL = (296, 146)      # botón 'F1' de la fila Proveedor
 TOTALIZAR_REL = (644, 691)         # botón '&Totalizar' (barra inferior de Compras)
 TOTAL_OPERAR_REL = (584, 660)      # botón 'T&otalizar' de TFrmTotalOperacion
+ITEM_GRID_REL = (72, 325)          # celda Código de la grilla (TAdvStringGrid), 1er ítem
+GRID_EDIT_CLASSES = ("THybridEdit", "THybridEditNumber")   # editores de la fila activa
 
 # ── ALTA DE PRODUCTO NUEVO (crear_producto) ─────────────────────────────────
 # Barra superior de la Ficha de Inventario (owner-drawn, sin título): botones
@@ -151,6 +153,12 @@ TOL_ALTA = 0.02   # misma tolerancia que TOL_COSTO_PRECIO, usada en la verificac
 # que sí se registró.
 REINTENTOS_LECTURA_DB = 3
 ESPERA_LECTURA_DB = 20    # segundos entre reintentos
+
+# Presupuesto para que HybridLite abra Costos y Precios (TFHCostosPrecios) tras
+# confirmar el costo de un ítem. Agotarlo significa "ítem at-min, agregado
+# directo" y SE SALTA el tecleo del precio, así que quedarse corto corrompe el
+# precio en silencio (ver bifurcación (a)/(b) en cargar_item).
+ESPERA_COSTOS_PRECIOS = 8   # segundos
 
 
 class CompraError(Exception):
@@ -190,6 +198,32 @@ def _leer_item_db(codigo):
             time.sleep(ESPERA_LECTURA_DB)
 
 
+def _leer_items_db_batch(codigos):
+    """(existencias, precios, costos) de una lista de ítems en DBISAM en solo 2 pasadas
+    (1 en TExistenciaInv + 1 en TInventario), con reintentos defensivos.
+    Devuelve dict {codigo: (existencia, costo, precio)}."""
+    for intento in range(1, REINTENTOS_LECTURA_DB + 1):
+        try:
+            ex_map = dbex.existencia_batch(codigos)
+            pc_map = hpw._db_valores_usd_batch(codigos)
+            res = {}
+            for c in codigos:
+                c_str = str(c).strip()
+                tot_ex = ex_map.get(c_str, (0.0, []))[0]
+                precio, costo = pc_map.get(c_str, (None, None))
+                res[c_str] = (tot_ex, costo, precio)
+            return res
+        except OSError as e:
+            if intento == REINTENTOS_LECTURA_DB:
+                raise VerificacionIndisponible(
+                    f"la DBISAM no responde tras {REINTENTOS_LECTURA_DB} intentos ({e!r}); "
+                    f"probablemente se cayó la unidad H:") from e
+            log.warning("Lectura batch DB de %s ítems falló (%r); reintento %s/%s en %ss.",
+                        len(codigos), e, intento + 1, REINTENTOS_LECTURA_DB, ESPERA_LECTURA_DB)
+            time.sleep(ESPERA_LECTURA_DB)
+
+
+
 # ── utilidades compartidas (mismo patrón que flujo_precio_real/flujo_stock_real) ──
 def _focus(hwnd):
     """Fuerza que la ventana esté al frente antes de disparar input real."""
@@ -206,7 +240,7 @@ def _focus(hwnd):
     time.sleep(0.25)
 
 
-def _confirmar_lo_que_pregunte(timeout=5):
+def _confirmar_lo_que_pregunte(timeout=5, inmediato_si_no_hay=False):
     """Responde afirmativamente a CUALQUIER diálogo de confirmación/alerta que
     aparezca (TFConfirmacion o TMessageForm), probando una lista amplia de
     títulos de botón. Cubre dos casos del flujo de compra:
@@ -215,14 +249,20 @@ def _confirmar_lo_que_pregunte(timeout=5):
       - Alerta 'el producto llegó al mínimo' al Totalizar/agregar un producto
         (típico de productos con existencia baja/nueva): solo hay que darle
         OK/Aceptar y CONTINUAR (confirmado por el dueño 2026-07-12). Por eso se
-        incluyen 'Aceptar'/'OK'/'Continuar' en la lista."""
+        incluyen 'Aceptar'/'OK'/'Continuar' en la lista.
+
+    Si inmediato_si_no_hay=True y no hay diálogo en pantalla, retorna False de
+    inmediato sin agotar el timeout (mismo contrato que
+    flujo_pedido_real._confirmar_lo_que_pregunte). Se usa dentro de bucles de
+    sondeo, donde bloquear el timeout completo por un diálogo que no está
+    frenaría el flujo."""
     t0 = time.time()
     respondido = False
     while time.time() - t0 < timeout:
         h = fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm")
         if not h:
-            if respondido:
-                return True
+            if respondido or inmediato_si_no_hay:
+                return respondido
             time.sleep(0.3)
             continue
         _focus(h)
@@ -431,6 +471,74 @@ def _cancelar_ficha_alta(hf):
         time.sleep(0.4)
 
 
+def _guardar_ficha_alta():
+    """Guarda la Ficha en modo ALTA (nuevo producto) y cancela el registro vacío sobrante.
+
+    En HybridLite, al dar de alta un producto nuevo ('Incluir' -> llenar campos -> 'Guardar'):
+    1. 'Guardar' persiste el nuevo producto en DBISAM de inmediato sin diálogo de confirmación.
+       Reintentar el clic a ciegas (como hace _guardar_ficha de modificación) vuelve a pulsar
+       'Guardar' sobre un registro nuevo en blanco, disparando el modal:
+       'Information: Existen campos obligatorios no procesados'.
+    2. Por tanto, se pulsa Guardar EXACTAMENTE UNA VEZ.
+    3. Si aparece algún diálogo de confirmación o aviso de Hybrid, se responde afirmativamente.
+    4. Tras guardar, HybridLite permanece en 'Modo Inserción' con campos vacíos.
+       Para dejar la Ficha limpia y salir de 'Modo Inserción', se pulsa 'Cancelar' (CANCELAR_REL),
+       descartando el registro en blanco sin afectar al producto ya guardado en DBISAM.
+    5. Finalmente se cierra la Ficha de Inventario con fsr._cerrar_ficha_si_abierta().
+    """
+    hf = fp._find_hwnd(fp.FICHA_CLASS)
+    if not hf:
+        raise CompraError("No encontré la Ficha de Inventario para guardar el alta.")
+    fpr._focus(hf)
+    L, T, _, _ = win32gui.GetWindowRect(hf)
+
+    # 1. Pulsar Guardar EXACTAMENTE UNA VEZ
+    ri.click(L + fpr.GUARDAR_REL[0], T + fpr.GUARDAR_REL[1])
+    time.sleep(0.4)
+
+    # 2. Si aparece algún diálogo de confirmación o aviso de Hybrid, responder
+    t0 = time.time()
+    while time.time() - t0 < 1.2:
+        h = fp._find_hwnd("TMessageForm") or fp._find_hwnd(CONF_CLASS)
+        if not h:
+            break
+        fpr._focus(h)
+        for titulo in ("&Yes", "&Sí", "Sí", "Yes", "Aceptar", "&Aceptar", "OK", "&OK", "Ok", "&Ok", "Continuar"):
+            try:
+                b = fp._win(h).child_window(title=titulo)
+                r = b.rectangle()
+                ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+                log.info("Diálogo post-guardar '%s' pulsado.", titulo)
+                time.sleep(0.15)
+                break
+            except Exception:
+                continue
+        time.sleep(0.05)
+
+    # 3. Cancelar el registro vacío sobrante para salir de 'Modo Inserción'
+    ri.click(L + CANCELAR_REL[0], T + CANCELAR_REL[1])
+    time.sleep(0.4)
+    t0 = time.time()
+    while time.time() - t0 < 1.0:
+        h = fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm")
+        if not h:
+            break
+        m = fp._win(h)
+        for titulo in ("&NO", "No", "&No", "&SI", "SI", "&Sí", "Sí", "OK", "&OK"):
+            try:
+                b = m.child_window(title=titulo)
+                r = b.rectangle()
+                ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+                time.sleep(0.15)
+                break
+            except Exception:
+                continue
+        time.sleep(0.05)
+
+    # 4. Cerrar la Ficha de Inventario para dejar el escritorio libre
+    fsr._cerrar_ficha_si_abierta()
+
+
 def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False):
     """Da de alta un producto NUEVO en la Ficha de Inventario, para ítems de
     compra con es_nuevo=True. Return: {"ok": bool, "etapa": str, "detalle": str}.
@@ -516,6 +624,7 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False)
     if not commit:
         fpr._click_boton_dialogo("Salir")        # descarta Costos y Precios
         _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))   # descarta la Ficha, SIN guardar
+        fsr._cerrar_ficha_si_abierta()
         return {"ok": True, "etapa": "preview",
                 "detalle": f"Alta de {codigo} ({descripcion}) verificada en pantalla "
                            f"(costo={costo}, precio={precio}) y DESCARTADA (sin --commit; "
@@ -528,8 +637,8 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False)
     if fp._find_hwnd(fp.PRECIOS_CLASS):
         fpr._click_boton_dialogo("Salir")
 
-    fpr._guardar_ficha()
-    time.sleep(0.8)
+    _guardar_ficha_alta()
+    time.sleep(0.5)
 
     try:
         existencia_db, costo_db, precio_db = _leer_item_db(codigo)
@@ -749,34 +858,105 @@ def seleccionar_proveedor(com, proveedor_codigo, proveedor_nombre=None):
 
 
 # ── ítems de la grilla ──────────────────────────────────────────────────────
+def _fila_activa(hcom):
+    """Inspecciona los controles de edición de la fila activa en la grilla de Compras.
+    Devuelve (top_px, {"codigo": str, "descripcion": str, "cantidad": str, "costo": str}).
+    Si la fila no tiene editores visibles (no está en edición), devuelve (None, {})."""
+    if not hcom:
+        return None, {}
+    try:
+        com = fp._win(hcom)
+        grid = com.child_window(class_name="TAdvStringGrid", found_index=0)
+        gr = grid.rectangle()
+        ctrls = []
+        for c in com.descendants():
+            cls = c.class_name()
+            if cls not in GRID_EDIT_CLASSES:
+                continue
+            r = c.rectangle()
+            if gr.left <= r.left < gr.right and gr.top <= r.top < gr.bottom:
+                ctrls.append((r.top, r.left, cls, c))
+    except Exception as e:
+        log.debug("No pude inspeccionar la grilla de Compras: %r", e)
+        return None, {}
+
+    bandas = {}
+    for top, left, cls, c in ctrls:
+        clave = next((k for k in bandas if abs(k - top) <= 3), top)
+        bandas.setdefault(clave, []).append((left, cls, c))
+
+    candidatas = {k: v for k, v in bandas.items() if len(v) >= 3}
+    if not candidatas:
+        return None, {}
+
+    top = max(candidatas)
+    fila = sorted(candidatas[top], key=lambda x: x[0])
+
+    def txt(c):
+        try:
+            return (c.window_text() or "").strip()
+        except Exception:
+            return ""
+
+    edits = [c for _, cls, c in fila if cls == "THybridEdit"]
+    nums = [c for _, cls, c in fila if cls == "THybridEditNumber"]
+
+    campos = {
+        "codigo":      txt(edits[0]) if len(edits) >= 1 else "",
+        "descripcion": txt(edits[1]) if len(edits) >= 2 else "",
+        "cantidad":    txt(nums[0]) if len(nums) >= 1 else "",
+        "costo":       txt(nums[1]) if len(nums) >= 2 else "",
+    }
+    return top, campos
+
+
+def _verificar_producto_cargado(hcom, codigo, clave_busqueda=None):
+    """Confirma EN PANTALLA que el código llegó a la grilla de Compras y que
+    HybridLite resolvió el producto correcto, antes de seguir tecleando cantidad y costo.
+    Acepta el código original o la clave de búsqueda (referencia/código de barras)."""
+    _, campos = _fila_activa(hcom)
+    if not campos:
+        log.warning("No pude leer la fila en curso del ítem %s: queda sin verificar en pantalla.", codigo)
+        return
+
+    leido = campos.get("codigo", "").strip().upper()
+    esperados = {str(codigo).strip().upper()}
+    if clave_busqueda:
+        esperados.add(str(clave_busqueda).strip().upper())
+    if leido not in esperados:
+        raise CompraError(
+            f"El código {codigo} no llegó a la grilla de Compras (la celda quedó en {leido!r}). "
+            f"El foco no estaba en la grilla o se cargó un producto incorrecto."
+        )
+    if not campos.get("descripcion"):
+        raise CompraError(
+            f"El ítem {codigo} quedó sin descripción en la grilla: HybridLite no resolvió el producto."
+        )
+
+
 def cargar_item(codigo, cantidad, costo, precio, commit, es_primero=False,
                 clave_busqueda=None):
-    """Teclea un ítem completo en la grilla de Compras (el foco ya está en la
-    celda Código, sin clic previo, replicando la grabación):
-        código -> ENTER (carga)
+    """Teclea un ítem completo en la grilla de Compras:
+        (solo el 1er ítem) clic en la celda Código de la grilla TAdvStringGrid
+        código -> ENTER (carga y verifica en pantalla)
         cantidad -> ENTER
-        costo (numérico) + Shift+4 ('$') -> ENTER  -> abre TFHCostosPrecios
-        precio (escribir_precio, reutilizado de flujo_precio_real) -> Aceptar+Salir
-        (commit) o solo Salir (preview, descarta el ítem)
+        costo (numérico) + Shift+4 ('$') -> ENTER -> abre TFHCostosPrecios (o ítem at-min)
+        precio (escribir_precio) -> Aceptar+Salir (commit) o solo Salir (preview)
     Lanza CompraError ante cualquier desviación; el llamador cancela TODO el
-    documento (política todo-o-nada).
-
-    SOLO el PRIMER ítem (`es_primero`) activa la ventana de Compras. Al salir de
-    Costos y Precios, HybridLite deja el cursor en la celda Código del siguiente
-    ítem automáticamente (confirmado por el dueño 2026-07-12), así que los ítems
-    siguientes NO se re-enfocan ni se clickea celda alguna -- re-activar la
-    ventana perturbaría ese cursor auto-posicionado.
-
-    `clave_busqueda`: string a TECLEAR para que la grilla cargue `codigo`. Puede
-    diferir del código cuando éste es la referencia de otro producto y teclearlo
-    cargaría ese otro (ver colisiones.py); lo calcula el pre-vuelo de
-    registrar_compra. `codigo` sigue siendo el producto REAL para todo lo demás
-    (IVA, verificación contra la DBISAM). None -> se teclea el código tal cual
-    (comportamiento previo, usado por el preview)."""
+    documento (política todo-o-nada)."""
     a_teclear = clave_busqueda or codigo
     hcom = fp._find_hwnd(COMPRAS_CLASS)
     if es_primero:
         _focus(hcom)
+        try:
+            com = fp._win(hcom)
+            grid = com.child_window(class_name="TAdvStringGrid", found_index=0)
+            gr = grid.rectangle()
+            ri.click(gr.left + 60, gr.top + 34)
+        except Exception:
+            L, T, _, _ = win32gui.GetWindowRect(hcom)
+            ri.click(L + ITEM_GRID_REL[0], T + ITEM_GRID_REL[1])
+        time.sleep(0.25)
 
     # Un ítem que quedó en/bajo su mínimo dispara una alerta 'llegó al mínimo'
     # de forma ASÍNCRONA/TARDÍA, que puede aparecer ya empezado el siguiente
@@ -795,6 +975,9 @@ def cargar_item(codigo, cantidad, costo, precio, commit, es_primero=False,
     time.sleep(0.15)
     ri.press("ENTER")
     time.sleep(0.6)
+
+    # VERIFICACIÓN EN PANTALLA: confirmar que el producto cargado es el pedido
+    _verificar_producto_cargado(hcom, codigo, clave_busqueda=a_teclear)
 
     ri.type_number(f"{float(cantidad):g}")
     time.sleep(0.15)
@@ -820,21 +1003,26 @@ def cargar_item(codigo, cantidad, costo, precio, commit, es_primero=False,
     # de un ítem previo (at-min) llega tarde/asíncrona y puede colarse aquí; se
     # drena (Ok) pero se SIGUE esperando a que abra Costos y Precios de ESTE
     # ítem. Solo si tras el timeout nunca abrió, se concluye caso (a).
+    #
+    # El presupuesto es de ESPERA_COSTOS_PRECIOS segundos y NO debe recortarse:
+    # concluir caso (a) por impaciencia se salta el tecleo del precio en un
+    # producto normal, y eso la verificación final contra la DBISAM NO lo
+    # detecta (valida existencia, no precio) -> el ítem queda con el precio
+    # viejo en silencio. El sondeo sí es rápido (50 ms), así que el caso (b)
+    # sale apenas abre el diálogo; los segundos solo se gastan en at-min real.
     precios_h = None
     t0 = time.time()
-    while time.time() - t0 < 8:
+    while time.time() - t0 < ESPERA_COSTOS_PRECIOS:
         precios_h = fp._find_hwnd(fp.PRECIOS_CLASS)
         if precios_h:
             break                                   # caso (b): abrió el diálogo
         if fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm"):
-            _confirmar_lo_que_pregunte(timeout=3)    # Ok a 'llegó al mínimo'
+            _confirmar_lo_que_pregunte(timeout=1.5, inmediato_si_no_hay=True)
             _focus(hcom)
-        time.sleep(0.3)
+        time.sleep(0.05)
 
     if not precios_h:
         # caso (a): nunca abrió Costos y Precios -> ítem at-min agregado directo.
-        # (Si en realidad no se agregó, la verificación final contra la DBISAM
-        # lo detecta por existencia y aborta todo-o-nada.)
         log.info("Ítem %s en el mínimo: agregado directo (costo=%s), Costos y "
                  "Precios NO abre; se continúa (commit=%s).",
                  codigo, costo, commit)
@@ -1135,17 +1323,24 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
         if clave != codigo:
             log.warning("Ítem %s se tecleará como %r (colisión evitada).", codigo, clave)
 
-    # existencia ANTES de cada ítem (para la verificación post-commit). Para
-    # ítems es_nuevo en preview el producto no existe todavía -> existencia
-    # ANTES no es legible (None), esperado y no bloqueante.
+    # existencia ANTES de cada ítem (en lote para reducir I/O sobre la red H:).
     existencias_antes = {}
-    for it in items:
-        try:
-            total_antes, _ = dbex.existencia(it["codigo"])
-        except Exception:
-            total_antes = None
-        existencias_antes[it["codigo"]] = total_antes
-        log.info("Existencia DB ANTES de %s: %s", it["codigo"], total_antes)
+    try:
+        ex_batch = dbex.existencia_batch([it["codigo"] for it in items])
+        for it in items:
+            c = it["codigo"]
+            existencias_antes[c] = ex_batch.get(c, (None, []))[0]
+            log.info("Existencia DB ANTES de %s: %s", c, existencias_antes[c])
+    except Exception as e:
+        log.warning("Lectura batch existencia ANTES falló (%r), usando fallback individual.", e)
+        for it in items:
+            try:
+                total_antes, _ = dbex.existencia(it["codigo"])
+            except Exception:
+                total_antes = None
+            existencias_antes[it["codigo"]] = total_antes
+            log.info("Existencia DB ANTES de %s: %s", it["codigo"], total_antes)
+
 
     # navegación PRE-escritura: abrir Compras + clasificación + proveedor.
     # Cualquier fallo aquí es 100% reintentable -- nada se ha escrito todavía
@@ -1214,24 +1409,28 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
     _salir_compras()
     time.sleep(0.8)
 
-    # verificación DB por ítem
+    # verificación DB por ítem (en lote: solo 2 lecturas de archivo sobre la red H:)
     resultados = {}
     todos_ok = True
+    codigos_items = [it["codigo"] for it in items]
+    try:
+        db_batch = _leer_items_db_batch(codigos_items)
+    except VerificacionIndisponible as e:
+        detalle = (f"Compra TOTALIZADA (doc={doc_numero}) con {len(items)} ítem(s), pero la "
+                   f"verificación quedó a medias: {e}. La compra YA ESTÁ "
+                   f"REGISTRADA en HybridLite — NO reencolar (sería una compra doble); "
+                   f"revisar existencias a mano y cerrar la solicitud.")
+        log.error("Verificación incompleta de la compra doc=%s: %s", doc_numero, detalle)
+        return {"ok": False, "etapa": "verificacion_indisponible",
+                "detalle": detalle, "resultados": resultados}
+
     for it in items:
         codigo = it["codigo"]
         existencia_antes = existencias_antes.get(codigo)
         existencia_esperada = (existencia_antes + float(it["cantidad"])
                                if existencia_antes is not None else None)
-        try:
-            existencia_despues, costo_despues, precio_despues = _leer_item_db(codigo)
-        except VerificacionIndisponible as e:
-            detalle = (f"Compra TOTALIZADA (doc={doc_numero}) con {len(items)} ítem(s), pero la "
-                       f"verificación quedó a medias en {codigo}: {e}. La compra YA ESTÁ "
-                       f"REGISTRADA en HybridLite — NO reencolar (sería una compra doble); "
-                       f"revisar existencias a mano y cerrar la solicitud.")
-            log.error("Verificación incompleta de la compra doc=%s: %s", doc_numero, detalle)
-            return {"ok": False, "etapa": "verificacion_indisponible",
-                    "detalle": detalle, "resultados": resultados}
+        existencia_despues, costo_despues, precio_despues = db_batch.get(codigo, (None, None, None))
+
 
         fallos = []
         if existencia_esperada is None:

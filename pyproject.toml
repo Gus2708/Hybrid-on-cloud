@@ -1,0 +1,55 @@
+[project]
+name = "backend-serrucho"
+version = "1.0.0"
+description = "Backend de sincronización y automatización robótica para Serrucho"
+requires-python = ">=3.14"
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+exclude = [
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+    "scratch",
+    "specs",
+    "*.csv",
+    "*.log*",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # Errores generales
+    "F",    # Pyflakes (variables no definidas, imports rotos)
+    "W",    # Advertencias de whitespace / sintaxis
+]
+ignore = [
+    "E401", # Imports múltiples en una línea (import os, sys, time)
+    "E402", # Imports no al inicio (usado en tests para inyectar mocks previos)
+    "E501", # Longitud de línea (manejada por line-length)
+    "E701", # Sentencias múltiples en una línea con dos puntos (patrón idiomático en scripts de sync)
+    "E702", # Múltiples sentencias con punto y coma
+    "E722", # Permite bare except en scripts de recuperación legacy
+    "E741", # Nombres de variables ambiguos (l, O, I en scripts de matemáticas/tiempo)
+    "F401", # Permite imports no usados directamente en módulos puente
+    "F541", # F-strings sin placeholders
+    "F841", # Variables locales no leídas en scripts legacy
+    "W291", # Trailing whitespace cosmético
+    "W292", # Falta de newline al final de archivo
+    "W293", # Blank line whitespace cosmético
+]
+
+[tool.coverage.run]
+source = [".", "hybrid_writeback", "schemas"]
+omit = [
+    "tests/*",
+    "scratch/*",
+    "specs/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "except Exception as e:",
+]
