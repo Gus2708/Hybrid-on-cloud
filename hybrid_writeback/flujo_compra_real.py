@@ -471,7 +471,7 @@ def _cancelar_ficha_alta(hf):
         time.sleep(0.4)
 
 
-def _guardar_ficha_alta():
+def _guardar_ficha_alta(cerrar_ficha=True):
     """Guarda la Ficha en modo ALTA (nuevo producto) y cancela el registro vacío sobrante.
 
     En HybridLite, al dar de alta un producto nuevo ('Incluir' -> llenar campos -> 'Guardar'):
@@ -484,7 +484,8 @@ def _guardar_ficha_alta():
     4. Tras guardar, HybridLite permanece en 'Modo Inserción' con campos vacíos.
        Para dejar la Ficha limpia y salir de 'Modo Inserción', se pulsa 'Cancelar' (CANCELAR_REL),
        descartando el registro en blanco sin afectar al producto ya guardado en DBISAM.
-    5. Finalmente se cierra la Ficha de Inventario con fsr._cerrar_ficha_si_abierta().
+    5. Si cerrar_ficha=True (por defecto, o tras el último ítem nuevo), se cierra la Ficha.
+       Si hay más ítems nuevos por ingresar, se deja la Ficha abierta lista para el próximo 'Incluir'.
     """
     hf = fp._find_hwnd(fp.FICHA_CLASS)
     if not hf:
@@ -535,13 +536,18 @@ def _guardar_ficha_alta():
                 continue
         time.sleep(0.05)
 
-    # 4. Cerrar la Ficha de Inventario para dejar el escritorio libre
-    fsr._cerrar_ficha_si_abierta()
+    # 4. Cerrar la Ficha de Inventario solo si se solicita
+    if cerrar_ficha:
+        fsr._cerrar_ficha_si_abierta()
 
 
-def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False):
+
+def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False, cerrar_ficha=True):
     """Da de alta un producto NUEVO en la Ficha de Inventario, para ítems de
     compra con es_nuevo=True. Return: {"ok": bool, "etapa": str, "detalle": str}.
+
+    cerrar_ficha: si es False, deja la Ficha de Inventario abierta lista para
+    el próximo ítem nuevo (evita reabrir la ventana desde el menú para cada ítem).
 
     Etapas de fallo:
       "abrir_ficha"  -- no se pudo abrir/localizar la Ficha (reintentable, nada tocado)
@@ -624,7 +630,8 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False)
     if not commit:
         fpr._click_boton_dialogo("Salir")        # descarta Costos y Precios
         _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))   # descarta la Ficha, SIN guardar
-        fsr._cerrar_ficha_si_abierta()
+        if cerrar_ficha:
+            fsr._cerrar_ficha_si_abierta()
         return {"ok": True, "etapa": "preview",
                 "detalle": f"Alta de {codigo} ({descripcion}) verificada en pantalla "
                            f"(costo={costo}, precio={precio}) y DESCARTADA (sin --commit; "
@@ -637,7 +644,8 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False)
     if fp._find_hwnd(fp.PRECIOS_CLASS):
         fpr._click_boton_dialogo("Salir")
 
-    _guardar_ficha_alta()
+    _guardar_ficha_alta(cerrar_ficha=cerrar_ficha)
+
     time.sleep(0.5)
 
     try:
@@ -1266,10 +1274,12 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
     # ALTA de productos nuevos: ANTES de tocar la grilla de Compras (usa la
     # Ficha de Inventario, ventana distinta a Compras). Cualquier fallo acá
     # cancela la compra completa -- todavía no se escribió nada en Compras.
+    # OPTIMIZACIÓN: Si hay múltiples ítems nuevos, se mantiene la Ficha abierta
+    # (pulsando 'Incluir' para el siguiente tras el 'Cancelar' del insert vacío)
+    # y solo se cierra al terminar el último producto nuevo.
     altas_resultado = {}
-    for it in items:
-        if not it.get("es_nuevo"):
-            continue
+    items_nuevos = [it for it in items if it.get("es_nuevo")]
+    for idx_alta, it in enumerate(items_nuevos):
         codigo = it["codigo"]
         # ROBUSTEZ ante reintentos: si el producto YA existe en el maestro
         # (p.ej. una pasada anterior creó el alta pero falló al totalizar la
@@ -1280,17 +1290,25 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
                      "alta y se compra como existente.", codigo)
             it["es_nuevo"] = False
             continue
+        es_ultima = (idx_alta == len(items_nuevos) - 1)
         res_alta = crear_producto(
             codigo, it.get("descripcion"), it.get("referencia"),
             it["costo"], it["precio"], commit=commit,
+            cerrar_ficha=es_ultima,
         )
         altas_resultado[codigo] = res_alta
         if not res_alta["ok"]:
+            fsr._cerrar_ficha_si_abierta()
             return {"ok": False, "etapa": f"alta_producto:{res_alta['etapa']}",
                     "detalle": f"Alta de producto nuevo {codigo} falló, compra CANCELADA "
                                f"(nada se tocó en Compras): {res_alta['detalle']}",
                     "resultados": altas_resultado}
-        log.info("Alta de %s (es_nuevo): %s", codigo, res_alta["detalle"])
+        log.info("Alta de %s (es_nuevo, %s/%s): %s",
+                 codigo, idx_alta + 1, len(items_nuevos), res_alta["detalle"])
+
+    # Asegurar que la Ficha de Inventario quede cerrada antes de abrir Compras
+    fsr._cerrar_ficha_si_abierta()
+
 
     # PRE-VUELO DE COLISIONES código<->referencia (ver colisiones.py). Va DESPUÉS
     # de las altas (un producto es_nuevo recién creado ya está en el catálogo y

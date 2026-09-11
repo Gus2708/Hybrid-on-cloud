@@ -105,3 +105,26 @@ def test_espera_costos_precios_no_se_recorta():
     saltarse el tecleo del precio, algo que la verificación contra DBISAM no
     detecta (valida existencia, no precio)."""
     assert fcr.ESPERA_COSTOS_PRECIOS >= 8
+
+
+def test_guardar_ficha_alta_mantiene_ficha_abierta_si_cerrar_ficha_false(monkeypatch):
+    """Verifica que _guardar_ficha_alta NO cierre la Ficha si cerrar_ficha=False."""
+    clics = []
+    cerrada = []
+    monkeypatch.setattr(fcr.fp, "_find_hwnd", lambda cls: 5555 if cls == fcr.fp.FICHA_CLASS else None)
+    monkeypatch.setattr(fcr.win32gui, "GetWindowRect", lambda hwnd: (100, 100, 900, 700))
+    monkeypatch.setattr(fcr.fpr, "_focus", lambda hwnd: None)
+    monkeypatch.setattr(fcr.ri, "click", lambda x, y: clics.append((x, y)))
+    monkeypatch.setattr(fcr.fsr, "_cerrar_ficha_si_abierta", lambda: cerrada.append(True))
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    # 1. Con cerrar_ficha=False -> Guarda, Cancela insert sobrante, pero NO cierra la Ficha
+    fcr._guardar_ficha_alta(cerrar_ficha=False)
+    assert len(clics) == 2
+    assert cerrada == []
+
+    # 2. Con cerrar_ficha=True -> Guarda, Cancela y cierra la Ficha
+    fcr._guardar_ficha_alta(cerrar_ficha=True)
+    assert len(clics) == 4
+    assert cerrada == [True]
+
