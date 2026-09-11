@@ -101,14 +101,16 @@ def _focus(hwnd):
     if not hwnd:
         return
     try:
-        fp._win(hwnd).set_focus()
-    except Exception:
-        pass
-    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         win32gui.SetForegroundWindow(hwnd)
     except Exception:
         pass
-    time.sleep(0.15)
+    try:
+        fp._win(hwnd).set_focus()
+    except Exception:
+        pass
+    time.sleep(0.1)
 
 
 def _find_form(title):
@@ -139,14 +141,15 @@ def _find_form(title):
     return out[0] if out else None
 
 
-def _responder(dialogo_titulos, timeout=4):
+def _responder(dialogo_titulos, timeout=2.0):
     """Responde a un diálogo de confirmación pulsando el primer botón cuyo título
-    matchee `dialogo_titulos`. Devuelve True si respondió alguno."""
+    matchee `dialogo_titulos`. Devuelve True si respondió alguno.
+    Polling reactivo cada 0.05s para no penalizar altas limpias."""
     t0 = time.time()
     while time.time() - t0 < timeout:
         h = fp._find_hwnd(CONF_CLASS) or fp._find_hwnd("TMessageForm")
         if not h:
-            time.sleep(0.3)
+            time.sleep(0.05)
             continue
         _focus(h)
         m = fp._win(h)
@@ -156,12 +159,13 @@ def _responder(dialogo_titulos, timeout=4):
                 r = b.rectangle()
                 ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
                 log.info("Diálogo: '%s' pulsado.", titulo)
-                time.sleep(0.5)
+                time.sleep(0.2)
                 return True
             except Exception:
                 continue
-        time.sleep(0.3)
+        time.sleep(0.05)
     return False
+
 
 
 # ── apertura de la forma ──────────────────────────────────────────────────────
@@ -183,9 +187,10 @@ def abrir_forma(tipo):
     hmain = fp._find_hwnd(fp.MAIN_CLASS)
     if not hmain:
         raise DirectorioError("HybridLiteOS no está abierto (no veo el módulo principal).")
-    main = fp._win(hmain)
     _focus(hmain)
-    time.sleep(0.2)
+    time.sleep(0.1)
+    main = fp._win(hmain)
+
 
     try:
         btn = main.child_window(title=cfg["menu_btn"], class_name="TAdvGlassButton")
@@ -212,22 +217,26 @@ def abrir_forma(tipo):
 
 
 # ── campos ────────────────────────────────────────────────────────────────────
-def _campo_por_top(hform, top_objetivo):
-    """Localiza el THybridEdit de la columna izquierda cuyo `top` relativo cae en la
-    franja `top_objetivo` (± TOP_TOL). Devuelve el control pywinauto o None."""
+def _localizar_campos(hform, tops):
+    """Localiza todos los THybridEdit de la columna izquierda en una SOLA pasada
+    por el árbol de controles (en vez de llamar descendants() N veces)."""
     form = fp._win(hform)
     L, T, _, _ = win32gui.GetWindowRect(hform)
-    mejor, mejor_delta = None, TOP_TOL + 1
+    edits = []
     for c in form.descendants(class_name="THybridEdit"):
         r = c.rectangle()
-        rel_top = r.top - T
-        rel_left = r.left - L
-        if rel_left > LEFT_MAX:
-            continue
-        delta = abs(rel_top - top_objetivo)
-        if delta <= TOP_TOL and delta < mejor_delta:
-            mejor, mejor_delta = c, delta
-    return mejor
+        if (r.left - L) <= LEFT_MAX:
+            edits.append((r.top - T, c))
+
+    controles = {}
+    for clave, top_objetivo in tops.items():
+        mejor, mejor_delta = None, TOP_TOL + 1
+        for rel_top, c in edits:
+            delta = abs(rel_top - top_objetivo)
+            if delta <= TOP_TOL and delta < mejor_delta:
+                mejor, mejor_delta = c, delta
+        controles[clave] = mejor
+    return controles
 
 
 def _escribir_campo(campo, valor):
@@ -239,15 +248,15 @@ def _escribir_campo(campo, valor):
     lo selecciona y el type lo reemplaza; si está vacío, no cuesta nada. Mucho más rápido."""
     r = campo.rectangle()
     ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-    time.sleep(0.06)
+    time.sleep(0.05)
     try:
         campo.set_focus()
     except Exception:
         pass
-    time.sleep(0.05)
+    time.sleep(0.04)
     ri.select_all_field()
     ri.type_text(valor)
-    time.sleep(0.1)
+    time.sleep(0.08)
     return (campo.window_text() or "").strip()
 
 
@@ -255,16 +264,14 @@ def _llenar_campos(hform, tipo, codigo, nombre, rif):
     """Llena CÓDIGO → NOMBRE → RIF verificando cada uno en pantalla. Lanza
     DirectorioError si alguno no queda como se esperaba (el llamador cancela el alta)."""
     tops = CFG[tipo]["tops"]
+    controles = _localizar_campos(hform, tops)
 
     plan = [("codigo", codigo), ("nombre", nombre), ("rif", rif)]
-    controles = {}
     for clave, _ in plan:
-        c = _campo_por_top(hform, tops[clave])
-        if c is None:
+        if controles.get(clave) is None:
             raise DirectorioError(
                 f"no localicé el campo {clave} (franja top≈{tops[clave]}) del alta de "
                 f"{tipo} — ¿'Incluir' no abrió el modo alta? (revisar INCLUIR_REL/tops).")
-        controles[clave] = c
 
     for clave, valor in plan:
         leido = _escribir_campo(controles[clave], valor)
@@ -273,6 +280,7 @@ def _llenar_campos(hform, tipo, codigo, nombre, rif):
                 f"el campo {clave} quedó en pantalla como {leido!r}, esperaba {valor!r}. "
                 f"Nada se guarda.")
         log.info("Campo %s = %r verificado en pantalla.", clave, leido)
+
 
 
 def _norm(v):
@@ -295,33 +303,37 @@ def _incluir(hform):
 def _guardar(hform):
     _click_barra(hform, GUARDAR_REL)
     # tras Guardar puede pedir confirmación o avisar; aceptar lo que pregunte
-    _responder(("&Ok", "Ok", "&Aceptar", "Aceptar", "&SI", "SI", "&Sí", "Sí", "&Yes", "Yes"), timeout=2.5)
-    time.sleep(0.35)
+    _responder(("&Ok", "Ok", "&Aceptar", "Aceptar", "&SI", "SI", "&Sí", "Sí", "&Yes", "Yes"), timeout=0.6)
+    time.sleep(0.15)
 
 
 def _cancelar(hform):
     """Descarta el alta SIN guardar (preview o abort): 'Cancelar' + responder 'No' si
     pregunta si desea guardar."""
     _click_barra(hform, CANCELAR_REL)
-    _responder(("&NO", "No", "&No"), timeout=2)
+    _responder(("&NO", "No", "&No"), timeout=0.6)
 
 
 def _cerrar_forma(hform):
     """Cierra la Forma al terminar: 'Salir' (coord) + confirmaciones + WM_CLOSE de
     respaldo, para dejar limpio antes del próximo registro."""
-    if not hform or not win32gui.IsWindow(hform):
+    if not hform or not win32gui.IsWindow(hform) or not win32gui.IsWindowVisible(hform):
         return
     _click_barra(hform, SALIR_REL)
-    _responder(("&NO", "No", "&No", "&Ok", "Ok", "&SI", "SI"), timeout=1.5)
-    for _ in range(3):
-        if not win32gui.IsWindow(hform):
+    # Si la ventana ya cerró al pulsar Salir, terminamos inmediatamente sin esperas
+    if not win32gui.IsWindow(hform) or not win32gui.IsWindowVisible(hform):
+        return
+    _responder(("&NO", "No", "&No", "&Ok", "Ok", "&SI", "SI"), timeout=0.5)
+    for _ in range(2):
+        if not win32gui.IsWindow(hform) or not win32gui.IsWindowVisible(hform):
             return
         try:
             win32gui.PostMessage(hform, win32con.WM_CLOSE, 0, 0)
         except Exception:
             pass
-        _responder(("&NO", "No", "&No"), timeout=0.8)
-        time.sleep(0.3)
+        _responder(("&NO", "No", "&No"), timeout=0.4)
+        time.sleep(0.1)
+
 
 
 # ── orquestador ───────────────────────────────────────────────────────────────

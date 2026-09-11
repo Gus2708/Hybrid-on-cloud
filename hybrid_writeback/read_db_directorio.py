@@ -106,7 +106,22 @@ def buscar_por_codigo(tipo, codigo):
 def existe_codigo(tipo, codigo):
     """True si ya hay una ficha con ese código (para hacer el alta idempotente:
     si el código ya existe, el flujo NO intenta crearlo de nuevo)."""
-    return buscar_por_codigo(tipo, codigo) is not None
+    if tipo not in CONFIG:
+        return False
+    objetivo = _norm_rif(codigo)
+    if not objetivo:
+        return False
+    cfg = CONFIG[tipo]
+    db = pydbisam.PyDBISAM(cfg["ruta"])
+    campos = db.fields()
+    idx = {n: i for i, n in enumerate(campos)}
+    cod_i = idx.get(cfg["codigo"])
+    if cod_i is None:
+        return False
+    for row in db.rows():
+        if _norm_rif(row[cod_i]) == objetivo:
+            return True
+    return False
 
 
 def verificar(tipo, nombre, rif=None):
@@ -120,26 +135,41 @@ def verificar(tipo, nombre, rif=None):
     objetivo_nombre = _norm(nombre)
     objetivo_rif = _norm_rif(rif) if rif else None
 
-    mejor = None
-    for reg in _rows(tipo):
-        if _norm(reg.get("nombre")) != objetivo_nombre:
-            continue
-        if objetivo_rif and _norm_rif(reg.get("rif")) != objetivo_rif:
-            continue
-        auto = reg.get("auto") or 0
-        if mejor is None or auto > (mejor.get("auto") or 0):
-            mejor = reg
+    cfg = CONFIG[tipo]
+    db = pydbisam.PyDBISAM(cfg["ruta"])
+    campos = db.fields()
+    idx = {n: i for i, n in enumerate(campos)}
+    nom_i = idx.get(cfg["nombre"])
+    rif_i = idx.get(cfg["rif"])
+    cod_i = idx.get(cfg["codigo"])
+    auto_i = idx.get(cfg["auto"])
 
-    if mejor is None:
+    if nom_i is None or cod_i is None:
+        return False, None, f"campos requeridos no encontrados en {cfg['ruta']}"
+
+    mejor_codigo = None
+    mejor_rif = None
+    mejor_auto = -1
+
+    for row in db.rows():
+        if _norm(row[nom_i]) != objetivo_nombre:
+            continue
+        row_rif = row[rif_i] if rif_i is not None else None
+        if objetivo_rif and _norm_rif(row_rif) != objetivo_rif:
+            continue
+        auto = row[auto_i] if auto_i is not None and row[auto_i] is not None else 0
+        if auto >= mejor_auto:
+            mejor_auto = auto
+            mejor_codigo = _clean(row[cod_i])
+            mejor_rif = _clean(row_rif)
+
+    if mejor_codigo is None:
         cond = f"nombre={nombre!r}" + (f", rif={rif!r}" if rif else "")
         return False, None, f"no encontré ninguna ficha de {tipo} con {cond} en la DBISAM tras Guardar."
 
-    codigo = _clean(mejor.get("codigo"))
-    if not codigo:
-        return False, None, (f"la ficha de {tipo} {nombre!r} existe pero su código quedó vacío "
-                             f"en la DBISAM (¿alta a medias?).")
-    return True, codigo, (f"ficha de {tipo} {nombre!r} VERIFICADA en DB "
-                          f"(codigo={codigo}, rif={_clean(mejor.get('rif'))}).")
+    return True, mejor_codigo, (f"ficha de {tipo} {nombre!r} VERIFICADA en DB "
+                                f"(codigo={mejor_codigo}, rif={mejor_rif}).")
+
 
 
 def main():
