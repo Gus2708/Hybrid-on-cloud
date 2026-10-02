@@ -164,3 +164,112 @@ def test_matar_huerfanos_solo_toca_pids_nuevos_sin_ventana(monkeypatch):
                         lambda cmd, **k: matados.append(cmd[-1]))
     assert hh.matar_huerfanos({10}) == 1
     assert matados == ["30"]
+
+
+# ─── ventanas_bloqueantes / verificar_hybrid_listo ──────────────────────────
+def test_ventanas_bloqueantes_vacio_si_todo_limpio(monkeypatch):
+    """Instancia con solo TF_MainHybridCashMG habilitada y sin popups no bloquea."""
+    monkeypatch.setattr(hh, "pids_hybrid", lambda: {10})
+    monkeypatch.setattr(hh, "ventanas_visibles", lambda _pids: [(100, 10, "TF_MainHybridCashMG")])
+    monkeypatch.setattr(hh, "_esta_habilitada", lambda hwnd: True)
+    monkeypatch.setattr(hh, "_popup_activo", lambda hwnd: hwnd)
+    monkeypatch.setattr(hh, "_texto_ventana", lambda hwnd: "HybridLite")
+    assert hh.ventanas_bloqueantes({10}) == []
+
+
+def test_ventanas_bloqueantes_detecta_ventana_deshabilitada(monkeypatch):
+    """Ventana deshabilitada por diálogo modal debe ser detectada."""
+    monkeypatch.setattr(hh, "pids_hybrid", lambda: {10})
+    monkeypatch.setattr(hh, "ventanas_visibles", lambda _pids: [(100, 10, "TF_MainHybridCashMG")])
+    monkeypatch.setattr(hh, "_esta_habilitada", lambda hwnd: False)
+    monkeypatch.setattr(hh, "_popup_activo", lambda hwnd: hwnd)
+    monkeypatch.setattr(hh, "_texto_ventana", lambda hwnd: "HybridLite")
+    bloqueos = hh.ventanas_bloqueantes({10})
+    assert len(bloqueos) == 1
+    assert "deshabilitada" in bloqueos[0]["motivo"]
+    assert bloqueos[0]["hwnd"] == 100
+
+
+def test_ventanas_bloqueantes_detecta_popup_activo(monkeypatch):
+    """Ventana con GetLastActivePopup != hwnd debe ser detectada."""
+    monkeypatch.setattr(hh, "pids_hybrid", lambda: {10})
+    monkeypatch.setattr(hh, "ventanas_visibles", lambda _pids: [(100, 10, "TF_MainHybridCashMG")])
+    monkeypatch.setattr(hh, "_esta_habilitada", lambda hwnd: True)
+    monkeypatch.setattr(hh, "_popup_activo", lambda hwnd: 101)  # popup distinto
+    monkeypatch.setattr(hh, "_es_visible", lambda hwnd: True)
+    monkeypatch.setattr(hh, "_texto_ventana", lambda hwnd: "Atención")
+    bloqueos = hh.ventanas_bloqueantes({10})
+    assert len(bloqueos) == 1
+    assert "popup" in bloqueos[0]["motivo"]
+
+
+def test_ventanas_bloqueantes_detecta_clase_modal(monkeypatch):
+    """Clases como TMessageForm o #32770 deben reportarse como bloqueantes."""
+    monkeypatch.setattr(hh, "pids_hybrid", lambda: {10})
+    monkeypatch.setattr(hh, "ventanas_visibles", lambda _pids: [
+        (100, 10, "TF_MainHybridCashMG"),
+        (101, 10, "TMessageForm"),
+    ])
+    monkeypatch.setattr(hh, "_esta_habilitada", lambda hwnd: True)
+    monkeypatch.setattr(hh, "_popup_activo", lambda hwnd: hwnd)
+    monkeypatch.setattr(hh, "_texto_ventana", lambda hwnd: "Error")
+    bloqueos = hh.ventanas_bloqueantes({10})
+    assert any("TMessageForm" in b["class_name"] or "modal" in b["motivo"] for b in bloqueos)
+
+
+def test_verificar_hybrid_listo_retorna_true_si_limpio(monkeypatch):
+    monkeypatch.setattr(hh, "pids_hybrid", lambda: {10})
+    monkeypatch.setattr(hh, "ventanas_bloqueantes", lambda pids=None: [])
+    monkeypatch.setattr(hh, "diagnosticar", lambda gracia=None, logger=None: None)
+    listo, motivo, bloqueos = hh.verificar_hybrid_listo(target_pid=10)
+    assert listo is True
+    assert bloqueos == []
+
+
+def test_verificar_hybrid_listo_retorna_false_si_hay_bloqueos(monkeypatch):
+    monkeypatch.setattr(hh, "pids_hybrid", lambda: {10})
+    monkeypatch.setattr(hh, "ventanas_bloqueantes", lambda pids=None: [
+        {"hwnd": 101, "pid": 10, "class_name": "TMessageForm", "title": "Aviso", "motivo": "diálogo modal"}
+    ])
+    monkeypatch.setattr(hh, "diagnosticar", lambda gracia=None, logger=None: None)
+    listo, motivo, bloqueos = hh.verificar_hybrid_listo(target_pid=10)
+    assert listo is False
+    assert len(bloqueos) == 1
+    assert "bloqueante" in motivo
+
+
+def test_asegurar_hybrid_no_adopta_instancia_bloqueada(monkeypatch):
+    import abrir_hybrid
+    abrir_hybrid._AISLADO_PID = None
+    # Fast path: sin ficha
+    monkeypatch.setattr(abrir_hybrid.fp, "_find_hwnd", lambda cls: 100 if cls == abrir_hybrid.MAIN else None)
+    monkeypatch.setattr(abrir_hybrid, "_pid_de", lambda hwnd: 10 if hwnd == 100 else None)
+    monkeypatch.setattr(abrir_hybrid, "_instancia_aislada_viva", lambda: (None, None))
+    monkeypatch.setattr(abrir_hybrid.hh, "recuperar_si_colgado", lambda: ("sano", None))
+    # Simulamos que la instancia 10 tiene diálogos modales bloqueantes
+    monkeypatch.setattr(abrir_hybrid.hh, "verificar_hybrid_listo",
+                        lambda target_pid=None: (False, "bloqueado por modal", [{"motivo": "modal"}]))
+    monkeypatch.setattr(abrir_hybrid.os.path, "exists", lambda path: False)
+
+    ok, msg = abrir_hybrid.asegurar_hybrid()
+    assert abrir_hybrid._AISLADO_PID != 10
+    assert not ok
+
+
+def test_asegurar_hybrid_adopta_instancia_limpia(monkeypatch):
+    import abrir_hybrid
+    abrir_hybrid._AISLADO_PID = None
+    monkeypatch.setattr(abrir_hybrid.fp, "_find_hwnd", lambda cls: 100 if cls == abrir_hybrid.MAIN else None)
+    monkeypatch.setattr(abrir_hybrid, "_pid_de", lambda hwnd: 10 if hwnd == 100 else None)
+    monkeypatch.setattr(abrir_hybrid, "_instancia_aislada_viva", lambda: (None, None))
+    monkeypatch.setattr(abrir_hybrid.hh, "recuperar_si_colgado", lambda: ("sano", None))
+    # Instancia 10 limpia
+    monkeypatch.setattr(abrir_hybrid.hh, "verificar_hybrid_listo",
+                        lambda target_pid=None: (True, "listo", []))
+
+    ok, msg = abrir_hybrid.asegurar_hybrid()
+    assert ok is True
+    assert abrir_hybrid._AISLADO_PID == 10
+
+
+

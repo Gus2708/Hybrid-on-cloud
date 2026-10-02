@@ -1,0 +1,59 @@
+change: writeback-guardrails
+flow: spec
+mode: standard
+pace: semi-supervised
+artifact_store: files
+verbosity: concise
+tdd_mode: strict
+review_mode: strict
+pr_strategy: single-pr
+pr_mode: draft
+review_budget_lines: 800
+review_hard_limit_lines: 1000
+review_budget_files: 15
+review_hard_limit_files: 25
+delivery:
+  model: whole
+  whole_pr:
+    branch: sdd/writeback-guardrails
+    base: main
+    draft_pr: true
+    status: created
+    url: https://github.com/Gus2708/Hybrid-on-cloud/pull/3
+  feature_base_branch: null
+  base_branch: null
+  feature_pr:
+    draft_pr: true
+    status: not_ready
+    url: null
+  active_slice: null
+  next_slice: null
+  reopen_unit: null
+  slices: []
+current_phase: archive
+next_phase: null
+status:
+  plan: pending
+  exploration: done
+  proposal: done
+  spec: done
+  design: done
+  tasks: done
+  apply: done
+  verify: done
+  archive: done
+artifacts:
+  intent: null
+  exploration: null
+  correction: null
+  proposal: null
+  spec: []
+  design: null
+  tasks: null
+  refactor: null
+  verify_report: null
+  archive_report: null
+decisions: []
+open_questions: []
+blocked_reasons: []
+updated_at: '2026-10-02T20:19:09.495812+00:00'

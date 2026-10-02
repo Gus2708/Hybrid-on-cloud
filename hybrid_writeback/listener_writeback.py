@@ -457,6 +457,20 @@ def procesar_pendientes(items):
     if not items:
         return
 
+    # ── GUARDRAIL PRE-VUELO: verificar que HybridLite esté libre de bloqueos ────
+    try:
+        import hybrid_health as hh
+        listo, motivo, bloqueos = hh.verificar_hybrid_listo()
+        if not listo:
+            log.warning(
+                "Writeback pospuesto: HybridLite no está listo para automatización (%s). "
+                "Se pospone la pasada sin incrementar reintentos ni tomar mouse/teclado.",
+                motivo,
+            )
+            return
+    except Exception as e:
+        log.warning("No pude ejecutar el pre-flight de ventanas en hybrid_health (sigo igual): %r", e)
+
     if control_seguro is None:
         if not _AVISO_SIN_SAFETY_CONTROL:
             log.warning("safety_control no disponible: procesando SIN overlay/F12/BlockInput "

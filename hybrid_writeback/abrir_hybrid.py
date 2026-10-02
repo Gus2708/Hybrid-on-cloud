@@ -321,14 +321,18 @@ def asegurar_hybrid(timeout_login=60, timeout_main=60):
     _AISLADO_PID = None
     fp.clear_target_pid()
 
-    # 1.5) Si ya hay una ventana de MAIN abierta en el sistema, la adoptamos para evitar duplicados
+    # 1.5) Si ya hay una ventana de MAIN abierta en el sistema, la adoptamos solo si está limpia y habilitada
     h_existente = fp._find_hwnd(MAIN)
     if h_existente:
         pid = _pid_de(h_existente)
         if pid:
-            _AISLADO_PID = pid
-            fp.set_target_pid(pid)
-            return True, "Reutilizando instancia principal de Hybrid ya abierta."
+            listo, motivo, _ = hh.verificar_hybrid_listo(target_pid=pid)
+            if not listo:
+                print(f"Instancia de Hybrid existente (PID {pid}) no está lista: {motivo}. No se adopta.")
+            else:
+                _AISLADO_PID = pid
+                fp.set_target_pid(pid)
+                return True, "Reutilizando instancia principal de Hybrid ya abierta."
 
     # 2) no hay instancia aislada viva -> lanzar SIEMPRE una instancia NUEVA.
     #    NUNCA se reutiliza el módulo principal/login que ya esté visible:

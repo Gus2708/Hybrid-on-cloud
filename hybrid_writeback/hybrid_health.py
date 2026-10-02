@@ -95,6 +95,10 @@ TIMEOUT_MUERTE = 15        # s de espera a que los procesos desaparezcan de verd
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
 _user32.IsHungAppWindow.argtypes = [wintypes.HWND]
 _user32.IsHungAppWindow.restype = wintypes.BOOL
+_user32.IsWindowEnabled.argtypes = [wintypes.HWND]
+_user32.IsWindowEnabled.restype = wintypes.BOOL
+_user32.GetLastActivePopup.argtypes = [wintypes.HWND]
+_user32.GetLastActivePopup.restype = wintypes.HWND
 _user32.SendMessageTimeoutW.argtypes = [
     wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
     wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t),
@@ -104,6 +108,144 @@ _user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
 WM_NULL = 0x0000
 SMTO_ABORTIFHUNG = 0x0002
 ERROR_INVALID_WINDOW_HANDLE = 1400
+
+
+def _esta_habilitada(hwnd):
+    try:
+        return bool(_user32.IsWindowEnabled(hwnd))
+    except Exception:
+        return True
+
+
+def _popup_activo(hwnd):
+    try:
+        return _user32.GetLastActivePopup(hwnd)
+    except Exception:
+        return hwnd
+
+
+def _texto_ventana(hwnd):
+    try:
+        return win32gui.GetWindowText(hwnd) or ""
+    except Exception:
+        return ""
+
+
+def _es_visible(hwnd):
+    try:
+        return bool(win32gui.IsWindowVisible(hwnd))
+    except Exception:
+        return False
+
+
+CLASES_MODALES_CONOCIDAS = {
+    "tmessageform",
+    "#32770",
+    "tform_busquedaconfdb",
+    "tfhcostosprecios",
+}
+
+CLASES_SUBMODULOS_TRABAJO = {
+    "tf_facturacionmain",
+    "tf_comprasmain",
+    "tf_pedidosmain",
+    "tf_ajustesmain",
+}
+
+
+def ventanas_bloqueantes(pids=None):
+    """Retorna una lista de dicts describiendo ventanas de HybridLite que están
+    bloqueando la aplicación o en un diálogo modal:
+    [{"hwnd": int, "pid": int, "class_name": str, "title": str, "motivo": str}]
+    """
+    if pids is None:
+        pids = pids_hybrid()
+    elif isinstance(pids, int):
+        pids = {pids}
+    else:
+        pids = set(pids)
+
+    if not pids:
+        return []
+
+    ventanas = ventanas_visibles(pids)
+    bloqueos = []
+
+    for hwnd, pid, cls in ventanas:
+        cls_lower = cls.lower()
+        title = _texto_ventana(hwnd)
+
+        # 1. Ventana deshabilitada (típico cuando Delphi abrió un ShowModal)
+        if not _esta_habilitada(hwnd):
+            bloqueos.append({
+                "hwnd": hwnd,
+                "pid": pid,
+                "class_name": cls,
+                "title": title,
+                "motivo": f"ventana {cls} deshabilitada por diálogo modal activo",
+            })
+            continue
+
+        # 2. Popup modal activo
+        popup = _popup_activo(hwnd)
+        if popup and popup != hwnd and _es_visible(popup):
+            bloqueos.append({
+                "hwnd": hwnd,
+                "pid": pid,
+                "class_name": cls,
+                "title": title,
+                "motivo": f"ventana {cls} tiene popup modal activo (hwnd {popup})",
+            })
+            continue
+
+        # 3. Clases de diálogos modales conocidos
+        if cls_lower in CLASES_MODALES_CONOCIDAS:
+            bloqueos.append({
+                "hwnd": hwnd,
+                "pid": pid,
+                "class_name": cls,
+                "title": title,
+                "motivo": f"diálogo modal abierto ({cls}: {title!r})",
+            })
+            continue
+
+        # 4. Submódulos transaccionales de trabajo de empleados
+        if cls_lower in CLASES_SUBMODULOS_TRABAJO:
+            bloqueos.append({
+                "hwnd": hwnd,
+                "pid": pid,
+                "class_name": cls,
+                "title": title,
+                "motivo": f"submódulo transaccional abierto ({cls}: {title!r})",
+            })
+            continue
+
+    return bloqueos
+
+
+def verificar_hybrid_listo(target_pid=None):
+    """Verifica si HybridLite está en un estado limpio y listo para automatización.
+    Devuelve (listo: bool, motivo: str, bloqueos: list[dict]).
+
+    - Si no hay procesos Hybrid corriendo -> (True, "sin procesos", [])
+    - Si hay cuelgue confirmado -> (False, "proceso colgado", [])
+    - Si hay ventanas bloqueantes o modales -> (False, f"ventanas bloqueantes: ...", bloqueos)
+    - Si todo está limpio -> (True, "HybridLite listo", [])
+    """
+    pids = pids_hybrid() if target_pid is None else ({target_pid} if target_pid in pids_hybrid() else set())
+    if not pids:
+        return True, "No hay instancias de HybridLiteOS corriendo.", []
+
+    colgado = diagnosticar(gracia=0.1)
+    if colgado:
+        return False, f"HybridLite está colgado: {colgado}", []
+
+    bloqueos = ventanas_bloqueantes(pids)
+    if bloqueos:
+        motivos = "; ".join(b["motivo"] for b in bloqueos)
+        return False, f"HybridLite tiene {len(bloqueos)} ventana(s) bloqueante(s): {motivos}", bloqueos
+
+    return True, "HybridLite está listo y sin ventanas bloqueantes.", []
 
 
 def responde(hwnd, timeout_ms=None):

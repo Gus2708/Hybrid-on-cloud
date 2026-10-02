@@ -114,6 +114,10 @@ def process_inventory(force=False):
                     raw_precio = str(row[13]).replace(',', '.') if row[13] != 'Fail' else '0.0'
                     productos[code]['costo'] = float(raw_costo)
                     productos[code]['precio'] = float(raw_precio)
+
+                    # Fallback para bloques sin costo en el POS: estimar al 30% de margen comercial (costo = 70% del precio de venta)
+                    if code in ('6545546541', 'MNF', 'BLO15') and productos[code]['costo'] <= 0.10 and productos[code]['precio'] > 0:
+                        productos[code]['costo'] = round(productos[code]['precio'] * 0.70, 2)
                 except Exception as e:
                     print(f"    ! Error parseando precios para {code}: {e} (Cost: {row[4]}, Price: {row[13]})")
         del db_precios

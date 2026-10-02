@@ -75,3 +75,50 @@ class TestCambioDeteccion:
         assert lw._tiene_metadata_cambio({"nueva_descripcion": "Nuevo nombre"}) is True
         assert lw._tiene_metadata_cambio({"nueva_referencia": "REF-99"}) is True
         assert lw._tiene_metadata_cambio({"nueva_descripcion": "   ", "nueva_referencia": None}) is False
+
+
+class TestPreflightGuardrail:
+    def test_preflight_bloqueado_pospone_sin_control_seguro_ni_quemar_intentos(self, monkeypatch):
+        import hybrid_health as hh
+
+        monkeypatch.setattr(hh, "verificar_hybrid_listo",
+                            lambda target_pid=None: (False, "diálogo modal TMessageForm", [{"motivo": "modal"}]))
+
+        control_seguro_llamado = []
+        def _fake_control_seguro(**kwargs):
+            control_seguro_llamado.append(True)
+            from contextlib import nullcontext
+            return nullcontext()
+
+        monkeypatch.setattr(lw, "control_seguro", _fake_control_seguro)
+
+        actualizados = []
+        monkeypatch.setattr(lw, "update_item", lambda iid, **kwargs: (actualizados.append((iid, kwargs)), True)[1])
+
+        items = [{"id": 1, "orden_id": 100, "codigo_producto": "01", "delta": 1, "nueva_existencia": 10}]
+        lw.procesar_pendientes(items)
+
+        assert len(control_seguro_llamado) == 0
+        assert len(actualizados) == 0
+
+    def test_preflight_limpio_procede_a_control_seguro(self, monkeypatch):
+        import hybrid_health as hh
+
+        monkeypatch.setattr(hh, "verificar_hybrid_listo",
+                            lambda target_pid=None: (True, "HybridLite listo", []))
+
+        control_seguro_llamado = []
+        def _fake_control_seguro(**kwargs):
+            control_seguro_llamado.append(True)
+            from contextlib import nullcontext
+            return nullcontext()
+
+        monkeypatch.setattr(lw, "control_seguro", _fake_control_seguro)
+        monkeypatch.setattr(lw, "_procesar_pendientes_impl", lambda items, banner=None: None)
+
+        items = [{"id": 1, "orden_id": 100, "codigo_producto": "01", "delta": 1, "nueva_existencia": 10}]
+        lw.procesar_pendientes(items)
+
+        assert len(control_seguro_llamado) == 1
+
+

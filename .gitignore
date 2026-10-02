@@ -60,6 +60,7 @@ scratch/
 .gemini/
 .engram/
 .claude/
+.atl/
 skills/
 
 # --- Artefactos de compilacion (Nuitka / Inno Setup) -------------------------
