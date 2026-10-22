@@ -259,5 +259,5 @@ while True:
     except Exception as e:
         log(f"Error en el bucle principal: {repr(e)}")
 
-    time.sleep(10)
+    time.sleep(30)
 

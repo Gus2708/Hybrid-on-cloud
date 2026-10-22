@@ -51,7 +51,7 @@ for _serv, _port in [("n8n", 5678), ("waha", 3000)]:
     if os.environ.get(f"TUNNEL_{_serv.upper()}_ENABLED", "1") == "1":
         SERVICIOS[_serv] = _port
 
-HEARTBEAT_INTERVAL = float(os.environ.get("TUNNEL_HEARTBEAT_INTERVAL", "30"))  # segundos
+HEARTBEAT_INTERVAL = float(os.environ.get("TUNNEL_HEARTBEAT_INTERVAL", "120"))  # segundos
 RESTART_DELAY = float(os.environ.get("TUNNEL_RESTART_DELAY", "5"))
 LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -227,7 +227,6 @@ def run_loop():
         print("[TUNNEL] ADVERTENCIA: Supabase no configurado. Solo se publicará el estado local.")
 
     while True:
-        known_urls = {}
         try:
             for servicio, port in SERVICIOS.items():
                 url = _ensure_running(servicio, port)
@@ -235,8 +234,8 @@ def run_loop():
                 dead = binfo.get("proc") and _monitor_died(binfo["proc"])
                 state = "error" if binfo.get("error") else ("down" if not url or dead else "running")
                 last_error = binfo.get("error")
-                known_urls[servicio] = {"url": url, "state": state}
 
+                # Este upsert también es el heartbeat: refresca updated_at en cada ciclo.
                 if url:
                     upsert_tunnel(servicio, url, state, last_error)
                 else:
@@ -244,11 +243,6 @@ def run_loop():
                     if supabase_ready():
                         upsert_tunnel(servicio, None, state,
                                       "Esperando URL del túnel (aún no disponible)" if not dead else "proceso caído")
-
-            # Heartbeat: refrescar updated_at de los servicios con URL
-            for servicio, info in known_urls.items():
-                if info["url"]:
-                    upsert_tunnel(servicio, info["url"], info["state"], None)
 
         except Exception as e:
             print(f"[TUNNEL] Error en bucle: {e}")

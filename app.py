@@ -206,7 +206,7 @@ def trigger_sync_force():
 
 _COUNT_CACHE = {}
 _SUPABASE_COUNT_CACHE = {}
-_SUPABASE_COUNT_CACHE_TTL = 90.0  # segundos
+_SUPABASE_COUNT_CACHE_TTL = 300.0  # segundos
 
 @app.route("/api/v1/sync/status", methods=["GET"])
 def sync_status():
