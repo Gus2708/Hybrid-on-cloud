@@ -16,14 +16,14 @@ import urllib.request
 
 # Listener de consultas a Corporación Norte: Serrucho Go inserta una fila en
 # consultas_corpnorte (status 'pendiente'); este proceso resuelve el producto en el
-# catálogo del proveedor, pregunta el stock a la API local (api-corporacionnorte,
+# catálogo del proveedor, pregunta el stock a la API local (corpnorte_api.py,
 # puerto 5002) y escribe el resultado en la misma fila. La app la lee por polling.
 #
 # Resolución: primero por código exacto (hash en la API); si no hay coincidencia, por
 # similitud de embeddings (RPC corpnorte_equivalentes) y se consulta el stock de cada
-# candidato. Es el gemelo de listener_maxcam.py.
+# candidato. Es el gemelo de maxcam_listener.py.
 
-LOG_FILE = "listener_corpnorte.log"
+LOG_FILE = "corpnorte_listener.log"
 _MAX_LOG_BYTES = 5 * 1024 * 1024
 CORPNORTE_API = os.environ.get("CORPNORTE_API_URL", "http://127.0.0.1:5002")
 POLL_SECONDS = 3
@@ -32,6 +32,11 @@ UMBRAL_SIMILITUD = 0.6
 MAX_CANDIDATOS = 3
 RETENCION_DIAS = 3
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Vive en microservicios/corpnorte: config y supabase_rest son los del backend. Se agrega al
+# FINAL de sys.path para que ningún módulo del microservicio los tape.
+BACKEND_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", ".."))
+if BACKEND_DIR not in sys.path:
+    sys.path.append(BACKEND_DIR)
 
 
 def log(message):

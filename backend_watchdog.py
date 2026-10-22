@@ -201,22 +201,20 @@ SCRIPTS = [
         # registrarse pronto para que caja lo facture, no en una ventana horaria.
         "env": {"HYBRID_WRITE_ENABLED": "1"},
     }),
+    # Microservicios de proveedores (carpeta microservicios/): cada uno es una API local
+    # (solo 127.0.0.1) más un listener que responde las consultas de Serrucho Go.
     ("maxcam_api.py",       "API Maxcam", {
-        # Disponibilidad de productos en el catálogo del proveedor Maxcam
-        # (sucursal Barquisimeto). Vive en el proyecto hermano api-maxcam;
-        # "dir" admite una ruta absoluta fuera de BASE_DIR. Puerto 5001. Si la
-        # carpeta no existe, el watchdog omite esta entrada.
-        "dir": os.path.normpath(os.path.join(BASE_DIR, "..", "api-maxcam")),
+        # Disponibilidad en el catálogo de Maxcam, sucursal Barquisimeto. Puerto 5001.
+        "subdir": "microservicios/maxcam",
     }),
-    ("listener_maxcam.py",  "Listener Maxcam"),
+    ("maxcam_listener.py",  "Listener Maxcam", {"subdir": "microservicios/maxcam"}),
     ("corpnorte_api.py",    "API Corporación Norte", {
-        # Stock del proveedor Corporación Norte (proyecto hermano
-        # api-corporacionnorte). Puerto 5002. Solo responde bien desde la red de la
-        # tienda: desde IPs de VPN el sitio devuelve 403 (la API sirve entonces el
-        # último catalogo.json). Si la carpeta no existe, el watchdog omite la entrada.
-        "dir": os.path.normpath(os.path.join(BASE_DIR, "..", "api-corporacionnorte")),
+        # Stock de Corporación Norte. Puerto 5002. Solo responde bien desde la red de la
+        # tienda: desde IPs de VPN el sitio devuelve 403 y la API sirve entonces el
+        # último catalogo.json (marcado en_vivo: false).
+        "subdir": "microservicios/corpnorte",
     }),
-    ("listener_corpnorte.py", "Listener Corporación Norte"),
+    ("corpnorte_listener.py", "Listener Corporación Norte", {"subdir": "microservicios/corpnorte"}),
     ("listener_directorio.py", "Write-back directorio", {
         "subdir": "hybrid_writeback",
         # Da de alta clientes/proveedores nuevos (registro_clientes_app /
@@ -404,12 +402,8 @@ def main():
                     if script == "app.py":
                         free_api_port()  # garantizar que el puerto esté libre antes de enlazar
                     subdir = opts.get("subdir")
-                    work_dir = opts.get("dir") or (os.path.join(BASE_DIR, subdir) if subdir else BASE_DIR)
+                    work_dir = os.path.join(BASE_DIR, subdir) if subdir else BASE_DIR
                     script_path = os.path.join(work_dir, script)
-                    if opts.get("dir") and not os.path.exists(script_path):
-                        log(f"[SKIP] {name}: no existe {script_path}.")
-                        _RESTART_COOLDOWN[script] = now
-                        continue
                     pythonw = sys.executable.replace("python.exe", "pythonw.exe")
                     if not os.path.exists(pythonw): pythonw = sys.executable
 

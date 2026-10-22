@@ -16,14 +16,14 @@ import urllib.request
 
 # Listener de consultas a Maxcam: Serrucho Go inserta una fila en
 # consultas_maxcam (status 'pendiente'); este proceso resuelve el SKU de Maxcam
-# del producto, pregunta el stock de Barquisimeto a la API local (api-maxcam,
+# del producto, pregunta el stock de Barquisimeto a la API local (maxcam_api.py,
 # puerto 5001) y escribe el resultado en la misma fila. La app la lee por polling.
 #
 # Resolución del SKU: primero por código exacto (hash en la API); si no hay
 # coincidencia, por similitud de embeddings (RPC maxcam_equivalentes) y se
 # consulta el stock de cada candidato.
 
-LOG_FILE = "listener_maxcam.log"
+LOG_FILE = "maxcam_listener.log"
 _MAX_LOG_BYTES = 5 * 1024 * 1024
 MAXCAM_API = os.environ.get("MAXCAM_API_URL", "http://127.0.0.1:5001")
 POLL_SECONDS = 3
@@ -32,6 +32,11 @@ UMBRAL_SIMILITUD = 0.6
 MAX_CANDIDATOS = 3
 RETENCION_DIAS = 3
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Vive en microservicios/maxcam: config y supabase_rest son los del backend. Se agrega al
+# FINAL de sys.path para que ningún módulo del microservicio los tape.
+BACKEND_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", ".."))
+if BACKEND_DIR not in sys.path:
+    sys.path.append(BACKEND_DIR)
 
 
 def log(message):
