@@ -201,6 +201,14 @@ SCRIPTS = [
         # registrarse pronto para que caja lo facture, no en una ventana horaria.
         "env": {"HYBRID_WRITE_ENABLED": "1"},
     }),
+    ("maxcam_api.py",       "API Maxcam", {
+        # Disponibilidad de productos en el catálogo del proveedor Maxcam
+        # (sucursal Barquisimeto). Vive en el proyecto hermano api-maxcam;
+        # "dir" admite una ruta absoluta fuera de BASE_DIR. Puerto 5001. Si la
+        # carpeta no existe, el watchdog omite esta entrada.
+        "dir": os.path.normpath(os.path.join(BASE_DIR, "..", "api-maxcam")),
+    }),
+    ("listener_maxcam.py",  "Listener Maxcam"),
     ("listener_directorio.py", "Write-back directorio", {
         "subdir": "hybrid_writeback",
         # Da de alta clientes/proveedores nuevos (registro_clientes_app /
@@ -221,6 +229,8 @@ _HUNG_KILL_TS = {}
 _HUNG_KILL_COOLDOWN = 180  # no matar el mismo script por "colgado" más de 1 vez cada 3 min
 
 API_PORT = 5000
+MAXCAM_PORT = 5001
+_MAXCAM_PORT_FAILS = 0
 
 def kill_pid(pid):
     try:
@@ -307,6 +317,19 @@ def is_hung(script):
                     return True
         except: pass
         return False
+    if script == "maxcam_api.py":
+        # Cualquier respuesta HTTP (incluido 404 en "/") prueba que Flask sirve.
+        global _MAXCAM_PORT_FAILS
+        import urllib.error, urllib.request
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{MAXCAM_PORT}/", timeout=5)
+            ok = True
+        except urllib.error.HTTPError:
+            ok = True
+        except Exception:
+            ok = False
+        _MAXCAM_PORT_FAILS = 0 if ok else _MAXCAM_PORT_FAILS + 1
+        return _MAXCAM_PORT_FAILS >= 4
     if script == "app.py":
         if _api_responds():
             _APP_PORT_FAILS = 0
@@ -373,8 +396,12 @@ def main():
                     if script == "app.py":
                         free_api_port()  # garantizar que el puerto esté libre antes de enlazar
                     subdir = opts.get("subdir")
-                    work_dir = os.path.join(BASE_DIR, subdir) if subdir else BASE_DIR
+                    work_dir = opts.get("dir") or (os.path.join(BASE_DIR, subdir) if subdir else BASE_DIR)
                     script_path = os.path.join(work_dir, script)
+                    if opts.get("dir") and not os.path.exists(script_path):
+                        log(f"[SKIP] {name}: no existe {script_path}.")
+                        _RESTART_COOLDOWN[script] = now
+                        continue
                     pythonw = sys.executable.replace("python.exe", "pythonw.exe")
                     if not os.path.exists(pythonw): pythonw = sys.executable
 
