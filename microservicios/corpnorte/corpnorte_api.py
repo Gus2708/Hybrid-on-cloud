@@ -8,6 +8,7 @@ Endpoints:
     GET /marcas
 """
 import unicodedata
+from urllib.parse import quote
 
 from flask import Flask, jsonify, request
 
@@ -23,8 +24,19 @@ def _fold(s):
     return s.lower()
 
 
+IMAGE_BASE = "https://catalogocorporacionnorte.com/uploads/productos/"
+
+
+def _imagen(codigo):
+    """The site names the file after the code with "/" replaced by "-". The extension
+    varies per product (the site itself falls back jpg -> png -> jpeg -> webp), so this
+    returns the jpg URL and the app handles the fallback."""
+    return IMAGE_BASE + quote(codigo.strip().replace("/", "-"), safe="-_.") + ".jpg"
+
+
 def _public(p, en_vivo=None):
     out = {
+        "imagen": _imagen(p["codigo"]),
         "codigo": p["codigo"], "nombre": (p.get("nombre") or "").strip(),
         "marca": p.get("composicion"), "categoria": p.get("categoria"),
         "subcategoria": p.get("subcategoria"), "precio": p.get("precio"),

@@ -111,7 +111,8 @@ def disponibilidad():
     return jsonify(encontrado=True, disponible=stock_bq > 0, stock_bq=stock_bq,
                    metodo=metodo, coincidio_con=matched,
                    sku=live["sku"], nombre=live["nombre"], precio=live["precio"],
-                   cant_caja=live["cant_caja"], stock_por_sucursal=live["stock_por_sucursal"])
+                   cant_caja=live["cant_caja"], url_foto=live.get("url_foto"),
+                   stock_por_sucursal=live["stock_por_sucursal"])
 
 
 @app.get("/marcas")

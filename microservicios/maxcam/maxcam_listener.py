@@ -30,7 +30,8 @@ POLL_SECONDS = 3
 API_TIMEOUT = 130          # la primera consulta tras arrancar la API construye el índice (~76 s)
 UMBRAL_SIMILITUD = 0.6
 MAX_CANDIDATOS = 3
-RETENCION_DIAS = 3
+RETENCION_MINUTOS = 30     # las respuestas son desechables: la app reutiliza una por 15 min
+LIMPIEZA_CADA = 600        # segundos entre limpiezas
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # Vive en microservicios/maxcam: config y supabase_rest son los del backend. Se agrega al
 # FINAL de sys.path para que ningún módulo del microservicio los tape.
@@ -100,6 +101,7 @@ def candidato(info, similitud, marca=None):
         "stock_bq": info["stock_bq"],
         "precio": info.get("precio"),
         "cant_caja": info.get("cant_caja"),
+        "imagen": info.get("url_foto"),
     }
 
 
@@ -129,10 +131,30 @@ def resolver(codigo_interno):
     return {"metodo": "similitud", "candidatos": candidatos}
 
 
+def veredicto_rotacion(codigo_interno):
+    """Regla de rotación (RPC proveedor_elegible, migración 050 de Serrucho Go): solo se
+    consulta al proveedor por productos de alta rotación o nuevos. Si el chequeo falla
+    (función sin desplegar, red) devuelve None y se consulta igual: no se frena el servicio."""
+    try:
+        r = http("POST", f"{REST}/rest/v1/rpc/proveedor_elegible", HEADERS,
+                 {"p_codigo": codigo_interno})
+        return r if isinstance(r, dict) and "elegible" in r else None
+    except Exception as e:
+        log(f"{codigo_interno}: no se pudo verificar la rotación ({e!r}); se consulta igual")
+        return None
+
+
 def procesar(row):
     rid, codigo = row["id"], row["codigo_interno"]
     # Reclamar la fila: si otra instancia ya la tomó, PATCH no devuelve nada.
     if not patch(rid, {"status": "procesando"}, only_status="pendiente"):
+        return
+    v = veredicto_rotacion(codigo)
+    if v and not v.get("elegible"):
+        causa = ("El producto tiene stock suficiente" if v.get("motivo") == "con_stock"
+                 else "Producto de baja rotación")
+        patch(rid, {"status": "error", "error": f"{causa}: no se consulta al proveedor."})
+        log(f"{codigo}: omitido, {v.get('motivo')} ({v.get('facturas')} facturas)")
         return
     try:
         resultado = resolver(codigo)
@@ -149,7 +171,7 @@ def procesar(row):
 
 def limpiar_viejas():
     limite = (datetime.datetime.now(datetime.timezone.utc)
-              - datetime.timedelta(days=RETENCION_DIAS)).isoformat()
+              - datetime.timedelta(minutes=RETENCION_MINUTOS)).isoformat()
     http("DELETE", f"{REST}/rest/v1/consultas_maxcam?creado_en=lt.{urllib.parse.quote(limite)}")
 
 
@@ -171,7 +193,7 @@ def main():
             fails = 0
             for row in pendientes or []:
                 procesar(row)
-            if time.time() - last_clean > 3600:
+            if time.time() - last_clean > LIMPIEZA_CADA:
                 limpiar_viejas()
                 last_clean = time.time()
         except Exception as e:
