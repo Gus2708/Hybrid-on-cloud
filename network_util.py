@@ -156,14 +156,14 @@ def check_waha() -> dict:
         return {"ok": False, "status": "NO_CONFIGURADO",
                 "detail": "WAHA_API_KEY no configurada (ver .env.example)"}
 
-    url = "http://localhost:3000/api/sessions/default"
+    url = "http://127.0.0.1:3000/api/sessions/default"
     headers = {
         "X-Api-Key": api_key,
         "Content-Type": "application/json"
     }
     try:
         req = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=2.0) as resp:
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
             data = json.loads(resp.read().decode())
             status = data.get("status", "UNKNOWN")
             ok = (status == "WORKING")
