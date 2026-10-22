@@ -237,19 +237,21 @@ def sync_status():
 
     def count_csv_smart(path):
         full = os.path.join(BASE_DIR, path)
-        if not os.path.exists(full): return 0
-        mtime = os.path.getmtime(full)
-        # Si el archivo no cambió, devolver caché
-        if path in _COUNT_CACHE and _COUNT_CACHE[path]["mtime"] == mtime:
-            return _COUNT_CACHE[path]["count"]
-        
-        # Contar filas (optimizado)
+        if not os.path.exists(full):
+            return _COUNT_CACHE.get(path, {}).get("count", 0)
         try:
+            mtime = os.path.getmtime(full)
+            # Si el archivo no cambió, devolver caché
+            if path in _COUNT_CACHE and _COUNT_CACHE[path]["mtime"] == mtime:
+                return _COUNT_CACHE[path]["count"]
+            
+            # Contar filas (optimizado)
             with open(full, 'rb') as f:
                 count = sum(1 for line in f) - 1 # Restar cabecera
             _COUNT_CACHE[path] = {"count": max(0, count), "mtime": mtime}
             return _COUNT_CACHE[path]["count"]
-        except: return 0
+        except Exception:
+            return _COUNT_CACHE.get(path, {}).get("count", 0)
     
     def count_supabase(table):
         if not supabase_reachable:
