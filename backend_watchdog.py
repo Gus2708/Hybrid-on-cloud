@@ -209,6 +209,14 @@ SCRIPTS = [
         "dir": os.path.normpath(os.path.join(BASE_DIR, "..", "api-maxcam")),
     }),
     ("listener_maxcam.py",  "Listener Maxcam"),
+    ("corpnorte_api.py",    "API Corporación Norte", {
+        # Stock del proveedor Corporación Norte (proyecto hermano
+        # api-corporacionnorte). Puerto 5002. Solo responde bien desde la red de la
+        # tienda: desde IPs de VPN el sitio devuelve 403 (la API sirve entonces el
+        # último catalogo.json). Si la carpeta no existe, el watchdog omite la entrada.
+        "dir": os.path.normpath(os.path.join(BASE_DIR, "..", "api-corporacionnorte")),
+    }),
+    ("listener_corpnorte.py", "Listener Corporación Norte"),
     ("listener_directorio.py", "Write-back directorio", {
         "subdir": "hybrid_writeback",
         # Da de alta clientes/proveedores nuevos (registro_clientes_app /
@@ -229,8 +237,9 @@ _HUNG_KILL_TS = {}
 _HUNG_KILL_COOLDOWN = 180  # no matar el mismo script por "colgado" más de 1 vez cada 3 min
 
 API_PORT = 5000
-MAXCAM_PORT = 5001
-_MAXCAM_PORT_FAILS = 0
+# APIs de proveedores (proyectos hermanos): puerto donde responden y fallos seguidos.
+SUPPLIER_PORTS = {"maxcam_api.py": 5001, "corpnorte_api.py": 5002}
+_SUPPLIER_FAILS = {}
 
 def kill_pid(pid):
     try:
@@ -317,19 +326,18 @@ def is_hung(script):
                     return True
         except: pass
         return False
-    if script == "maxcam_api.py":
+    if script in SUPPLIER_PORTS:
         # Cualquier respuesta HTTP (incluido 404 en "/") prueba que Flask sirve.
-        global _MAXCAM_PORT_FAILS
         import urllib.error, urllib.request
         try:
-            urllib.request.urlopen(f"http://127.0.0.1:{MAXCAM_PORT}/", timeout=5)
+            urllib.request.urlopen(f"http://127.0.0.1:{SUPPLIER_PORTS[script]}/", timeout=5)
             ok = True
         except urllib.error.HTTPError:
             ok = True
         except Exception:
             ok = False
-        _MAXCAM_PORT_FAILS = 0 if ok else _MAXCAM_PORT_FAILS + 1
-        return _MAXCAM_PORT_FAILS >= 4
+        _SUPPLIER_FAILS[script] = 0 if ok else _SUPPLIER_FAILS.get(script, 0) + 1
+        return _SUPPLIER_FAILS[script] >= 4
     if script == "app.py":
         if _api_responds():
             _APP_PORT_FAILS = 0
