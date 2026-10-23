@@ -148,6 +148,7 @@ def sync_inventory():
         import sync
         with acquire_lock(timeout=10):
             sync.sync_incremental()
+        invalidate_supabase_count_cache()
         return jsonify({"status": "success", "message": "Inventario sincronizado"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -162,6 +163,7 @@ def sync_sales():
         import sync_ventas
         with acquire_lock(timeout=10):
             sync_ventas.sync_incremental()
+        invalidate_supabase_count_cache()
         return jsonify({"status": "success", "message": "Ventas sincronizadas"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -176,9 +178,10 @@ def trigger_sync_all():
             from lock_util import acquire_lock
             import sync
             import sync_ventas
-            with acquire_lock(timeout=10):
+            with acquire_lock(timeout=45):
                 sync.sync_incremental()
                 sync_ventas.sync_incremental()
+            invalidate_supabase_count_cache()
         except Exception as e:
             print(f"[APP] Error en sync/run: {e}")
 
@@ -195,9 +198,10 @@ def trigger_sync_force():
             from lock_util import acquire_lock
             import sync
             import sync_ventas
-            with acquire_lock(timeout=10):
+            with acquire_lock(timeout=45):
                 sync.sync_incremental(force=True)
                 sync_ventas.sync_incremental()
+            invalidate_supabase_count_cache()
         except Exception as e:
             print(f"[APP] Error en sync/force: {e}")
 
@@ -206,13 +210,31 @@ def trigger_sync_force():
 
 _COUNT_CACHE = {}
 _SUPABASE_COUNT_CACHE = {}
-_SUPABASE_COUNT_CACHE_TTL = 300.0  # segundos
+_SUPABASE_COUNT_CACHE_TTL = 30.0  # reducido de 300s a 30s para evitar falsas discrepancias prolongadas
+
+def invalidate_supabase_count_cache():
+    global _SUPABASE_COUNT_CACHE
+    _SUPABASE_COUNT_CACHE.clear()
+
+def _get_latest_sync_mtime():
+    latest = 0.0
+    for f in ["last_sync.json", "ventas_last_sync.json"]:
+        p = os.path.join(BASE_DIR, f)
+        if os.path.exists(p):
+            try:
+                mt = os.path.getmtime(p)
+                if mt > latest:
+                    latest = mt
+            except Exception:
+                pass
+    return latest
 
 @app.route("/api/v1/sync/status", methods=["GET"])
 def sync_status():
     """Verifica integridad: compara conteos locales vs nube con caché de disco."""
     import csv
     import urllib.request
+    from flask import request
     global _COUNT_CACHE, _SUPABASE_COUNT_CACHE
     
     try:
@@ -221,6 +243,8 @@ def sync_status():
         return jsonify({"status": "error", "message": "Config no disponible"}), 500
     
     headers = {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}", "Prefer": "count=exact"}
+    force_fresh = bool(request.args.get("fresh"))
+    latest_sync_mtime = _get_latest_sync_mtime()
     
     # ⚡ Verificación rápida de conectividad TCP a Supabase (evita bloqueos de 40s si la red/VPN falla)
     supabase_reachable = False
@@ -258,7 +282,12 @@ def sync_status():
             return -1
         now = time.time()
         cached = _SUPABASE_COUNT_CACHE.get(table)
-        if cached and (now - cached["ts"]) < _SUPABASE_COUNT_CACHE_TTL:
+        if force_fresh:
+            cached = None
+        elif cached and cached.get("ts", 0) < latest_sync_mtime:
+            # Hubo una sincronización en disco posterior al cache -> invalidar
+            cached = None
+        elif cached and (now - cached["ts"]) < _SUPABASE_COUNT_CACHE_TTL:
             return cached["count"]
         try:
             url = SUPABASE_REST_URL.rstrip('/') + "/rest/v1/" + table + "?select=count"
