@@ -201,8 +201,8 @@ class SerruchoPremiumWidget:
         self.canvas.tag_bind("integrity_header", "<Button-1>", lambda e: self.toggle_integrity())
 
         # --- Footer ---
-        self.btn_bg = self.draw_rounded_rect(15, 248, 295, 285, 12, self.colors["blue"], tags="footer_ui")
-        self.btn_text = self.canvas.create_text(155, 267, text="Sincronizar Ahora", fill="#FFFFFF", font=("Inter", 9, "bold"), tags="footer_ui")
+        self.btn_bg = self.draw_rounded_rect(15, 248, 295, 285, 12, self.colors["blue"], tags=("footer_ui", "sync_btn"))
+        self.btn_text = self.canvas.create_text(155, 267, text="Sincronizar Ahora", fill="#FFFFFF", font=("Inter", 9, "bold"), tags=("footer_ui", "sync_btn"))
         self.sync_time_label = self.canvas.create_text(155, 298, text="Último Sync: ...", fill=self.colors["subtext"], font=("Inter", 7), tags="footer_ui")
         self.check_time_label = self.canvas.create_text(155, 308, text="Último Monitoreo: --/-- --:--", fill=self.colors["subtext"], font=("Inter", 7), tags="footer_ui")
         
@@ -212,7 +212,9 @@ class SerruchoPremiumWidget:
         
         self.canvas.tag_bind("bg_layer", "<ButtonPress-1>", self.start_move)
         self.canvas.tag_bind("bg_layer", "<B1-Motion>", self.do_move)
-        self.canvas.tag_bind("footer_ui", "<Button-1>", lambda e: self.trigger_sync_flow())
+        self.canvas.tag_bind("sync_btn", "<Button-1>", lambda e: self.trigger_sync_flow())
+        self.canvas.tag_bind("sync_btn", "<Enter>", lambda e: self.canvas.config(cursor="hand2"))
+        self.canvas.tag_bind("sync_btn", "<Leave>", lambda e: self.canvas.config(cursor=""))
         self.root.bind("<Button-3>", lambda e: self.quit_app())
 
         self.is_syncing = False
@@ -435,24 +437,55 @@ class SerruchoPremiumWidget:
         self.root.deiconify()
         self.root.attributes("-topmost", True)
 
+    def set_sync_state(self, is_syncing):
+        """Sincroniza reactivamente el estado visual del widget con el backend."""
+        self.is_syncing = bool(is_syncing)
+        if self.is_syncing:
+            self.canvas.itemconfig(self.btn_bg, fill="#3A3A3C")
+            self.canvas.itemconfig(self.btn_text, text="Sincronizando...", fill="#8E8E93")
+            self.canvas.itemconfig(self.integrity_card_bg, fill="#1C1C1E")
+            self.canvas.itemconfig(self.status_dot, fill=self.colors["yellow"])
+            self.canvas.itemconfig(self.spinner, state="normal")
+        else:
+            self.canvas.itemconfig(self.btn_bg, fill=self.colors["blue"])
+            self.canvas.itemconfig(self.btn_text, text="Sincronizar Ahora", fill="#FFFFFF")
+            self.canvas.itemconfig(self.integrity_card_bg, fill=self.colors["card"])
+            self.canvas.itemconfig(self.status_dot, fill=self.colors["green"])
+            self.canvas.itemconfig(self.spinner, state="hidden")
+            self.load_last_sync_time()
+
     def verify_loop(self):
         self._verify_running = True
         def task():
             while self._verify_running:
+                backend_syncing = False
+                has_mismatch = False
                 try:
                     req = urllib.request.Request("http://localhost:5000/api/v1/sync/status")
                     with urllib.request.urlopen(req, timeout=10) as resp:
                         data = json.loads(resp.read().decode())
                         backend_syncing = data.get("is_syncing", False)
                         if not getattr(self, "manual_sync_trigger", False):
-                            self.is_syncing = backend_syncing
+                            self.root.after(0, lambda bs=backend_syncing: self.set_sync_state(bs))
                         self.root.after(0, lambda d=data: self._update_ui_full(d))
-                except: pass
-                time.sleep(3 if self.is_syncing else 45)
+                        has_mismatch = (data.get("status") != "ok")
+                except Exception as e:
+                    log_widget_error(f"Error en verify_loop: {repr(e)}")
+                
+                if self.is_syncing or backend_syncing:
+                    sleep_time = 3
+                elif has_mismatch:
+                    sleep_time = 10
+                else:
+                    sleep_time = 30
+                time.sleep(sleep_time)
         t = threading.Thread(target=task, daemon=True)
         t.start()
 
     def _update_ui_full(self, data):
+        backend_syncing = data.get("is_syncing", False)
+        if not getattr(self, "manual_sync_trigger", False):
+            self.set_sync_state(backend_syncing)
         self.update_integrity_ui(data.get("entities", {}))
         last_mon = data.get("last_monitor", "--/-- --:--")
         self.canvas.itemconfig(self.check_time_label, text=f"Último Monitoreo: {last_mon}")
@@ -464,41 +497,58 @@ class SerruchoPremiumWidget:
         return self.canvas.create_polygon(p, smooth=True, fill=color, tags=tags)
 
     def trigger_sync_flow(self):
-        if self.is_syncing: return
-        self.is_syncing = True
+        if self.is_syncing or getattr(self, "manual_sync_trigger", False):
+            return
         self.manual_sync_trigger = True
-        
-        self.canvas.itemconfig(self.btn_bg, fill="#3A3A3C")
-        self.canvas.itemconfig(self.btn_text, text="Sincronizando...", fill="#8E8E93")
-        self.canvas.itemconfig(self.integrity_card_bg, fill="#1C1C1E") 
+        self.set_sync_state(True)
         for lbl in self.integrity_labels.values():
             self.canvas.itemconfig(lbl, text="Actualizando...", fill=self.colors["subtext"])
         
         def run():
             try:
                 req = urllib.request.Request("http://localhost:5000/api/v1/sync/run", method="POST")
-                with urllib.request.urlopen(req, timeout=10) as resp: pass
-            except: pass
-            time.sleep(2)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    pass
+            except Exception as e:
+                log_widget_error(f"Error disparando sync/run: {repr(e)}")
+            
+            # Polling rápido con timeout hasta que el backend termine de sincronizar
+            start = time.time()
+            while time.time() - start < 45:
+                time.sleep(1.5)
+                try:
+                    st_req = urllib.request.Request("http://localhost:5000/api/v1/sync/status?fresh=1")
+                    with urllib.request.urlopen(st_req, timeout=5) as st_resp:
+                        st_data = json.loads(st_resp.read().decode())
+                        if not st_data.get("is_syncing", False):
+                            self.root.after(0, lambda d=st_data: self._update_ui_full(d))
+                            break
+                except Exception:
+                    pass
+            
             self.manual_sync_trigger = False
             self.last_synced_at = time.time()
+            self.root.after(0, self.force_verify)
             
         threading.Thread(target=run, daemon=True).start()
 
     def force_verify(self):
-        """Ejecuta una verificación de integridad fuera del loop normal."""
+        """Ejecuta una verificación de integridad fuera del loop normal y restaura el estado."""
         try:
-            req = urllib.request.Request("http://localhost:5000/api/v1/sync/status")
+            req = urllib.request.Request("http://localhost:5000/api/v1/sync/status?fresh=1")
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode())
-                self.update_integrity_ui(data.get("entities", {}))
-        except: pass
+                backend_syncing = data.get("is_syncing", False)
+                self.set_sync_state(backend_syncing)
+                self._update_ui_full(data)
+        except Exception as e:
+            log_widget_error(f"Error en force_verify: {repr(e)}")
+            if not getattr(self, "manual_sync_trigger", False):
+                self.set_sync_state(False)
 
     def reset_ui(self):
-        self.canvas.itemconfig(self.btn_bg, fill=self.colors["blue"])
-        self.canvas.itemconfig(self.btn_text, text="Sincronizar Ahora", fill="#FFFFFF")
+        self.set_sync_state(False)
         self.canvas.itemconfig(self.detail_label, text="Datos al día ✓")
-        self.canvas.itemconfig(self.integrity_ui_bg, fill=self.colors["card"])
         now_str = datetime.now().strftime("%d/%m %H:%M:%S")
         self.canvas.itemconfig(self.sync_time_label, text=f"Último Sync: {now_str}")
         self.root.after(3000, lambda: self.canvas.itemconfig(self.detail_label, text="Monitoreando archivos..."))
