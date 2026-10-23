@@ -4,8 +4,8 @@ set "STARTUP_FOLDER=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
 
 echo Instalando inicio automatico para El Serrucho...
 
-:: Crear un acceso directo en la carpeta Startup
-powershell -Command "$s=(New-Object -COM WScript.Shell).CreateShortcut('%STARTUP_FOLDER%\SerruchoBackend.lnk');$s.TargetPath='wscript.exe';$s.Arguments='\"%SCRIPT_PATH%\"';$s.WorkingDirectory='%~dp0';$s.Save()"
+:: Crear un acceso directo en la carpeta Startup y asegurar que no quede deshabilitado en Windows
+powershell -Command "$s=(New-Object -COM WScript.Shell).CreateShortcut('%STARTUP_FOLDER%\SerruchoBackend.lnk');$s.TargetPath='wscript.exe';$s.Arguments='\"%SCRIPT_PATH%\"';$s.WorkingDirectory='%~dp0';$s.Save(); Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder' -Name 'SerruchoBackend.lnk' -Value ([byte[]](2,0,0,0,0,0,0,0,0,0,0,0)) -ErrorAction SilentlyContinue"
 
 echo.
 echo [OK] El servidor se iniciara automaticamente cada vez que enciendas esta PC.
