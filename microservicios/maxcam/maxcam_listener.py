@@ -8,6 +8,7 @@ if sys.executable.lower().endswith("pythonw.exe"):
     except: pass
 
 import json
+import re
 import time
 import datetime
 import urllib.error
@@ -86,7 +87,8 @@ def patch(row_id, fields, only_status=None):
 
 
 def api_disponibilidad(**params):
-    pairs = [(k, v) for k, v in params.items() if v]
+    # A list value repeats the key (?codigo=a&codigo=b): the API tries each code in order.
+    pairs = [(k, x) for k, v in params.items() for x in (v if isinstance(v, list) else [v]) if x]
     url = f"{MAXCAM_API}/disponibilidad?{urllib.parse.urlencode(pairs)}"
     return http("GET", url, {}, timeout=API_TIMEOUT)
 
@@ -105,6 +107,23 @@ def candidato(info, similitud, marca=None):
     }
 
 
+# Model codes the store writes into the description, e.g. "TR-ATG-1K1C" or "DT102AC":
+# letters AND digits, 5+ chars. Measures such as "2X1X0.80X6MTS" or "42.5KG" (numbers
+# followed by a short unit) are skipped.
+_TOKEN = re.compile(r"[A-Z0-9][A-Z0-9./-]{3,}[A-Z0-9]")
+_MEDIDA = re.compile(r"^[\d.,/X-]+[A-Z]{0,3}$")
+MAX_CODIGOS_DESCRIPCION = 5
+
+
+def codigos_en_descripcion(descripcion):
+    codigos = []
+    for token in _TOKEN.findall((descripcion or "").upper()):
+        es_codigo = re.search(r"[A-Z]", token) and re.search(r"\d", token) and not _MEDIDA.match(token)
+        if es_codigo and token not in codigos:
+            codigos.append(token)
+    return codigos[:MAX_CODIGOS_DESCRIPCION]
+
+
 def resolver(codigo_interno):
     q = f"{REST}/rest/v1/productos?codigo_interno=eq.{urllib.parse.quote(codigo_interno, safe='')}" \
         "&select=codigo_interno,descripcion,codigo_barras,referencia"
@@ -113,7 +132,8 @@ def resolver(codigo_interno):
         raise ValueError("Producto no encontrado en el inventario")
     p = rows[0]
 
-    exacto = api_disponibilidad(codigo=p["codigo_interno"], referencia=p.get("referencia"),
+    codigos = [p["codigo_interno"], *codigos_en_descripcion(p.get("descripcion"))]
+    exacto = api_disponibilidad(codigo=codigos, referencia=p.get("referencia"),
                                 barras=p.get("codigo_barras"))
     if exacto and exacto.get("encontrado"):
         return {"metodo": "codigo", "candidatos": [candidato(exacto, 1.0)]}
