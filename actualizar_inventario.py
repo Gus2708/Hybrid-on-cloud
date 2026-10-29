@@ -40,6 +40,13 @@ def _safe_read_db(filepath: str, retries: int = _MAX_RETRIES):
             else:
                 raise
 
+def descripcion_util(desc):
+    """True si la descripción nombra un producto. HybridLite tiene fichas llamadas "." o ".."
+    cuyo embedding casi vacío se parece a cualquier consulta y contamina la búsqueda del bot."""
+    if desc == 'SIN DESCRIPCION':
+        return False
+    return sum(ch.isalpha() for ch in desc) >= 3
+
 def clean_val(val):
     if isinstance(val, str):
         # Eliminar caracteres nulos y limpiar espacios
@@ -151,7 +158,7 @@ def process_inventory(force=False):
             count = 0
             for code in sorted(productos.keys()):
                 p = productos[code]
-                if len(p['codigo']) < 2 or p['desc'] == 'SIN DESCRIPCION': continue
+                if len(p['codigo']) < 2 or not descripcion_util(p['desc']): continue
                 
                 writer.writerow([p['codigo'], p['desc'], p['und'], p['bar'], p['referencia'], p['costo'], p['precio'], p['existencia']])
                 count += 1
