@@ -175,3 +175,59 @@ def check_waha() -> dict:
     except Exception as e:
         return {"ok": False, "status": "OFFLINE", "detail": "Servidor offline / puerto cerrado"}
 
+
+def check_supplier_api(port: int, service_name: str = "", timeout: float = 1.5) -> dict:
+    """Verifica si la API local de un proveedor (5001 Maxcam, 5002 CorpNorte) responde HTTP."""
+    for path in ("/health", "/marcas", "/"):
+        url = f"http://127.0.0.1:{port}{path}"
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if 200 <= resp.getcode() < 500:
+                    return {"ok": True, "status": "ONLINE", "port": port, "service": service_name}
+        except urllib.error.HTTPError as e:
+            if 200 <= e.code < 500:
+                return {"ok": True, "status": "ONLINE", "port": port, "service": service_name}
+        except Exception:
+            continue
+    return {"ok": False, "status": "OFFLINE", "port": port, "service": service_name}
+
+
+def check_maxcam(timeout: float = 1.5) -> dict:
+    """Verifica el estado del microservicio Maxcam en el puerto 5001."""
+    return check_supplier_api(5001, service_name="Maxcam", timeout=timeout)
+
+
+def check_corpnorte(timeout: float = 1.5) -> dict:
+    """Verifica el estado del microservicio Corporación Norte en el puerto 5002."""
+    return check_supplier_api(5002, service_name="CorpNorte", timeout=timeout)
+
+
+
+def run_checks_parallel(checks: dict, timeout: float = 5.0) -> dict:
+    """Ejecuta chequeos {nombre: callable} en paralelo con un tope duro de `timeout` s.
+
+    El tiempo total es el del chequeo más lento (no la suma). Un chequeo que lanza
+    o no termina a tiempo se reporta como {"ok": False, ...} sin afectar a los demás.
+    """
+    results = {}
+    lock = threading.Lock()
+
+    def _run(name, fn):
+        try:
+            value = fn()
+        except Exception as e:
+            value = {"ok": False, "detail": f"error: {e}"}
+        with lock:
+            results[name] = value
+
+    threads = []
+    for name, fn in checks.items():
+        t = threading.Thread(target=_run, args=(name, fn), daemon=True)
+        t.start()
+        threads.append(t)
+    deadline = time.time() + timeout
+    for t in threads:
+        t.join(max(0.0, deadline - time.time()))
+    with lock:
+        return {n: results.get(n, {"ok": False, "detail": "timeout"}) for n in checks}

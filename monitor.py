@@ -96,17 +96,18 @@ class SyncTriggerHandler(FileSystemEventHandler):
             self.timers[sync_type] = threading.Timer(delay, self.trigger_sync, [filename, sync_type])
             self.timers[sync_type].start()
 
-    def trigger_sync(self, reason, sync_type):
+    def trigger_sync(self, reason, sync_type, force=False):
         with self.lock:
             self.timers[sync_type] = None
             self.pending_syncs[sync_type] = False
         
         # Ejecutar la sincronización real
-        self.run_sync(reason, sync_type)
+        self.run_sync(reason, sync_type, force=force)
 
-    def run_sync(self, reason, sync_type):
+    def run_sync(self, reason, sync_type, force=False):
         log_msg = f"[{datetime.now().strftime('%H:%M:%S')}] Cambio en: {reason}. Sync {sync_type}..."
         log_monitor(log_msg)
+        is_force = force or (reason == "Self-Healing")
         
         def sync_worker():
             try:
@@ -120,7 +121,7 @@ class SyncTriggerHandler(FileSystemEventHandler):
                         import sync_ventas
                         import importlib
                         importlib.reload(sync_ventas)
-                        ok = sync_ventas.sync_incremental() is not False
+                        ok = sync_ventas.sync_incremental(force=is_force) is not False
                     elif sync_type == "proveedores":
                         import sync_proveedores
                         import importlib
@@ -130,7 +131,7 @@ class SyncTriggerHandler(FileSystemEventHandler):
                         import sync
                         import importlib
                         importlib.reload(sync)
-                        ok = sync.sync_incremental() is not False
+                        ok = sync.sync_incremental(force=is_force) is not False
 
                 if ok:
                     self.last_sync_time[sync_type] = time.time()
@@ -226,8 +227,8 @@ def auto_heal_check(sync_handler: SyncTriggerHandler) -> bool:
 
         # Check Inventario/Productos
         if not entities.get("productos", {}).get("ok", True):
-            log_monitor("  -> Discrepancia en Inventario. Solicitando sync automático...")
-            sync_handler.run_sync("Self-Healing", "inventario")
+            log_monitor("  -> Discrepancia en Inventario. Solicitando sync automático (force)...")
+            sync_handler.run_sync("Self-Healing", "inventario", force=True)
             if first_failure:
                 try:
                     from alert_util import send_alert
@@ -241,8 +242,8 @@ def auto_heal_check(sync_handler: SyncTriggerHandler) -> bool:
         clientes_ok = entities.get("clientes", {}).get("ok", True)
 
         if not (ventas_ok and detalle_ok and clientes_ok):
-            log_monitor("  -> Discrepancia en Ventas/Clientes. Solicitando sync automático...")
-            sync_handler.run_sync("Self-Healing", "ventas")
+            log_monitor("  -> Discrepancia en Ventas/Clientes. Solicitando sync automático (force)...")
+            sync_handler.run_sync("Self-Healing", "ventas", force=True)
             if first_failure:
                 try:
                     from alert_util import send_alert

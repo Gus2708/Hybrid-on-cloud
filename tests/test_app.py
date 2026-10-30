@@ -20,6 +20,8 @@ def test_health_endpoint(client, mocker):
     mocker.patch("network_util.check_drive", return_value=True)
     mocker.patch("network_util.check_supabase", return_value={"ok": True})
     mocker.patch("network_util.check_waha", return_value={"ok": True, "status": "WORKING"})
+    mocker.patch("network_util.check_maxcam", return_value={"ok": True, "status": "ONLINE", "port": 5001, "service": "Maxcam"})
+    mocker.patch("network_util.check_corpnorte", return_value={"ok": True, "status": "ONLINE", "port": 5002, "service": "CorpNorte"})
     mocker.patch("network_util.get_local_ip", return_value="127.0.0.1")
     
     response = client.get("/health")
@@ -27,6 +29,10 @@ def test_health_endpoint(client, mocker):
     data = response.get_json()
     assert data["status"] == "ok"
     assert data["app"] == "El Serrucho Backend"
+    assert "maxcam" in data["checks"]
+    assert data["checks"]["maxcam"]["ok"] is True
+    assert "corpnorte" in data["checks"]
+    assert data["checks"]["corpnorte"]["ok"] is True
 
 def test_productos_vacio(client, mocker):
     # Mocking cache to return empty

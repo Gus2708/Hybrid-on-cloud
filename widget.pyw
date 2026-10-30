@@ -48,6 +48,18 @@ HYBRID_PATHS = [
 # Se difiere al bloque __main__ para permitir la importación en tests sin interrumpir
 
 
+def check_port_alive(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:
+    """Verifica rápidamente si un puerto local TCP está abierto."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        res = s.connect_ex((host, port))
+        s.close()
+        return res == 0
+    except Exception:
+        return False
+
+
 def log_widget_error(msg):
     """Escribe en widget_error.log con rotación (sin conexión escribe cada 15s y crecía sin límite)."""
     try:
@@ -70,6 +82,11 @@ class SerruchoPremiumWidget:
         self.height_compact = 230
         self.integrity_visible = True
         self.waha_alert_shown = False
+        self.waha_ok = True
+        self.waha_status = "WORKING"
+        self.corpnorte_ok = True
+        self.maxcam_ok = True
+        self.current_detail_text = "Monitoreando archivos..."
         
         # Estética iOS 17
         self.root.overrideredirect(True)
@@ -94,43 +111,83 @@ class SerruchoPremiumWidget:
         self.bg_rect = self.draw_rounded_rect(0, 0, self.width, self.height_full, 28, self.colors["bg"], tags="bg_layer")
         
         # Cabecera
-        self.canvas.create_text(25, 22, text="El Serrucho", fill=self.colors["text"], font=("Inter", 12, "bold"), anchor="w", tags="title")
-        
-        # Indicador independiente de WhatsApp (WAHA)
-        self.waha_dot = self.canvas.create_oval(198, 17, 208, 27, fill=self.colors["green"], outline="")
-        self.canvas.create_text(188, 22, text="WA", fill=self.colors["subtext"], font=("Inter", 8, "bold"), anchor="e", tags="waha_label")
-
-        self.status_dot = self.canvas.create_oval(260, 17, 270, 27, fill=self.colors["green"], outline="")
-        # Anillo exterior del status_dot (se usa para drive/monitor status)
-        self.status_ring = self.canvas.create_oval(258, 15, 272, 29, outline=self.colors["green"], width=1, state="hidden")
+        self.canvas.create_text(16, 22, text="El Serrucho", fill=self.colors["text"], font=("Inter", 11, "bold"), anchor="w", tags="title")
         
         base_dir = os.path.dirname(os.path.abspath(__file__))
         logo_path = os.path.join(base_dir, "assets", "logo.png")
         if os.path.exists(logo_path) and HAS_PIL:
             try:
-                pil_img = Image.open(logo_path).resize((22, 22), Image.Resampling.LANCZOS)
+                pil_img = Image.open(logo_path).resize((20, 20), Image.Resampling.LANCZOS)
                 self.logo_img = ImageTk.PhotoImage(pil_img)
-                self.canvas.create_image(18, 22, image=self.logo_img, anchor="w")
-                self.canvas.move(self.canvas.find_withtag("title"), 30, 0)
+                self.canvas.create_image(14, 22, image=self.logo_img, anchor="w")
+                self.canvas.move(self.canvas.find_withtag("title"), 24, 0)
             except: pass
-        self.canvas.create_text(290, 22, text="✕", fill=self.colors["subtext"], font=("Inter", 10, "bold"), tags="close_btn")
-        self.canvas.tag_bind("close_btn", "<Button-1>", lambda e: self.hide_to_tray())
-        
-        # Botón Calculadora (%) con Estilo iOS
-        self.calc_btn_bg = self.draw_rounded_rect(225, 10, 250, 35, 8, self.colors["card"], tags="calc_btn")
-        self.calc_btn_txt = self.canvas.create_text(237, 22, text="%", fill=self.colors["blue"], font=("Inter", 11, "bold"), tags="calc_btn")
-        
-        # Efectos Hover y Clic
+
+        # Indicadores en cabecera
+        # WAHA
+        self.waha_label = self.canvas.create_text(128, 22, text="WA", fill=self.colors["subtext"], font=("Inter", 7, "bold"), anchor="w", tags="waha_ui")
+        self.waha_dot = self.canvas.create_oval(146, 18, 154, 26, fill=self.colors["green"], outline="", tags="waha_ui")
+
+        # CorpNorte
+        self.corpnorte_label = self.canvas.create_text(160, 22, text="NOR", fill=self.colors["subtext"], font=("Inter", 7, "bold"), anchor="w", tags="corpnorte_ui")
+        self.corpnorte_dot = self.canvas.create_oval(184, 18, 192, 26, fill=self.colors["green"], outline="", tags="corpnorte_ui")
+
+        # Maxcam
+        self.maxcam_label = self.canvas.create_text(198, 22, text="MAX", fill=self.colors["subtext"], font=("Inter", 7, "bold"), anchor="w", tags="maxcam_ui")
+        self.maxcam_dot = self.canvas.create_oval(222, 18, 230, 26, fill=self.colors["green"], outline="", tags="maxcam_ui")
+
+        # Botón Calculadora (%)
+        self.calc_btn_bg = self.draw_rounded_rect(236, 11, 256, 33, 6, self.colors["card"], tags="calc_btn")
+        self.calc_btn_txt = self.canvas.create_text(246, 22, text="%", fill=self.colors["blue"], font=("Inter", 10, "bold"), tags="calc_btn")
+
+        # Efectos Hover y Clic Calculadora
         self.canvas.tag_bind("calc_btn", "<Enter>", lambda e: self.canvas.itemconfig(self.calc_btn_bg, fill="#3A3A3C"))
         self.canvas.tag_bind("calc_btn", "<Leave>", lambda e: self.canvas.itemconfig(self.calc_btn_bg, fill=self.colors["card"]))
         self.canvas.tag_bind("calc_btn", "<Button-1>", lambda e: self.open_calculator())
 
-        # Spinner de Carga (oculto por defecto)
-        self.spinner = self.canvas.create_arc(257, 14, 273, 30, start=0, extent=60, outline=self.colors["blue"], width=2, style="arc", state="hidden")
+        # Status dot / ring / spinner
+        self.status_dot = self.canvas.create_oval(264, 17, 274, 27, fill=self.colors["green"], outline="", tags="sys_status_ui")
+        self.status_ring = self.canvas.create_oval(262, 15, 276, 29, outline=self.colors["green"], width=1, state="hidden", tags="sys_status_ui")
+        self.spinner = self.canvas.create_arc(261, 14, 277, 30, start=0, extent=60, outline=self.colors["blue"], width=2, style="arc", state="hidden")
+
+        # Botón Cerrar
+        self.canvas.create_text(293, 22, text="✕", fill=self.colors["subtext"], font=("Inter", 10, "bold"), tags="close_btn")
+        self.canvas.tag_bind("close_btn", "<Button-1>", lambda e: self.hide_to_tray())
 
         # Estado
         self.status_label = self.canvas.create_text(25, 50, text="Sistema Activo", fill=self.colors["text"], font=("Inter", 10, "bold"), anchor="w")
-        self.detail_label = self.canvas.create_text(25, 68, text="Monitoreando archivos...", fill=self.colors["subtext"], font=("Inter", 8), anchor="w")
+        self.detail_label = self.canvas.create_text(25, 68, text=self.current_detail_text, fill=self.colors["subtext"], font=("Inter", 8), anchor="w")
+
+        # Hover handlers para indicadores de cabecera
+        def _on_hover(text):
+            self.canvas.itemconfig(self.detail_label, text=text)
+
+        def _on_leave():
+            self.canvas.itemconfig(self.detail_label, text=self.current_detail_text)
+
+        self.canvas.tag_bind(
+            "waha_ui", "<Enter>",
+            lambda e: _on_hover(f"WhatsApp: {'Conectado' if self.waha_ok else 'Desconectado'} ({self.waha_status})")
+        )
+        self.canvas.tag_bind("waha_ui", "<Leave>", lambda e: _on_leave())
+
+        self.canvas.tag_bind(
+            "corpnorte_ui", "<Enter>",
+            lambda e: _on_hover(f"CorpNorte API (5002): {'ONLINE' if self.corpnorte_ok else 'OFFLINE'}")
+        )
+        self.canvas.tag_bind("corpnorte_ui", "<Leave>", lambda e: _on_leave())
+
+        self.canvas.tag_bind(
+            "maxcam_ui", "<Enter>",
+            lambda e: _on_hover(f"Maxcam API (5001): {'ONLINE' if self.maxcam_ok else 'OFFLINE'}")
+        )
+        self.canvas.tag_bind("maxcam_ui", "<Leave>", lambda e: _on_leave())
+
+        self.canvas.tag_bind(
+            "sys_status_ui", "<Enter>",
+            lambda e: _on_hover("Sincronizando datos..." if self.is_syncing else "Sistema Serrucho: Operativo")
+        )
+        self.canvas.tag_bind("sys_status_ui", "<Leave>", lambda e: _on_leave())
 
         # --- Switch de Writeback (estilo iOS) ---
         self.settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "writeback_settings.json")
@@ -551,7 +608,7 @@ class SerruchoPremiumWidget:
         self.canvas.itemconfig(self.detail_label, text="Datos al día ✓")
         now_str = datetime.now().strftime("%d/%m %H:%M:%S")
         self.canvas.itemconfig(self.sync_time_label, text=f"Último Sync: {now_str}")
-        self.root.after(3000, lambda: self.canvas.itemconfig(self.detail_label, text="Monitoreando archivos..."))
+        self.root.after(3000, lambda: self.canvas.itemconfig(self.detail_label, text=self.current_detail_text))
 
     def update_integrity_ui(self, entities):
         for key, info in entities.items():
@@ -601,13 +658,21 @@ class SerruchoPremiumWidget:
                 # 2. Obtener estado de la API Local (aislado)
                 try:
                     h_req = urllib.request.Request("http://localhost:5000/health")
-                    with urllib.request.urlopen(h_req, timeout=5) as h_resp:
+                    # /health encadena chequeos (drive, supabase, WAHA, Maxcam, CorpNorte):
+                    # en el peor caso suma ~14s, así que 5s daba falsos "API no responde".
+                    with urllib.request.urlopen(h_req, timeout=15) as h_resp:
                         h_data = json.loads(h_resp.read().decode())
                         self.root.after(0, lambda d=h_data: self._update_health_ui(d))
                         self._health_failures = 0
                 except Exception as e:
+                    self.corpnorte_ok = False
+                    self.maxcam_ok = False
                     self.root.after(0, lambda: self.canvas.itemconfig(self.status_ring, state="normal", outline=self.colors["red"]))
-                    self.root.after(0, lambda: self.canvas.itemconfig(self.detail_label, text="⚠️ API local no responde — reiniciando..."))
+                    self.root.after(0, lambda: self.canvas.itemconfig(self.corpnorte_dot, fill=self.colors["red"]))
+                    self.root.after(0, lambda: self.canvas.itemconfig(self.maxcam_dot, fill=self.colors["red"]))
+                    err_msg = "⚠️ API local no responde — reiniciando..."
+                    self.current_detail_text = err_msg
+                    self.root.after(0, lambda: self.canvas.itemconfig(self.detail_label, text=err_msg))
                     log_widget_error(f"Error API local: {repr(e)}")
                 
                 time.sleep(60)
@@ -630,29 +695,45 @@ class SerruchoPremiumWidget:
             
             # WAHA Check
             waha_check = checks.get("waha", {})
-            waha_ok = waha_check.get("ok", False)
-            waha_status = waha_check.get("status", "UNKNOWN")
+            self.waha_ok = waha_check.get("ok", False)
+            self.waha_status = waha_check.get("status", "UNKNOWN")
             
             # Mapear color del dot de WAHA independientemente
-            waha_color = self.colors["green"] if waha_ok else self.colors["red"]
+            waha_color = self.colors["green"] if self.waha_ok else self.colors["red"]
             self.canvas.itemconfig(self.waha_dot, fill=waha_color)
+
+            # CorpNorte & Maxcam checks
+            if "corpnorte" in checks:
+                cn_check = checks.get("corpnorte")
+                self.corpnorte_ok = cn_check.get("ok", False) if isinstance(cn_check, dict) else bool(cn_check)
+            else:
+                self.corpnorte_ok = check_port_alive(5002)
+
+            if "maxcam" in checks:
+                mc_check = checks.get("maxcam")
+                self.maxcam_ok = mc_check.get("ok", False) if isinstance(mc_check, dict) else bool(mc_check)
+            else:
+                self.maxcam_ok = check_port_alive(5001)
+
+            self.canvas.itemconfig(self.corpnorte_dot, fill=self.colors["green"] if self.corpnorte_ok else self.colors["red"])
+            self.canvas.itemconfig(self.maxcam_dot, fill=self.colors["green"] if self.maxcam_ok else self.colors["red"])
             
             # Alerta emergente del sistema (Popup no bloqueante) si se cae
-            if not waha_ok:
+            if not self.waha_ok:
                 if not self.waha_alert_shown:
                     self.waha_alert_shown = True
-                    if waha_status == "SCAN_QR_CODE":
+                    if self.waha_status == "SCAN_QR_CODE":
                         title_box = "Vincular WhatsApp (El Serrucho)"
                         msg_box = "La sesión de WhatsApp del bot se cerró.\n\nPor favor, abre el panel de WAHA (http://localhost:3000) e inicia sesión con admin_serrucho para escanear el código QR."
-                    elif waha_status == "FAILED":
+                    elif self.waha_status == "FAILED":
                         title_box = "Sesión Fallida de WhatsApp"
                         msg_box = "La sesión de WhatsApp (WAHA) falló.\n\nRevisa el panel de control de WAHA para reiniciar la sesión o re-vincular."
-                    elif waha_status == "OFFLINE":
+                    elif self.waha_status == "OFFLINE":
                         title_box = "Servidor WhatsApp Offline"
                         msg_box = "El servidor de WhatsApp (WAHA) no responde.\n\nComprueba que Docker Desktop esté en ejecución y los contenedores estén activos."
                     else:
                         title_box = "WhatsApp Desconectado"
-                        msg_box = f"La sesión de WhatsApp del bot no está activa (Estado: {waha_status}).\n\nPor favor, verifica la conexión."
+                        msg_box = f"La sesión de WhatsApp del bot no está activa (Estado: {self.waha_status}).\n\nPor favor, verifica la conexión."
                     
                     def show_popup():
                         try:
@@ -668,30 +749,39 @@ class SerruchoPremiumWidget:
             self.canvas.itemconfig(self.status_ring, state="normal", outline=ring_color)
             
             # Prioridad de mensajes en el label de detalle
-            if not waha_ok:
-                if waha_status == "SCAN_QR_CODE":
-                    self.canvas.itemconfig(self.detail_label, text="⚠️ WhatsApp: Escanear QR en panel")
-                elif waha_status == "FAILED":
-                    self.canvas.itemconfig(self.detail_label, text="⚠️ WhatsApp: Sesión fallida")
-                elif waha_status == "OFFLINE":
-                    self.canvas.itemconfig(self.detail_label, text="⚠️ WhatsApp: Servidor offline")
+            if not self.waha_ok:
+                if self.waha_status == "SCAN_QR_CODE":
+                    detail_text = "⚠️ WhatsApp: Escanear QR en panel"
+                elif self.waha_status == "FAILED":
+                    detail_text = "⚠️ WhatsApp: Sesión fallida"
+                elif self.waha_status == "OFFLINE":
+                    detail_text = "⚠️ WhatsApp: Servidor offline"
                 else:
-                    self.canvas.itemconfig(self.detail_label, text=f"⚠️ WhatsApp: Desconectado ({waha_status})")
+                    detail_text = f"⚠️ WhatsApp: Desconectado ({self.waha_status})"
             elif not sup_ok:
-                self.canvas.itemconfig(self.detail_label, text="⚠️ Supabase no responde")
+                detail_text = "⚠️ Supabase no responde"
             elif not drive_ok:
-                self.canvas.itemconfig(self.detail_label, text="⚠️ Unidad H: desconectada")
+                detail_text = "⚠️ Unidad H: desconectada"
             elif not mon_ok:
-                self.canvas.itemconfig(self.detail_label, text="⚠️ Monitor caído — reiniciar backend")
+                detail_text = "⚠️ Monitor caído — reiniciar backend"
+            elif not self.corpnorte_ok and not self.maxcam_ok:
+                detail_text = "⚠️ APIs Norte y Maxcam offline"
+            elif not self.corpnorte_ok:
+                detail_text = "⚠️ API Norte (5002) offline"
+            elif not self.maxcam_ok:
+                detail_text = "⚠️ API Maxcam (5001) offline"
             else:
-                self.canvas.itemconfig(self.detail_label, text="Monitoreando archivos...")
+                detail_text = "Monitoreando archivos..."
+
+            self.current_detail_text = detail_text
+            self.canvas.itemconfig(self.detail_label, text=detail_text)
         except: pass
 
     def animate(self):
         self.anim_f += 2
         
         pulse = (math.sin(self.anim_f / 5) + 1) / 2
-        self.canvas.coords(self.status_dot, 260-pulse, 17-pulse, 270+pulse, 27+pulse)
+        self.canvas.coords(self.status_dot, 264-pulse, 17-pulse, 274+pulse, 27+pulse)
         
         if self.is_syncing:
             self.canvas.itemconfig(self.spinner, state="normal", start=self.anim_f % 360, outline=self.colors["blue"])

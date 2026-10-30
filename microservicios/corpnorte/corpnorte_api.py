@@ -53,6 +53,11 @@ def on_error(e):
     return jsonify(error=str(e)), 502
 
 
+@app.get("/health")
+def health():
+    return jsonify(status="ok", service="corpnorte")
+
+
 @app.get("/disponibilidad")
 def disponibilidad():
     """`disponible` is stock > 0: the site's own `disponible` flag is always 1."""

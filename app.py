@@ -145,9 +145,11 @@ def sync_inventory():
         return auth_err
     try:
         from lock_util import acquire_lock
+        from flask import request
+        force = bool(request.args.get("force"))
         import sync
         with acquire_lock(timeout=10):
-            sync.sync_incremental()
+            sync.sync_incremental(force=force)
         invalidate_supabase_count_cache()
         return jsonify({"status": "success", "message": "Inventario sincronizado"})
     except Exception as e:
@@ -160,9 +162,11 @@ def sync_sales():
         return auth_err
     try:
         from lock_util import acquire_lock
+        from flask import request
+        force = bool(request.args.get("force"))
         import sync_ventas
         with acquire_lock(timeout=10):
-            sync_ventas.sync_incremental()
+            sync_ventas.sync_incremental(force=force)
         invalidate_supabase_count_cache()
         return jsonify({"status": "success", "message": "Ventas sincronizadas"})
     except Exception as e:
@@ -179,8 +183,8 @@ def trigger_sync_all():
             import sync
             import sync_ventas
             with acquire_lock(timeout=45):
-                sync.sync_incremental()
-                sync_ventas.sync_incremental()
+                sync.sync_incremental(force=True)
+                sync_ventas.sync_incremental(force=True)
             invalidate_supabase_count_cache()
         except Exception as e:
             print(f"[APP] Error en sync/run: {e}")
@@ -200,7 +204,7 @@ def trigger_sync_force():
             import sync_ventas
             with acquire_lock(timeout=45):
                 sync.sync_incremental(force=True)
-                sync_ventas.sync_incremental()
+                sync_ventas.sync_incremental(force=True)
             invalidate_supabase_count_cache()
         except Exception as e:
             print(f"[APP] Error en sync/force: {e}")
@@ -277,6 +281,24 @@ def sync_status():
         except Exception:
             return _COUNT_CACHE.get(path, {}).get("count", 0)
     
+    def count_detalle_valid():
+        """Cuenta líneas de detalle cuyo producto existe en el maestro (las demás no se suben por FK)."""
+        det = os.path.join(BASE_DIR, "VENTAS_DETALLE.csv")
+        mae = os.path.join(BASE_DIR, "MAESTRO_ACTUAL.csv")
+        if not (os.path.exists(det) and os.path.exists(mae)):
+            return count_csv_smart("VENTAS_DETALLE.csv")
+        try:
+            from sync_utils import count_valid_detail_rows
+            key = (os.path.getmtime(det), os.path.getmtime(mae))
+            cached = _COUNT_CACHE.get("detalle_valid")
+            if cached and cached["mtime"] == key:
+                return cached["count"]
+            count = count_valid_detail_rows(det, mae)
+            _COUNT_CACHE["detalle_valid"] = {"count": count, "mtime": key}
+            return count
+        except Exception:
+            return count_csv_smart("VENTAS_DETALLE.csv")
+
     def count_supabase(table):
         if not supabase_reachable:
             return -1
@@ -312,7 +334,7 @@ def sync_status():
     result = {}
     all_ok = True
     for key, cfg in entities.items():
-        local = count_csv_smart(cfg["csv"])
+        local = count_detalle_valid() if key == "detalle" else count_csv_smart(cfg["csv"])
         cloud = count_supabase(cfg["table"])
         # Permitir una pequeña tolerancia de hasta 2 registros por registros corruptos u huérfanos omitidos
         ok = (abs(local - cloud) <= 2) if cloud >= 0 else False
@@ -359,7 +381,14 @@ def tunnel_urls():
 def health():
     """Endpoint de diagnóstico completo con timeouts para no bloquear."""
     try:
-        from network_util import check_drive, check_supabase, get_local_ip, check_waha
+        from network_util import (
+            check_drive,
+            check_supabase,
+            get_local_ip,
+            check_waha,
+            check_maxcam,
+            check_corpnorte,
+        )
     except ImportError:
         return jsonify({"status": "error", "detail": "network_util no disponible"}), 500
     
@@ -373,12 +402,23 @@ def health():
         drive = check_drive(RUTA_INVENTARIO)
     t = threading.Thread(target=_check, daemon=True)
     t.start()
-    t.join(timeout=4)
+
+    from network_util import run_checks_parallel
+    # Los chequeos de red corren en paralelo entre sí y con el sondeo del drive:
+    # el total es el más lento (tope ~5s), no la suma.
+    parallel = run_checks_parallel({
+        "supabase": check_supabase,
+        "waha": check_waha,
+        "maxcam": check_maxcam,
+        "corpnorte": check_corpnorte,
+    }, timeout=5)
+    t.join(timeout=0.1)
     if t.is_alive():
         drive = False
-    
-    supabase = check_supabase()
-    waha = check_waha()
+    supabase = parallel["supabase"]
+    waha = parallel["waha"]
+    maxcam = parallel["maxcam"]
+    corpnorte = parallel["corpnorte"]
     ip = get_local_ip()
     
     mon_path = os.path.join(BASE_DIR, "last_monitor.json")
@@ -402,6 +442,8 @@ def health():
         "monitor": {"ok": monitor_alive, "last_seen": last_mon},
         "is_syncing": locked,
         "waha": waha,
+        "maxcam": maxcam,
+        "corpnorte": corpnorte,
     }
     all_ok = all(v.get("ok", False) if isinstance(v, dict) else True for v in checks.values())
     

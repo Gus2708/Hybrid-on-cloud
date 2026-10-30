@@ -59,6 +59,11 @@ def on_error(e):
     return jsonify(error=str(e)), 502
 
 
+@app.get("/health")
+def health():
+    return jsonify(status="ok", service="maxcam")
+
+
 @app.get("/productos")
 def productos():
     per_page = min(int(request.args.get("por_pagina", 40)), MAX_PER_PAGE)
