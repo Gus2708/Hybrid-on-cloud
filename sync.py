@@ -283,7 +283,16 @@ def verify_sync(csv_count: int, force: bool = False):
                         meta["last_reconcile"] = now
                         with open(LAST_SYNC_FILE, 'w') as f: json.dump(meta, f)
                     except: pass
-        except: pass
+                else:
+                    msg = "No se pudieron eliminar los huérfanos de productos en la nube (ver log: posible FK o permisos)."
+                    print(f"[SYNC] ! {msg}")
+                    try:
+                        from alert_util import send_alert
+                        send_alert("warning", msg)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[SYNC] ! Error en la reconciliación de huérfanos: {e}")
 
 if __name__ == "__main__":
     from lock_util import acquire_lock

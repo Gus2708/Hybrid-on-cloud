@@ -257,20 +257,37 @@ def delete_orphans_rest(valid_ids: list, table: str = "productos") -> bool:
         
         # 3. Eliminar por lotes (PostgREST in filter)
         batch_size = 50 # Menor tamaño para URLs más seguras
-        for i in range(0, len(orphans), batch_size):
-            batch = orphans[i:i + batch_size]
+        fk_blocked = []
+
+        def _delete_ids(ids_batch):
             # PostgREST requiere que los valores con caracteres especiales estén entrecomillados
             # y que la URL esté codificada.
-            quoted_ids = [f'"{oid}"' for oid in batch]
-            ids_str = ",".join(quoted_ids)
-            
-            params = urllib.parse.urlencode({"codigo_interno": f"in.({ids_str})"})
+            quoted_ids = [f'"{oid}"' for oid in ids_batch]
+            params = urllib.parse.urlencode({"codigo_interno": f"in.({','.join(quoted_ids)})"})
             del_url = f"{REST_URL.rstrip('/')}/rest/v1/{table}?{params}"
-            
-            print(f"[REST] Borrando batch {i//batch_size + 1}: {len(batch)} items...")
             del_req = urllib.request.Request(del_url, headers=headers, method="DELETE")
             with urllib.request.urlopen(del_req, timeout=20) as resp:
                 pass
+
+        for i in range(0, len(orphans), batch_size):
+            batch = orphans[i:i + batch_size]
+            print(f"[REST] Borrando batch {i//batch_size + 1}: {len(batch)} items...")
+            try:
+                _delete_ids(batch)
+            except urllib.error.HTTPError as e:
+                if e.code != 409:
+                    raise
+                # Un huérfano con historial (FK) hace fallar el lote entero:
+                # aislar uno a uno para borrar el resto y reportar los protegidos.
+                for oid in batch:
+                    try:
+                        _delete_ids([oid])
+                    except urllib.error.HTTPError as e2:
+                        if e2.code != 409:
+                            raise
+                        fk_blocked.append(oid)
+        if fk_blocked:
+            print(f"[REST] {len(fk_blocked)} huérfanos NO se pueden borrar (tienen historial/FK): {fk_blocked}")
         return True
     except Exception as e:
         print(f"[REST] Error eliminando huerfanos: {e}")

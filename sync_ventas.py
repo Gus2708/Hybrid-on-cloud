@@ -15,7 +15,7 @@ except ImportError:
     SUPABASE_REST_URL = ""
     SUPABASE_ANON_KEY = ""
 
-from sync_utils import safe_decimal, set_priority_low, _kill_proc, exponential_backoff
+from sync_utils import safe_decimal, set_priority_low, _kill_proc, exponential_backoff, filter_valid_detail_rows
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EXPORTER_SCRIPT = os.path.join(BASE_DIR, "extraer_ventas.py")
@@ -166,6 +166,104 @@ def upsert_with_response(table: str, on_conflict: str, payload: list) -> list:
                 time.sleep(delay)
     return []
 
+def validate_sales_detail_coherence(cabecera_path: str, detalle_path: str, check_window: int = 20) -> bool:
+    """
+    Verifica la coherencia entre VENTAS_CABECERA.csv y VENTAS_DETALLE.csv.
+    Asegura que si hay ventas en cabecera, el detalle no esté ausente, vacío o desactualizado
+    y contenga detalles para las ventas recientes.
+    Devuelve True si los datos son coherentes, False en caso contrario.
+    """
+    if not os.path.isabs(cabecera_path) and not os.path.exists(cabecera_path):
+        cabecera_path = os.path.join(BASE_DIR, cabecera_path)
+    if not os.path.isabs(detalle_path) and not os.path.exists(detalle_path):
+        detalle_path = os.path.join(BASE_DIR, detalle_path)
+
+    if not os.path.exists(cabecera_path):
+        print(f"  [COHERENCE] Archivo de cabecera no encontrado: {cabecera_path}")
+        return False
+
+    try:
+        with open(cabecera_path, "r", encoding="utf-8-sig") as f:
+            cab_rows = list(csv.DictReader(f))
+    except Exception as e:
+        print(f"  [COHERENCE] Error leyendo {cabecera_path}: {e}")
+        return False
+
+    # Si no hay ventas en cabecera, es coherente
+    if not cab_rows:
+        return True
+
+    # Si hay ventas pero no existe el archivo de detalle
+    if not os.path.exists(detalle_path):
+        print(f"  [COHERENCE] Cabecera tiene {len(cab_rows)} ventas pero detalle no existe: {detalle_path}")
+        return False
+
+    try:
+        with open(detalle_path, "r", encoding="utf-8-sig") as f:
+            det_rows = list(csv.DictReader(f))
+    except Exception as e:
+        print(f"  [COHERENCE] Error leyendo {detalle_path}: {e}")
+        return False
+
+    # Si detalle está vacío pero cabecera tiene ventas
+    if not det_rows:
+        print(f"  [COHERENCE] Cabecera tiene {len(cab_rows)} ventas pero detalle está vacío.")
+        return False
+
+    # Detectar columna de ID en cabecera
+    cab_id_col = None
+    for cand in ["THT_AUTOINCREMENT", "THT_DOCUMENTO", "ID_UNICO", "ID"]:
+        for k in cab_rows[0].keys():
+            if k.upper() == cand:
+                cab_id_col = k
+                break
+        if cab_id_col:
+            break
+
+    if not cab_id_col:
+        print("  [COHERENCE] No se encontró columna de ID en cabecera.")
+        return False
+
+    # Detectar columna de enlace en detalle
+    det_parent_col = None
+    for cand in ["TBT_OPERACION_AUTOINCREMENT", "TBT_DOCUMENTO", "VENTA_ID", "PARENT_ID"]:
+        for k in det_rows[0].keys():
+            if k.upper() == cand:
+                det_parent_col = k
+                break
+        if det_parent_col:
+            break
+
+    if not det_parent_col:
+        print("  [COHERENCE] No se encontró columna de enlace en detalle.")
+        return False
+
+    cab_sales = [str(r[cab_id_col]).strip() for r in cab_rows if r.get(cab_id_col) and str(r[cab_id_col]).strip()]
+    if not cab_sales:
+        return True
+
+    det_parents = {str(r[det_parent_col]).strip() for r in det_rows if r.get(det_parent_col) and str(r[det_parent_col]).strip()}
+
+    # Identificar ventas recientes por ventana final
+    sample_size = min(len(cab_sales), check_window)
+    recent_sales = set(cab_sales[-sample_size:])
+
+    # Identificar ventas por fecha más reciente si existe columna de fecha
+    date_col = next((k for k in cab_rows[0].keys() if k.upper() in ("THT_FECHAEMISION", "FECHA")), None)
+    if date_col:
+        valid_dates = [r[date_col].strip() for r in cab_rows if r.get(date_col) and r[date_col].strip()]
+        if valid_dates:
+            latest_date = max(valid_dates)
+            latest_sales = {str(r[cab_id_col]).strip() for r in cab_rows if r.get(date_col, "").strip() == latest_date and str(r.get(cab_id_col, "")).strip()}
+            recent_sales.update(latest_sales)
+
+    missing = [s for s in recent_sales if s not in det_parents]
+    if missing:
+        print(f"  [COHERENCE] Incoherencia: Detalle no contiene {len(missing)} de {len(recent_sales)} ventas recientes (ej: {missing[:5]}).")
+        return False
+
+    return True
+
 def sync_incremental(force=False):
     """Sincroniza ventas/clientes a Supabase. Devuelve True si terminó completo, False si abortó o hubo lotes fallidos."""
     if not SUPABASE_REST_URL or not SUPABASE_ANON_KEY: return False
@@ -296,6 +394,16 @@ def sync_incremental(force=False):
     ventas_map_ids = {}
     doc_to_tasa = {}
     current_bcv_rate = get_current_rate()
+
+    # Validar coherencia antes de subir ventas para evitar crear huérfanos si los detalles están desactualizados
+    cab_path = "VENTAS_CABECERA.csv"
+    det_path = "VENTAS_DETALLE.csv"
+    cab_full = os.path.join(BASE_DIR, cab_path)
+    if (os.path.exists(cab_path) or os.path.exists(cab_full)) and not validate_sales_detail_coherence(cab_path, det_path):
+        print("[SYNC VENTAS] ! ABORTANDO: Incoherencia detectada entre ventas y detalles. "
+              "VENTAS_DETALLE carece de detalles para las ventas recientes en VENTAS_CABECERA. "
+              "Operación cancelada para proteger la integridad referencial.")
+        return False
     
     if validate_csv("VENTAS_CABECERA.csv"):
         print(f"[SYNC VENTAS] Procesando ventas (Tasa actual: {current_bcv_rate})...")
@@ -389,8 +497,17 @@ def sync_incremental(force=False):
             else:
                 had_errors = True
 
+        # Líneas cuyo producto ya no existe en el maestro violarían la FK
+        # fk_ventas_detalle_producto en Supabase: se omiten (set vacío = sin filtro).
+        valid_products = set()
+        try:
+            with open("MAESTRO_ACTUAL.csv", "r", encoding="utf-8-sig") as mf:
+                valid_products = {r["CODIGO_INTERNO"].strip() for r in csv.DictReader(mf)}
+        except Exception as e:
+            print(f"  [WARN] No se pudo leer MAESTRO_ACTUAL.csv para filtrar detalles: {e}")
+
         with open("VENTAS_DETALLE.csv", "r", encoding="utf-8-sig") as f:
-            for row in csv.DictReader(f):
+            for row in filter_valid_detail_rows(csv.DictReader(f), valid_products):
                 try:
                     doc_num = row["TBT_DOCUMENTO"].strip().zfill(8)
                     tasa = doc_to_tasa.get(doc_num, current_bcv_rate)
@@ -467,8 +584,13 @@ def sync_incremental(force=False):
 _MIN_SAFE_IDS = 10
 
 def reconcile_ventas(force: bool = False):
-    """Busca registros en Supabase que ya no existen en los CSV locales y los elimina (con cooldown de 12h)."""
-    # Verificar cooldown de 12 horas
+    """
+    Busca registros en Supabase que ya no existen en los CSV locales y los elimina.
+    Ejecuta si:
+      1. force=True (disparo manual o forzado)
+      2. Se detecta discrepancia en los conteos (Self-Healing o sync)
+      3. Cooldown de 12 horas expirado (auditoría periódica preventiva)
+    """
     last_reconcile_time = 0.0
     last_reconcile_file = os.path.join(BASE_DIR, "ventas_last_reconcile.json")
     if os.path.exists(last_reconcile_file):
@@ -478,39 +600,81 @@ def reconcile_ventas(force: bool = False):
         except: pass
     
     now = time.time()
-    if not force and (now - last_reconcile_time < 12 * 3600):
-        print(f"[AUDIT] La última reconciliación de ventas fue hace menos de 12 horas. Saltando reconciliación.")
+    has_discrepancy = False
+
+    # Verificación proactiva de discrepancia (rápida, 0 egress con HEAD)
+    if not force:
+        try:
+            check_targets = [
+                ("ventas_detalle", "VENTAS_DETALLE.csv"),
+                ("ventas", "VENTAS_CABECERA.csv"),
+                ("clientes", "MAESTRO_CLIENTES.csv")
+            ]
+            for t_name, csv_name in check_targets:
+                csv_path = os.path.join(BASE_DIR, csv_name)
+                if os.path.exists(csv_path):
+                    with open(csv_path, 'rb') as f_cnt:
+                        loc_count = max(0, sum(1 for _ in f_cnt) - 1)
+                    u_cnt = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/{t_name}?select=count"
+                    headers_cnt = {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}", "Prefer": "count=exact"}
+                    r_cnt = _retry_http(u_cnt, method="HEAD", headers=headers_cnt, timeout=4)
+                    if r_cnt:
+                        cr = r_cnt.headers.get("content-range", "")
+                        if cr and "/" in cr:
+                            c_count = int(cr.split("/")[-1])
+                            if abs(loc_count - c_count) > 2:
+                                has_discrepancy = True
+                                print(f"[AUDIT] Discrepancia detectada en {t_name} (Local: {loc_count} vs Nube: {c_count}). Reconciliando...")
+                                break
+        except Exception:
+            pass
+
+    if not force and not has_discrepancy and (now - last_reconcile_time < 12 * 3600):
+        print(f"[AUDIT] La última reconciliación de ventas fue hace menos de 12 horas y los datos coinciden. Saltando.")
         return
 
     try:
         reconciled_any = False
-        # 1. Reconciliar VENTAS (Cabecera) usando id_unico
+
+        # 1. Reconciliar DETALLES primero (para liberar dependencias hacia ventas)
+        if os.path.exists("VENTAS_DETALLE.csv"):
+            print("[AUDIT] Verificando integridad de Detalles...")
+            with open("VENTAS_DETALLE.csv", "r", encoding="utf-8-sig") as f:
+                local_ids = {int(row["TBT_AUTOINCREMENT"]) for row in csv.DictReader(f) if row.get("TBT_AUTOINCREMENT")}
+            
+            if len(local_ids) < _MIN_SAFE_IDS:
+                print(f"  [SKIP] Solo {len(local_ids)} IDs locales en detalle (< {_MIN_SAFE_IDS}). "
+                      f"Posible unidad H: caída. No se eliminarán registros remotos.")
+            elif delete_orphans_generic("ventas_detalle", "id", list(local_ids), is_numeric=True):
+                print("[AUDIT] Reconciliación de Detalles completada.")
+                reconciled_any = True
+
+        # 2. Reconciliar VENTAS (Cabecera)
         if os.path.exists("VENTAS_CABECERA.csv"):
             print("[AUDIT] Verificando integridad de Ventas...")
             with open("VENTAS_CABECERA.csv", "r", encoding="utf-8-sig") as f:
                 local_ids = {int(row["THT_IDUNICO"]) for row in csv.DictReader(f) if row.get("THT_IDUNICO")}
             
-            # 🛡️ No reconciliar si hay muy pocos IDs (H: caída protege datos en nube)
             if len(local_ids) < _MIN_SAFE_IDS:
                 print(f"  [SKIP] Solo {len(local_ids)} IDs locales en ventas (< {_MIN_SAFE_IDS}). "
                       f"Posible unidad H: caída. No se eliminarán registros remotos.")
-            elif delete_orphans_generic("ventas", "id_unico", list(local_ids)):
+            elif delete_orphans_generic("ventas", "id_unico", list(local_ids), is_numeric=True):
                 print("[AUDIT] Reconciliación de Ventas completada.")
                 reconciled_any = True
 
-        # 2. Reconciliar DETALLES usando id (HybridLite autoincrement)
-        if os.path.exists("VENTAS_DETALLE.csv"):
-            print("[AUDIT] Verificando integridad de Detalles...")
-            with open("VENTAS_DETALLE.csv", "r", encoding="utf-8-sig") as f:
-                local_ids = {int(row["TBT_AUTOINCREMENT"]) for row in csv.DictReader(f)}
+        # 3. Reconciliar CLIENTES
+        if os.path.exists("MAESTRO_CLIENTES.csv"):
+            print("[AUDIT] Verificando integridad de Clientes...")
+            with open("MAESTRO_CLIENTES.csv", "r", encoding="utf-8-sig") as f:
+                local_codes = {row["CLT_CODIGO"].strip() for row in csv.DictReader(f) if row.get("CLT_CODIGO")}
             
-            if len(local_ids) < _MIN_SAFE_IDS:
-                print(f"  [SKIP] Solo {len(local_ids)} IDs locales en detalle (< {_MIN_SAFE_IDS}). "
+            if len(local_codes) < _MIN_SAFE_IDS:
+                print(f"  [SKIP] Solo {len(local_codes)} códigos locales en clientes (< {_MIN_SAFE_IDS}). "
                       f"Posible unidad H: caída. No se eliminarán registros remotos.")
-            elif delete_orphans_generic("ventas_detalle", "id", list(local_ids)):
-                print("[AUDIT] Reconciliación de Detalles completada.")
+            elif delete_orphans_generic("clientes", "codigo_cliente", list(local_codes), is_numeric=False):
+                print("[AUDIT] Reconciliación de Clientes completada.")
                 reconciled_any = True
-                
+
         if reconciled_any or not os.path.exists(last_reconcile_file):
             try:
                 with open(last_reconcile_file, 'w') as f:
@@ -532,8 +696,9 @@ def _retry_http(url: str, method: str = "GET", data: bytes = None, timeout: int 
                 time.sleep(exponential_backoff(attempt))
     return None
 
-def delete_orphans_generic(table: str, pk_col: str, valid_ids: list) -> bool:
-    """Elimina registros huérfanos de cualquier tabla con reintentos."""
+def delete_orphans_generic(table: str, pk_col: str, valid_ids: list, is_numeric: bool = True) -> bool:
+    """Elimina registros huérfanos de cualquier tabla con reintentos y soporte numérico/string."""
+    import urllib.parse
     try:
         cloud_ids = set()
         page_size = 1000
@@ -549,11 +714,16 @@ def delete_orphans_generic(table: str, pk_col: str, valid_ids: list) -> bool:
             for item in items:
                 val = item.get(pk_col)
                 if val is not None:
-                    cloud_ids.add(int(val))
+                    parsed_val = int(val) if is_numeric else str(val).strip()
+                    cloud_ids.add(parsed_val)
             if len(items) < page_size: break
             offset += page_size
 
-        valid_set = {int(vid) for vid in valid_ids}
+        if is_numeric:
+            valid_set = {int(vid) for vid in valid_ids}
+        else:
+            valid_set = {str(vid).strip() for vid in valid_ids}
+
         orphans = [oid for oid in cloud_ids if oid not in valid_set]
 
         if not orphans:
@@ -572,10 +742,33 @@ def delete_orphans_generic(table: str, pk_col: str, valid_ids: list) -> bool:
         batch_size = 100
         for i in range(0, len(orphans), batch_size):
             batch = orphans[i:i + batch_size]
-            ids_str = ",".join(map(str, batch))
-            del_url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/{table}?{pk_col}=in.({ids_str})"
-            _retry_http(del_url, method="DELETE", timeout=20)
-            
+            if is_numeric:
+                ids_str = ",".join(map(str, batch))
+                del_url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/{table}?{pk_col}=in.({ids_str})"
+            else:
+                formatted_ids = ",".join(f'"{oid}"' for oid in batch)
+                del_url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/{table}?{pk_col}=in.({urllib.parse.quote(formatted_ids)})"
+            del_resp = _retry_http(del_url, method="DELETE", timeout=20)
+            if del_resp is None:
+                print(f"  [WARN] Falló eliminación de lote de huérfanos en {table}")
+
+        # Limpiar huérfanos del caché local en disco para mantener sincronía
+        try:
+            cache_file = os.path.join(BASE_DIR, "ventas_cache.json")
+            if os.path.exists(cache_file):
+                with open(cache_file, "r") as cf:
+                    mem_cache = json.load(cf)
+                cache_key = "ventas" if table == "ventas" else ("ventas_detalle" if table == "ventas_detalle" else "clientes")
+                if cache_key in mem_cache:
+                    orphans_str = {str(oid) for oid in orphans}
+                    before_cnt = len(mem_cache[cache_key])
+                    mem_cache[cache_key] = {k: v for k, v in mem_cache[cache_key].items() if k not in orphans_str}
+                    if len(mem_cache[cache_key]) != before_cnt:
+                        with open(cache_file, "w") as cf:
+                            json.dump(mem_cache, cf)
+        except Exception as e:
+            print(f"  [WARN] No se pudo purgar huérfanos del caché de {table}: {e}")
+
         return True
 
     except Exception as e:

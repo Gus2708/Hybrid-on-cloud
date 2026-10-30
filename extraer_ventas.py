@@ -55,13 +55,56 @@ def get_payments_map():
     return payments
 
 def decode_dbisam_time(ms_value):
-    """Decodifica milisegundos desde medianoche a formato HH:MM:SS"""
-    if not isinstance(ms_value, int):
+    """Decodifica milisegundos desde medianoche a formato HH:MM:SS.
+    Maneja enteros, flotantes, valores fuera de rango y tipos no válidos de forma segura.
+    """
+    if isinstance(ms_value, bool) or not isinstance(ms_value, (int, float)):
         return "00:00:00"
-    h = ms_value // (1000 * 3600)
-    m = (ms_value % (1000 * 3600)) // (1000 * 60)
-    s = (ms_value % (1000 * 60)) // 1000
+    try:
+        ms = int(ms_value)
+    except (ValueError, TypeError, OverflowError):
+        return "00:00:00"
+    if ms < 0:
+        return "00:00:00"
+    ms = ms % 86400000
+    h = ms // (1000 * 3600)
+    m = (ms % (1000 * 3600)) // (1000 * 60)
+    s = (ms % (1000 * 60)) // 1000
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+def safe_str(val) -> str:
+    """Convierte cualquier valor (int, float, date, None) a string limpio de manera segura."""
+    if val is None or val == "Fail":
+        return ""
+    if isinstance(val, (datetime, date)):
+        return val.strftime("%Y-%m-%d")
+    return str(val).strip()
+
+def sanitize_row(row: list) -> list:
+    """Sanitiza una fila completa convirtiendo todos sus elementos a strings limpios."""
+    return [safe_str(v) for v in row]
+
+def prune_orphaned_details(existing_data: dict, valid_sales_ids: set, idx_parent_auto: int) -> tuple:
+    """
+    Purga detalles huérfanos de existing_data cuyos IDs de cabecera no existan en valid_sales_ids.
+    Maneja llaves heterogéneas (int/str) y valores con tipos mixtos de forma segura.
+    Devuelve (cleaned_data, pruned_count).
+    """
+    if not valid_sales_ids or idx_parent_auto < 0:
+        return existing_data, 0
+    valid_set = {safe_str(x) for x in valid_sales_ids if x is not None and safe_str(x)}
+    cleaned = {}
+    pruned_count = 0
+    for k, v in existing_data.items():
+        if isinstance(v, (list, tuple)) and len(v) > idx_parent_auto:
+            parent_id = safe_str(v[idx_parent_auto])
+            if parent_id in valid_set:
+                cleaned[k] = v
+            else:
+                pruned_count += 1
+        else:
+            pruned_count += 1
+    return cleaned, pruned_count
 
 def should_extract(dat_filename, csv_filename):
     dat_path = os.path.join(base, dat_filename)
@@ -81,9 +124,9 @@ def load_existing_csv_simple(csv_path, key_idx=0):
                 return rows_dict
             for r in reader:
                 if len(r) > key_idx:
-                    key = r[key_idx].strip()
+                    key = safe_str(r[key_idx])
                     if key:
-                        rows_dict[key] = r
+                        rows_dict[key] = sanitize_row(r)
     except Exception as e:
         print(f"Error cargando CSV existente {csv_path}: {e}")
     return rows_dict
@@ -93,7 +136,7 @@ def run_extraction(force=False):
     test_path = os.path.join(base, "TInventario.dat")
     if not os.path.exists(test_path):
         print("  [DRIVE] Unidad H: no disponible. Abortando extracción de ventas.")
-        return False
+        return None
 
     # Lista de tareas: (DAT, CSV, Columnas)
     tasks = [
@@ -111,7 +154,9 @@ def run_extraction(force=False):
     ]
     
     any_extracted = False
+    had_error = False
     payments_map = None
+    valid_sales_ids = None
     
     # ─── Determinar si las ventas cambiaron (cabecera o detalle) ───
     ventas_changed = should_extract("TTransaccionvta.dat", "VENTAS_CABECERA.csv") or should_extract("TDetalleVta.dat", "VENTAS_DETALLE.csv")
@@ -129,6 +174,10 @@ def run_extraction(force=False):
                 print("Cargando catálogo de métodos de pago...")
                 payments_map = get_payments_map()
 
+            # Asegurar IDs de ventas válidas para integridad referencial de detalles
+            if dat == "TDetalleVta.dat" and valid_sales_ids is None:
+                valid_sales_ids = {safe_str(k) for k in load_existing_csv_simple("VENTAS_CABECERA.csv", key_idx=0).keys() if safe_str(k)}
+
             db = None
             try:
                 db = _safe_read_db(filepath)
@@ -140,6 +189,7 @@ def run_extraction(force=False):
                 idx_fecha = next((i for i, c in enumerate(cols) if c == "THT_FECHAEMISION"), -1)
                 idx_hora = next((i for i, c in enumerate(cols) if c == "THT_HORA"), -1)
                 idx_id_unico = next((i for i, c in enumerate(cols) if c == "THT_IDUNICO"), -1)
+                idx_parent_auto = next((i for i, c in enumerate(cols) if c == "TBT_OPERACION_AUTOINCREMENT"), -1)
 
                 # Columnas de salida
                 out_cols = cols.copy()
@@ -176,17 +226,34 @@ def run_extraction(force=False):
 
                     # Lógica de filtrado: Solo Facturas (11) y No Anuladas (Status != 4)
                     if idx_tipo != -1:
-                        tipo_val = str(row[col_indices[idx_tipo]]).strip()
-                        if tipo_val != "11": continue
+                        tipo_val = safe_str(row[col_indices[idx_tipo]])
+                        if tipo_val != "11":
+                            if is_incremental:
+                                row_key = safe_str(row[col_indices[0]])
+                                existing_data.pop(row_key, None)
+                            continue
                     
                     if idx_status != -1:
-                        status_val = str(row[col_indices[idx_status]]).strip()
-                        if status_val == "4": continue
+                        status_val = safe_str(row[col_indices[idx_status]])
+                        if status_val == "4":
+                            if is_incremental:
+                                row_key = safe_str(row[col_indices[0]])
+                                existing_data.pop(row_key, None)
+                            continue
+
+                    # 🛡️ Integridad Referencial: Si es detalle, descartar huérfanos sin factura cabecera válida
+                    if dat == "TDetalleVta.dat" and idx_parent_auto != -1 and valid_sales_ids is not None:
+                        parent_auto = safe_str(row[col_indices[idx_parent_auto]])
+                        if parent_auto not in valid_sales_ids:
+                            if is_incremental:
+                                row_key = safe_str(row[col_indices[0]])
+                                existing_data.pop(row_key, None)
+                            continue
 
                     out_row = []
                     for col_idx in col_indices:
                         val = row[col_idx] if col_idx != -1 else ''
-                        if isinstance(val, date): val = val.strftime('%Y-%m-%d')
+                        if isinstance(val, (datetime, date)): val = val.strftime('%Y-%m-%d')
                         elif val == 'Fail': val = ''
                         out_row.append(val)
                     
@@ -196,7 +263,7 @@ def run_extraction(force=False):
                         metodo = payments_map.get(id_unico, "EFECTIVO") if id_unico else "EFECTIVO"
                         out_row.append(metodo)
                         
-                        fecha_str = out_row[idx_fecha] if idx_fecha != -1 else ""
+                        fecha_str = safe_str(out_row[idx_fecha]) if idx_fecha != -1 else ""
                         hora_str = "00:00:00"
                         if idx_hora != -1:
                             col_obj = db._columns[col_indices[idx_hora]]
@@ -208,13 +275,22 @@ def run_extraction(force=False):
                         full_ts = f"{fecha_str} {hora_str}-04:00"
                         out_row.append(full_ts)
 
+                    # Sanitizar fila completa a strings seguros para evitar colisiones de tipo
+                    out_row = sanitize_row(out_row)
+
                     # Si es incremental, actualizamos el diccionario en memoria
                     if is_incremental:
-                        key = str(out_row[0]).strip()
+                        key = out_row[0]
                         if key:
                             existing_data[key] = out_row
                     else:
                         new_rows.append(out_row)
+
+                # Limpieza referencial en existing_data si es TDetalleVta
+                if dat == "TDetalleVta.dat" and is_incremental and valid_sales_ids and idx_parent_auto != -1:
+                    existing_data, pruned = prune_orphaned_details(existing_data, valid_sales_ids, idx_parent_auto)
+                    if pruned > 0:
+                        print(f"  [INTEGRIDAD] Purgados {pruned} detalles huérfanos sin factura válida en cabecera.")
 
                 # Guardar el CSV resultante
                 with open(tmp_filename, 'w', newline='', encoding='utf-8-sig') as f:
@@ -235,11 +311,14 @@ def run_extraction(force=False):
                 if safe_replace(tmp_filename, csv_f):
                     mode_str = "Incremental" if is_incremental else "Completo"
                     print(f"  -> {dat}: ({mode_str}) Guardado {valid_rows} registros filtrados en {csv_f}")
+                    if dat == "TTransaccionvta.dat":
+                        valid_sales_ids = {safe_str(k) for k in (existing_data.keys() if is_incremental else [r[0] for r in new_rows]) if safe_str(k)}
                 else:
                     raise IOError(f"No se pudo reemplazar {csv_f} debido a bloqueos de archivos en Windows.")
                 
                 any_extracted = True
             except Exception as e:
+                had_error = True
                 import traceback
                 traceback.print_exc()
                 print(f"Error procesando {dat}: {e}")
@@ -252,11 +331,21 @@ def run_extraction(force=False):
         else:
             print(f"[SKIP] {dat} no ha cambiado.")
             
+    if had_error:
+        print("  ! Error detectado durante la extracción.")
+        return None
     if not any_extracted:
         print("Todo está al día. No se extrajo nada.")
     return any_extracted
 
-if __name__ == '__main__':
-    force = len(sys.argv) > 1 and sys.argv[1] == "force"
-    run_extraction(force=force)
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv
+    force = len(argv) > 1 and argv[1] == "force"
+    res = run_extraction(force=force)
+    if res is None:
+        sys.exit(1)
+    return 0
 
+if __name__ == '__main__':
+    main()

@@ -51,3 +51,35 @@ def safe_decimal(val) -> float:
 def exponential_backoff(attempt: int) -> float:
     """Calcula delay de backoff exponencial con techo de 15 segundos."""
     return min(1.5 ** attempt, 15.0)
+
+
+def filter_valid_detail_rows(rows, valid_codes):
+    """Descarta líneas de detalle cuyo producto (TBT_CODIGO) ya no existe en el maestro.
+
+    Esas líneas violan la FK fk_ventas_detalle_producto en Supabase. Si el maestro
+    está vacío (lectura fallida) no se filtra nada, para no descartar todo el detalle.
+    """
+    if not valid_codes:
+        return list(rows)
+    return [r for r in rows if r.get("TBT_CODIGO", "").strip() in valid_codes]
+
+
+def count_valid_detail_rows(detalle_path: str, maestro_path: str) -> int:
+    """Cuenta líneas de detalle con producto existente en el maestro.
+
+    Si falta alguno de los CSV, cae al conteo de filas crudas del detalle.
+    """
+    import csv
+    import os
+    try:
+        if not os.path.exists(detalle_path):
+            return 0
+        if not os.path.exists(maestro_path):
+            with open(detalle_path, "rb") as f:
+                return max(0, sum(1 for _ in f) - 1)
+        with open(maestro_path, "r", encoding="utf-8-sig", newline="") as f:
+            valid = {r["CODIGO_INTERNO"].strip() for r in csv.DictReader(f)}
+        with open(detalle_path, "r", encoding="utf-8-sig", newline="") as f:
+            return len(filter_valid_detail_rows(csv.DictReader(f), valid))
+    except Exception:
+        return 0
