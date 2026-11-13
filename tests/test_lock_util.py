@@ -121,6 +121,28 @@ class TestIsLocked:
         assert lock_util.is_locked() is False
 
 
+# ─── Tests de clear_stale_locks() ─────────────────────────────────────────────
+
+class TestClearStaleLocks:
+    def test_clear_stale_locks_preserves_active_pid(self, tmp_path, monkeypatch):
+        """clear_stale_locks preserves sync.lock for active PID and deletes it for inactive PID."""
+        import lock_util
+        lock_file = tmp_path / "sync.lock"
+        monkeypatch.setattr(lock_util, "LOCK_FILE", str(lock_file))
+
+        # 1. Active PID: sync.lock must NOT be deleted
+        lock_file.write_text(str(os.getpid()))
+        lock_util.clear_stale_locks()
+        assert lock_file.exists()
+        assert lock_file.read_text().strip() == str(os.getpid())
+
+        # 2. Inactive PID: sync.lock must be deleted
+        lock_file.write_text("9999999")
+        monkeypatch.setattr(lock_util, "pid_exists", lambda pid: False)
+        lock_util.clear_stale_locks()
+        assert not lock_file.exists()
+
+
 # ─── Tests de safe_replace() ──────────────────────────────────────────────────
 
 class TestSafeReplace:

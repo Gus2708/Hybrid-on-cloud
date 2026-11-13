@@ -571,7 +571,7 @@ class SerruchoPremiumWidget:
             
             # Polling rápido con timeout hasta que el backend termine de sincronizar
             start = time.time()
-            while time.time() - start < 45:
+            while time.time() - start < 180:
                 time.sleep(1.5)
                 try:
                     st_req = urllib.request.Request("http://localhost:5000/api/v1/sync/status?fresh=1")

@@ -40,8 +40,45 @@ CRITICAL_FILES = {
     os.path.basename(RUTA_PROVEEDORES).lower(): "proveedores"
 }
 
+# Mapeo de archivos fuente en H: contra CSV locales para detección de desincronización
+SOURCE_SYNC_MAP = {
+    "inventario": [
+        (RUTA_INVENTARIO, "MAESTRO_ACTUAL.csv"),
+        (RUTA_PRECIOS, "MAESTRO_ACTUAL.csv"),
+        (RUTA_EXISTENCIA, "MAESTRO_ACTUAL.csv"),
+    ],
+    "ventas": [
+        (RUTA_VENTAS_CABECERA, "VENTAS_CABECERA.csv"),
+        (RUTA_VENTAS_DETALLE, "VENTAS_DETALLE.csv"),
+        (RUTA_CLIENTES, "MAESTRO_CLIENTES.csv"),
+    ],
+}
+
 WATCH_DIR = os.path.dirname(RUTA_INVENTARIO)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def check_stale_source_files() -> set:
+    """
+    Comprueba si algún archivo .DAT en H: es más reciente que su CSV local.
+    Cubre cambios ocurridos mientras la PC estuvo apagada o monitor.py detenido.
+    """
+    stale_types = set()
+    for sync_type, file_pairs in SOURCE_SYNC_MAP.items():
+        for dat_path, csv_name in file_pairs:
+            csv_path = os.path.join(BASE_DIR, csv_name)
+            try:
+                if not os.path.exists(dat_path):
+                    continue
+                if not os.path.exists(csv_path):
+                    stale_types.add(sync_type)
+                    break
+                # Margen de 2s para evitar falsos positivos por jitter de timestamp en red SMB
+                if os.path.getmtime(dat_path) > (os.path.getmtime(csv_path) + 2.0):
+                    stale_types.add(sync_type)
+                    break
+            except Exception:
+                pass
+    return stale_types
 
 class SyncTriggerHandler(FileSystemEventHandler):
     def __init__(self):
@@ -195,12 +232,37 @@ _HEAL_INTERVAL = 30 * 60  # re-verificación periódica de integridad (30 min)
 _heal_was_ok = True       # para alertar solo en la transición OK → discrepancia
 
 
+def check_startup_sync(sync_handler: SyncTriggerHandler):
+    """Verifica al iniciar o reconectar H: si hay .DAT más recientes que los CSV locales."""
+    try:
+        stale = check_stale_source_files()
+        if stale:
+            log_monitor(f"Startup check: detectados .DAT en H: más recientes que CSV locales en: {', '.join(stale)}. Sincronizando...")
+            for stype in stale:
+                sync_handler.run_sync(f"Startup check ({stype})", stype, force=False)
+        else:
+            log_monitor("Startup check: CSV locales al día con archivos .DAT de unidad H:.")
+    except Exception as e:
+        log_monitor(f"Error en verificación inicial de .DAT: {e}")
+
+
 def auto_heal_check(sync_handler: SyncTriggerHandler) -> bool:
     """
-    Una pasada de Self-Healing: consulta /sync/status y dispara los syncs
-    necesarios. Devuelve True si logró verificar, False si la API no respondió.
+    Una pasada de Self-Healing:
+    1. Verifica si hay .DAT en H: más recientes que los CSV locales.
+    2. Consulta /sync/status para comparar conteos CSV local vs Supabase.
+    Devuelve True si logró verificar, False si la API no respondió.
     """
     global _heal_was_ok
+
+    # 1. Comprobar si los .DAT en H: fueron modificados respecto a los CSV locales
+    stale_types = check_stale_source_files()
+    if stale_types:
+        log_monitor(f"⚠️ Self-Healing: DATs en H: más recientes que CSV locales en: {', '.join(stale_types)}")
+        for stype in stale_types:
+            sync_handler.run_sync(f"Self-Healing ({stype} DAT desactualizado)", stype, force=False)
+        _heal_was_ok = False
+
     for _ in range(3):
         try:
             req = urllib.request.Request("http://localhost:5000/api/v1/sync/status")
@@ -214,7 +276,7 @@ def auto_heal_check(sync_handler: SyncTriggerHandler) -> bool:
             log_monitor("Self-Healing: hay un sync en curso; se verificará en el próximo ciclo.")
             return True
 
-        if data.get("status") == "ok":
+        if data.get("status") == "ok" and not stale_types:
             if not _heal_was_ok:
                 log_monitor("✅ Self-Healing: Integridad de datos recuperada.")
             _heal_was_ok = True
@@ -225,8 +287,8 @@ def auto_heal_check(sync_handler: SyncTriggerHandler) -> bool:
         _heal_was_ok = False
         entities = data.get("entities", {})
 
-        # Check Inventario/Productos
-        if not entities.get("productos", {}).get("ok", True):
+        # Check Inventario/Productos (si no fue ya disparado por stale_types)
+        if not entities.get("productos", {}).get("ok", True) and "inventario" not in stale_types:
             log_monitor("  -> Discrepancia en Inventario. Solicitando sync automático (force)...")
             sync_handler.run_sync("Self-Healing", "inventario", force=True)
             if first_failure:
@@ -236,12 +298,12 @@ def auto_heal_check(sync_handler: SyncTriggerHandler) -> bool:
                 except Exception:
                     pass
 
-        # Check Ventas/Detalles/Clientes
+        # Check Ventas/Detalles/Clientes (si no fue ya disparado por stale_types)
         ventas_ok = entities.get("ventas", {}).get("ok", True)
         detalle_ok = entities.get("detalle", {}).get("ok", True)
         clientes_ok = entities.get("clientes", {}).get("ok", True)
 
-        if not (ventas_ok and detalle_ok and clientes_ok):
+        if not (ventas_ok and detalle_ok and clientes_ok) and "ventas" not in stale_types:
             log_monitor("  -> Discrepancia en Ventas/Clientes. Solicitando sync automático (force)...")
             sync_handler.run_sync("Self-Healing", "ventas", force=True)
             if first_failure:
@@ -321,6 +383,7 @@ def start_monitor():
             observer.schedule(event_handler, WATCH_DIR, recursive=False)
             observer.start()
             log_monitor("Observador de archivos activo (Polling).")
+            check_startup_sync(event_handler)
             
             last_drive_check = 0
             

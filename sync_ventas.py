@@ -613,8 +613,17 @@ def reconcile_ventas(force: bool = False):
             for t_name, csv_name in check_targets:
                 csv_path = os.path.join(BASE_DIR, csv_name)
                 if os.path.exists(csv_path):
-                    with open(csv_path, 'rb') as f_cnt:
-                        loc_count = max(0, sum(1 for _ in f_cnt) - 1)
+                    if t_name == "ventas_detalle":
+                        mae_path = os.path.join(BASE_DIR, "MAESTRO_ACTUAL.csv")
+                        if os.path.exists(mae_path):
+                            from sync_utils import count_valid_detail_rows
+                            loc_count = count_valid_detail_rows(csv_path, mae_path)
+                        else:
+                            with open(csv_path, 'rb') as f_cnt:
+                                loc_count = max(0, sum(1 for _ in f_cnt) - 1)
+                    else:
+                        with open(csv_path, 'rb') as f_cnt:
+                            loc_count = max(0, sum(1 for _ in f_cnt) - 1)
                     u_cnt = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/{t_name}?select=count"
                     headers_cnt = {"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {SUPABASE_ANON_KEY}", "Prefer": "count=exact"}
                     r_cnt = _retry_http(u_cnt, method="HEAD", headers=headers_cnt, timeout=4)
