@@ -63,3 +63,14 @@ def test_corpnorte_api_health_endpoint():
         assert resp.get_json() == {"status": "ok", "service": "corpnorte"}
     finally:
         sys.path.pop(0)
+
+
+def test_maxcam_auth_load_env_without_dotenv_file(monkeypatch, tmp_path):
+    maxcam_dir = os.path.join(os.path.dirname(__file__), "..", "microservicios", "maxcam")
+    sys.path.insert(0, os.path.abspath(maxcam_dir))
+    try:
+        import maxcam_auth
+        monkeypatch.setattr(maxcam_auth, "HERE", str(tmp_path))
+        assert maxcam_auth.load_env() == {}
+    finally:
+        sys.path.pop(0)

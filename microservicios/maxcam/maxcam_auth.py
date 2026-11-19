@@ -17,22 +17,31 @@ SESSION_FILE = os.path.join(HERE, "session.json")
 
 def load_env():
     env = {}
-    with open(os.path.join(HERE, ".env"), encoding="utf-8") as f:
-        for line in f:
-            if "=" in line and not line.startswith("#"):
-                k, v = line.strip().split("=", 1)
-                env[k] = v
+    env_path = os.path.join(HERE, ".env")
+    if os.path.exists(env_path):
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    env[k] = v
     return env
 
 
 ENV = load_env()
-BASE = ENV["SUPABASE_URL"]
-HEADERS = {"apikey": ENV["SUPABASE_KEY"], "Content-Type": "application/json"}
+BASE = ENV.get("SUPABASE_URL") or os.environ.get("SUPABASE_URL", "")
+HEADERS = {
+    "apikey": ENV.get("SUPABASE_KEY") or os.environ.get("SUPABASE_KEY", ""),
+    "Content-Type": "application/json",
+}
+
+
+def _maxcam_email():
+    return ENV.get("MAXCAM_EMAIL") or os.environ.get("MAXCAM_EMAIL", "")
 
 
 def request_code():
     r = requests.post(f"{BASE}/auth/v1/otp", headers=HEADERS,
-                      json={"email": ENV["MAXCAM_EMAIL"], "create_user": False}, timeout=30)
+                      json={"email": _maxcam_email(), "create_user": False}, timeout=30)
     print(r.status_code, r.text[:300])
 
 
@@ -44,7 +53,7 @@ def _save(data):
 
 def verify_code(code):
     r = requests.post(f"{BASE}/auth/v1/verify", headers=HEADERS,
-                      json={"type": "email", "email": ENV["MAXCAM_EMAIL"], "token": code.strip()},
+                      json={"type": "email", "email": _maxcam_email(), "token": code.strip()},
                       timeout=30)
     if r.status_code != 200:
         sys.exit(f"verify failed: {r.status_code} {r.text[:300]}")
