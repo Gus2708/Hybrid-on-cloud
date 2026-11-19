@@ -95,7 +95,7 @@ except Exception:
 
 import flujo_precio as fp                    # helpers de ventanas + constantes de clase
 import flujo_precio_real as fpr               # escribir_precio, _click_boton_dialogo, _focus...
-import flujo_stock_real as fsr                # _cerrar_ficha_si_abierta (modelo de apertura)
+import flujo_stock_real as fsr                # _cerrar_ficha_si_abierta + ajustar_stock[_lote] (es_ajuste)
 import hybrid_price_writer as hpw             # _db_precio_usd, _db_costo_usd
 import read_db_existencia as dbex             # existencia() de verificación
 import colisiones                             # clave de búsqueda segura (código vs referencia)
@@ -1211,13 +1211,198 @@ def _totalizar_compra(hcom, doc_numero):
     return True
 
 
+# ── ajuste fijo de existencia (es_ajuste=True) ───────────────────────────────
+def calcular_existencia_esperada(item, existencia_antes):
+    """Existencia final esperada en DBISAM tras procesar un ítem de compra.
+
+    Para es_ajuste=True, item['cantidad'] es la existencia final absoluta objetivo
+    que debe quedar en HybridLite (no una cantidad a sumar). Para es_ajuste=False,
+    se suma a existencia_antes."""
+    if bool(item.get("es_ajuste")):
+        return float(item["cantidad"])
+    if existencia_antes is None:
+        return None
+    return float(existencia_antes) + float(item["cantidad"])
+
+
+def calcular_ajuste_item(item, existencia_antes, existencia_post_compra=None):
+    """Calcula si un ítem requiere paso por Ajustes de Inventario y su delta/target.
+
+    Secuencia Compra -> Ajuste Post-Compra:
+      - Para es_ajuste=False: nunca requiere ajuste adicional.
+      - Para es_ajuste=True:
+          target = float(item["cantidad"])
+          En commit (existencia_post_compra provista tras totalizar la compra),
+          delta = target - float(existencia_post_compra).
+          En preview / proyección previa (existencia_post_compra=None),
+          se estima existencia_post = float(existencia_antes) + target (o target
+          si es_nuevo=True y existencia_antes es None).
+          Si abs(delta) <= TOL_EXISTENCIA, ya quedó en target y no abre Ajustes.
+    """
+    if not bool(item.get("es_ajuste")):
+        return {
+            "requiere_ajuste": False,
+            "target": calcular_existencia_esperada(item, existencia_antes),
+            "delta": 0.0,
+            "existencia_base": (
+                float(existencia_post_compra)
+                if existencia_post_compra is not None
+                else existencia_antes
+            ),
+            "motivo": "es_ajuste=False",
+        }
+
+    target = float(item["cantidad"])
+    if existencia_post_compra is not None:
+        existencia_post = float(existencia_post_compra)
+    elif existencia_antes is not None:
+        existencia_post = float(existencia_antes) + target
+    elif bool(item.get("es_nuevo")):
+        existencia_post = target
+    else:
+        existencia_post = None
+
+    if existencia_post is None:
+        return {
+            "requiere_ajuste": False,
+            "target": target,
+            "delta": None,
+            "existencia_base": None,
+            "motivo": "existencia_indisponible",
+        }
+
+    delta = target - existencia_post
+    requiere = abs(delta) > TOL_EXISTENCIA
+    return {
+        "requiere_ajuste": requiere,
+        "target": target,
+        "delta": delta,
+        "existencia_base": existencia_post,
+        "motivo": "ajuste_necesario" if requiere else "ya_en_target",
+    }
+
+
+def armar_lote_ajustes_compra(items, existencias_antes, existencias_post_compra=None,
+                              claves_busqueda=None):
+    """Arma el lote de ajustes de inventario requeridos para los ítems con es_ajuste=True.
+
+    Devuelve (lote_ajustes, errores_lectura) donde cada entrada de lote_ajustes tiene:
+      {"item_id", "codigo", "codigo_esperado", "delta", "target", "existencia_base"}.
+    """
+    lote_ajustes = []
+    errores_lectura = {}
+    for it in items:
+        if not bool(it.get("es_ajuste")):
+            continue
+        codigo = it["codigo"]
+        codigo_key = str(codigo).strip()
+        ex_antes = None
+        if existencias_antes:
+            ex_antes = existencias_antes.get(codigo, existencias_antes.get(codigo_key))
+        ex_post = None
+        if existencias_post_compra:
+            ex_post = existencias_post_compra.get(codigo, existencias_post_compra.get(codigo_key))
+        info = calcular_ajuste_item(it, ex_antes, existencia_post_compra=ex_post)
+        if info["motivo"] == "existencia_indisponible":
+            errores_lectura[codigo] = {
+                "ok": False,
+                "detalle": (f"No se pudo leer la existencia de {codigo} en DBISAM "
+                            f"para calcular el ajuste fijo de existencia."),
+            }
+            continue
+        if not info["requiere_ajuste"]:
+            continue
+        clave = (claves_busqueda or {}).get(codigo) or (claves_busqueda or {}).get(codigo_key) or codigo
+        lote_ajustes.append({
+            "item_id": codigo,
+            "codigo": clave,
+            "codigo_esperado": codigo,
+            "delta": info["delta"],
+            "target": info["target"],
+            "existencia_base": info["existencia_base"],
+        })
+    return lote_ajustes, errores_lectura
+
+
+def _ejecutar_ajustes_post_compra(lote_ajustes, existencias_antes, commit,
+                                  doc_numero=None, banner=None):
+    """Ejecuta Ajustes de Inventario (flujo_stock_real) para los ítems es_ajuste=True
+    que quedaron fuera de su existencia objetivo tras la compra."""
+    if not lote_ajustes:
+        return {
+            "ok": True,
+            "etapa": "commit" if commit else "preview",
+            "detalle": "Sin ajustes adicionales requeridos.",
+            "resultados": {},
+        }
+
+    if banner is not None:
+        try:
+            doc_txt = f" — OC-{doc_numero}" if doc_numero is not None else ""
+            banner.set_texto(f"AJUSTANDO EXISTENCIA FIJA ({len(lote_ajustes)} ÍTEM/S){doc_txt}")
+        except Exception:
+            pass
+
+    try:
+        if len(lote_ajustes) == 1:
+            aj = lote_ajustes[0]
+            res = fsr.ajustar_stock(
+                aj["codigo"],
+                aj["target"],
+                commit=commit,
+                delta=False,
+                codigo_esperado=aj["codigo_esperado"],
+            )
+            return {
+                "ok": bool(res.get("ok")),
+                "etapa": res.get("etapa", "error"),
+                "detalle": res.get("detalle", ""),
+                "resultados": {aj["item_id"]: res},
+            }
+
+        lote_para_fsr = []
+        for aj in lote_ajustes:
+            codigo_real = aj["codigo_esperado"]
+            ex_antes = None
+            if existencias_antes:
+                ex_antes = existencias_antes.get(
+                    codigo_real, existencias_antes.get(str(codigo_real).strip())
+                )
+            delta_lote = (
+                (aj["target"] - float(ex_antes))
+                if (not commit and ex_antes is not None)
+                else aj["delta"]
+            )
+            lote_para_fsr.append({
+                "item_id": aj["item_id"],
+                "codigo": aj["codigo"],
+                "codigo_esperado": codigo_real,
+                "delta": delta_lote,
+                "target": aj["target"],
+            })
+        return fsr.ajustar_stock_lote(lote_para_fsr, commit=commit)
+    except Exception as e:
+        return {
+            "ok": False,
+            "etapa": "excepcion",
+            "detalle": f"excepción ejecutando ajuste de inventario: {e!r}",
+            "resultados": {},
+        }
+
+
 # ── orquestador ──────────────────────────────────────────────────────────────
-def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedor_nombre=None):
+def registrar_compra(proveedor_codigo, items, doc_numero, commit=False,
+                     proveedor_nombre=None, banner=None):
     """items: list[dict] {"codigo": str, "cantidad": float, "costo": float, "precio": float,
-    "es_nuevo": bool (opcional), "referencia": str|None (opcional), "descripcion": str
-    (opcional, solo requerida si es_nuevo)}.
+    "es_nuevo": bool (opcional), "es_ajuste": bool (opcional), "referencia": str|None (opcional),
+    "descripcion": str (opcional, solo requerida si es_nuevo)}.
+    Cuando es_ajuste=True, `cantidad` representa la existencia final objetivo que
+    debe quedar en HybridLite (se registra la compra por `cantidad` con costo/precio
+    reales y luego se ejecuta Ajustes de Inventario si la existencia post-compra no
+    coincide con `cantidad`).
     proveedor_nombre: opcional; si viene, se verifica contra el campo del header.
     doc_numero: str numérico para los dos campos de Total Operación (relleno).
+    banner: handle opcional de safety_control para actualizar el texto en vivo.
     Return: {"ok": bool, "etapa": str, "detalle": str,
              "resultados": dict[str_codigo, {"ok","detalle"}],  # verificación por item (solo commit)
              ...}
@@ -1225,13 +1410,14 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
     etapas fallo PRE-commit (reintentables, NADA quedó a medias porque se canceló todo):
       "abrir_hybrid" | "alta_producto:<etapa>" (ver crear_producto) | "navegacion"
       (clase/proveedor) | "carga_item" | "precio_item"
-    etapas fallo AMBIGUAS: "totalizar" | "verificacion_db" | "alta_producto:guardar" |
+    etapas fallo AMBIGUAS / POST-TOTALIZAR: "totalizar" | "verificacion_db" |
+      "ajuste_inventario:<etapa>" | "alta_producto:guardar" |
       "alta_producto:verificacion_db"
     etapa fallo NO AMBIGUA pero tampoco reintentable: "verificacion_indisponible"
       -- la compra SÍ se totalizó y solo falló la LECTURA de la DBISAM para
       confirmarla (unidad H: caída). Reencolar duplicaría el documento; hay que
-      revisar a mano. ("alta_producto:verificacion_indisponible" es su gemela en
-      el alta: el Guardar ya se pulsó y no se pudo confirmar.)
+      revisar a mano. ("alta_producto:verificacion_indisponible" y
+      "ajuste_inventario:verificacion_indisponible" son sus gemelas.)
     REGLA DE ORO: ante CUALQUIER fallo antes de pulsar Totalizar -> Cancelar la
     compra completa + Salir de la ventana + devolver etapa pre-commit. La compra
     es TODO-O-NADA (un documento). El alta de productos nuevos (es_nuevo) corre
@@ -1264,6 +1450,10 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
             return {"ok": False, "etapa": "navegacion",
                     "detalle": f"Ítem {it['codigo']} viene con es_nuevo=True pero sin "
                                f"descripción. Nada se tocó."}
+        if it.get("es_ajuste") and float(it["cantidad"]) <= 0:
+            return {"ok": False, "etapa": "navegacion",
+                    "detalle": f"Ítem {it['codigo']} viene con es_ajuste=True y "
+                               f"cantidad={it['cantidad']} <= 0; debe ser > 0. Nada se tocó."}
 
     # asegurar que Hybrid esté abierto y logueado (lo lanza si está cerrado)
     import abrir_hybrid
@@ -1347,7 +1537,7 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
         ex_batch = dbex.existencia_batch([it["codigo"] for it in items])
         for it in items:
             c = it["codigo"]
-            existencias_antes[c] = ex_batch.get(c, (None, []))[0]
+            existencias_antes[c] = ex_batch.get(c, ex_batch.get(str(c).strip(), (None, [])))[0]
             log.info("Existencia DB ANTES de %s: %s", c, existencias_antes[c])
     except Exception as e:
         log.warning("Lectura batch existencia ANTES falló (%r), usando fallback individual.", e)
@@ -1407,11 +1597,45 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
             if it.get("es_nuevo"):
                 continue   # ya está en altas_resultado (etapa "preview")
             resultados[it["codigo"]] = {"ok": True, "detalle": "Verificado en pantalla y descartado."}
+
+        lote_ajustes_preview, _ = armar_lote_ajustes_compra(
+            [it for it in items if not it.get("es_nuevo")],
+            existencias_antes,
+            existencias_post_compra=None,
+            claves_busqueda=claves_busqueda,
+        )
+        if lote_ajustes_preview:
+            res_aj = _ejecutar_ajustes_post_compra(
+                lote_ajustes_preview,
+                existencias_antes,
+                commit=False,
+                doc_numero=doc_numero,
+                banner=banner,
+            )
+            if not res_aj["ok"]:
+                return {
+                    "ok": False,
+                    "etapa": "navegacion",
+                    "detalle": f"Preview de ajuste fijo de existencia falló: {res_aj['detalle']}",
+                    "resultados": resultados,
+                }
+            for aj in lote_ajustes_preview:
+                c_aj = aj["codigo_esperado"]
+                det_aj = (res_aj.get("resultados") or {}).get(aj["item_id"], {}).get("detalle", "")
+                resultados[c_aj] = {
+                    "ok": True,
+                    "detalle": f"[es_ajuste] Verificado en pantalla (Compra + Ajustes) y descartado. {det_aj}".strip(),
+                }
+
+        extra_ajuste = (
+            f" Preview de ajuste fijo validado para {len(lote_ajustes_preview)} ítem(s)."
+            if lote_ajustes_preview else ""
+        )
         return {"ok": True, "etapa": "preview",
                 "detalle": f"Preview de {len(items)} ítem(s) verificado(s) en pantalla y "
                            f"DESCARTADO (sin --commit; documento cancelado completo). "
                            f"Los ítems es_nuevo NO se cargaron en la grilla (ver asimetría "
-                           f"preview/commit en el docstring).",
+                           f"preview/commit en el docstring).{extra_ajuste}",
                 "resultados": resultados}
 
     # COMMIT: Totalizar (etapa AMBIGUA si falla -- no sabemos si el documento
@@ -1442,17 +1666,91 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
         return {"ok": False, "etapa": "verificacion_indisponible",
                 "detalle": detalle, "resultados": resultados}
 
+    if any(bool(it.get("es_ajuste")) for it in items):
+        existencias_post_compra = {
+            it["codigo"]: db_batch.get(
+                str(it["codigo"]).strip(),
+                db_batch.get(it["codigo"], (None, None, None)),
+            )[0]
+            for it in items
+        }
+        lote_ajustes, errores_lectura = armar_lote_ajustes_compra(
+            items,
+            existencias_antes,
+            existencias_post_compra=existencias_post_compra,
+            claves_busqueda=claves_busqueda,
+        )
+        if errores_lectura:
+            detalle = (
+                f"Compra totalizada (doc={doc_numero}), pero no se pudo leer existencia para "
+                f"ajuste fijo de existencia: "
+                + "; ".join(v["detalle"] for v in errores_lectura.values())
+            )
+            log.error(detalle)
+            return {
+                "ok": False,
+                "etapa": "ajuste_inventario:lectura_db",
+                "detalle": detalle,
+                "resultados": errores_lectura,
+            }
+        if lote_ajustes:
+            log.info(
+                "Compra doc=%s totalizada; aplicando ajuste fijo post-compra para %s ítem(s): %s",
+                doc_numero,
+                len(lote_ajustes),
+                [(a["codigo_esperado"], a["existencia_base"], "->", a["target"]) for a in lote_ajustes],
+            )
+            res_aj = _ejecutar_ajustes_post_compra(
+                lote_ajustes,
+                existencias_antes,
+                commit=True,
+                doc_numero=doc_numero,
+                banner=banner,
+            )
+            if not res_aj["ok"]:
+                etapa_aj = f"ajuste_inventario:{res_aj.get('etapa', 'error')}"
+                detalle = (
+                    f"Compra totalizada (doc={doc_numero}), pero falló el ajuste fijo de "
+                    f"existencia: {res_aj.get('detalle', '')}"
+                )
+                log.error(detalle)
+                return {
+                    "ok": False,
+                    "etapa": etapa_aj,
+                    "detalle": detalle,
+                    "resultados": res_aj.get("resultados", {}),
+                }
+            time.sleep(0.5)
+            try:
+                db_batch = _leer_items_db_batch(codigos_items)
+            except VerificacionIndisponible as e:
+                detalle = (
+                    f"Compra (doc={doc_numero}) y ajuste fijo de existencia TOTALIZADOS, "
+                    f"pero la verificación final en DBISAM quedó a medias: {e}. "
+                    f"NO reencolar (sería una compra doble); revisar existencias a mano."
+                )
+                log.error(detalle)
+                return {
+                    "ok": False,
+                    "etapa": "ajuste_inventario:verificacion_indisponible",
+                    "detalle": detalle,
+                    "resultados": res_aj.get("resultados", {}),
+                }
+
     for it in items:
         codigo = it["codigo"]
+        codigo_key = str(codigo).strip()
         existencia_antes = existencias_antes.get(codigo)
-        existencia_esperada = (existencia_antes + float(it["cantidad"])
-                               if existencia_antes is not None else None)
-        existencia_despues, costo_despues, precio_despues = db_batch.get(codigo, (None, None, None))
-
+        existencia_esperada = calcular_existencia_esperada(it, existencia_antes)
+        existencia_despues, costo_despues, precio_despues = db_batch.get(
+            codigo_key, db_batch.get(codigo, (None, None, None))
+        )
 
         fallos = []
         if existencia_esperada is None:
             fallos.append("existencia ANTES no legible, no se pudo verificar el delta")
+        elif existencia_despues is None:
+            fallos.append("existencia DESPUÉS no legible en DB")
         elif abs(existencia_despues - existencia_esperada) > TOL_EXISTENCIA:
             fallos.append(f"existencia quedó en {existencia_despues}, esperaba {existencia_esperada}")
 
@@ -1467,13 +1765,15 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
             fallos.append(f"precio quedó en {precio_despues}, esperaba {it['precio']}")
 
         prefijo_alta = "[alta_producto] " if codigo in altas_resultado else ""
+        prefijo_ajuste = "[es_ajuste] " if it.get("es_ajuste") else ""
+        prefijo = prefijo_alta + prefijo_ajuste
         if fallos:
             todos_ok = False
-            detalle = prefijo_alta + "¡ALERTA! " + "; ".join(fallos)
+            detalle = prefijo + "¡ALERTA! " + "; ".join(fallos)
             log.error("Verificación %s: %s", codigo, detalle)
             resultados[codigo] = {"ok": False, "detalle": detalle}
         else:
-            detalle = (f"{prefijo_alta}VERIFICADO en DB: existencia={existencia_despues} "
+            detalle = (f"{prefijo}VERIFICADO en DB: existencia={existencia_despues} "
                       f"costo={costo_despues} precio={precio_despues}")
             log.info("Verificación %s: %s", codigo, detalle)
             resultados[codigo] = {"ok": True, "detalle": detalle}
@@ -1486,21 +1786,40 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 def _parse_items(spec):
-    """'COD:cant:costo:precio,COD2:...' -> list[dict]."""
+    """'COD:cant:costo:precio,COD2:...' -> list[dict].
+    Soporta sufijo '...' en la cantidad (ej. '01404:5...:0.50:1.00') o un 5º
+    campo opcional 'ajuste' ('01404:5:0.50:1.00:ajuste') para es_ajuste=True."""
     items = []
     for par in spec.split(","):
         partes = par.split(":")
-        if len(partes) != 4:
-            raise ValueError(f"Ítem inválido: {par!r} (formato codigo:cantidad:costo:precio)")
-        codigo, cantidad, costo, precio = partes
-        codigo = codigo.strip()
+        if len(partes) not in (4, 5):
+            raise ValueError(
+                f"Ítem inválido: {par!r} (formato codigo:cantidad[...]:costo:precio[:ajuste])"
+            )
+        codigo = partes[0].strip()
+        cant_raw = partes[1].strip()
+        costo = partes[2].strip()
+        precio = partes[3].strip()
+        es_ajuste = False
+        if cant_raw.endswith("..."):
+            es_ajuste = True
+            cant_raw = cant_raw[:-3].strip()
+        if len(partes) == 5:
+            flag = partes[4].strip().lower()
+            if flag in ("ajuste", "es_ajuste", "1", "true"):
+                es_ajuste = True
+            elif flag not in ("", "0", "false", "normal"):
+                raise ValueError(f"Flag es_ajuste inválido en {par!r}: {partes[4]!r}")
         if not codigo:
             raise ValueError(f"Ítem inválido: {par!r} (código vacío)")
+        if not cant_raw:
+            raise ValueError(f"Ítem inválido: {par!r} (cantidad vacía)")
         items.append({
             "codigo": codigo,
-            "cantidad": float(cantidad),
+            "cantidad": float(cant_raw),
             "costo": float(costo),
             "precio": float(precio),
+            "es_ajuste": es_ajuste,
         })
     return items
 
@@ -1521,7 +1840,7 @@ if __name__ == "__main__":
 
     if len(args) < 1 or "--items" not in _raw or "--doc" not in _raw:
         print("Uso: python flujo_compra_real.py <proveedor_codigo> "
-              "--items \"COD:cant:costo:precio,COD2:...\" --doc 123456 [--commit]")
+              "--items \"COD:cant[...]:costo:precio,COD2:...\" --doc 123456 [--commit]")
         sys.exit(1)
 
     proveedor_codigo = args[0]
@@ -1535,7 +1854,25 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        res = registrar_compra(proveedor_codigo, items, doc_numero, commit="--commit" in _raw)
+        try:
+            from safety_control import control_seguro
+        except Exception:
+            control_seguro = None
+        commit_flag = "--commit" in _raw
+        if control_seguro is not None:
+            modo = "COMMIT" if commit_flag else "PREVIEW"
+            with control_seguro(
+                f"COMPRA MANUAL ({modo}) — DOC {doc_numero}",
+                ocultar_scripts=["widget.pyw", "widget_recargo.pyw"],
+            ) as banner:
+                res = registrar_compra(
+                    proveedor_codigo, items, doc_numero,
+                    commit=commit_flag, banner=banner,
+                )
+        else:
+            res = registrar_compra(
+                proveedor_codigo, items, doc_numero, commit=commit_flag
+            )
         print("\n=== RESULTADO ===")
         for k, v in res.items():
             if k == "resultados":

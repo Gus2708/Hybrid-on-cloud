@@ -653,9 +653,12 @@ def ajustar_stock_lote(items_lote, commit=False):
     comportamiento es IDÉNTICO a un único documento (mismo caso validado en vivo).
 
     items_lote: list[dict] con claves:
-        "item_id" (int)  — id de ordenes_cambio_items (para el mapa de resultados)
-        "codigo"  (str)  — código del producto
-        "delta"   (float)— cambio RELATIVO de stock (target = existencia_DB + delta)
+        "item_id" (int|str) — id de ordenes_cambio_items (para el mapa de resultados)
+        "codigo"  (str)     — código del producto (o alias de búsqueda)
+        "delta"   (float)   — cambio RELATIVO de stock (target = existencia_DB + delta)
+        "target"  (float, opcional) — objetivo ABSOLUTO explícito; si viene,
+                              prevalece sobre existencia_DB + delta.
+        "codigo_esperado" (str, opcional) — código interno real cuando `codigo` es alias.
 
     Return: {
         "ok":     bool,   # True solo si TODOS los items de TODOS los documentos quedaron ok
@@ -710,12 +713,18 @@ def ajustar_stock_lote(items_lote, commit=False):
             return _lote_fallo_uniforme(items_lote, "carga/conteo", detalle)
         existencias_antes[it["item_id"]] = total_antes
 
-    targets = {it["item_id"]: existencias_antes[it["item_id"]] + float(it["delta"])
-               for it in items_lote}
+    targets = {
+        it["item_id"]: (
+            float(it["target"])
+            if it.get("target") is not None
+            else existencias_antes[it["item_id"]] + float(it["delta"])
+        )
+        for it in items_lote
+    }
     for it in items_lote:
         log.info("Lote: item_id=%s codigo=%s existencia_db=%s delta=%s target=%s",
                  it["item_id"], it["codigo"], existencias_antes[it["item_id"]],
-                 it["delta"], targets[it["item_id"]])
+                 it.get("delta"), targets[it["item_id"]])
 
     # 4) trocear en chunks de MAX_FILAS_LOTE, preservando el orden, y procesar
     #    los documentos EN SECUENCIA.

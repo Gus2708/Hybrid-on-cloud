@@ -108,7 +108,8 @@ ETAPAS_REINTENTABLES = ("abrir_hybrid", "navegacion", "carga_item", "precio_item
 # desastre que no existe. Lección de la compra 35 (2026-08-13): quedó marcada
 # 'error' con un aviso alarmante cuando en realidad sus 9 ítems estaban perfectos.
 ETAPAS_VERIFICACION_ILEGIBLE = ("verificacion_indisponible",
-                                "alta_producto:verificacion_indisponible")
+                                "alta_producto:verificacion_indisponible",
+                                "ajuste_inventario:verificacion_indisponible")
 
 
 def get_compras_pendientes():
@@ -132,23 +133,48 @@ def get_compras_pendientes():
         return []
 
 
+_AVISO_SIN_COL_ES_AJUSTE = False
+
+
 def get_items(compra_id):
     """Items de una compra, mapeados a la forma que espera
     flujo_compra_real.registrar_compra: {"codigo","cantidad","costo","precio",
-    "es_nuevo","referencia","descripcion"} (la tabla usa codigo_producto; el
-    flujo usa "codigo"). "es_nuevo"/"referencia" son opcionales en la tabla
-    (columnas todavía no migradas a la fecha de este cambio); se leen con
-    .get() defensivo, así que si no existen en compras_app_items simplemente
-    viajan como False/None y ningún ítem se trata como alta nueva."""
+    "es_nuevo","es_ajuste","referencia","descripcion"} (la tabla usa
+    codigo_producto; el flujo usa "codigo"). "es_nuevo"/"es_ajuste"/"referencia"
+    se leen con .get() defensivo: si es_ajuste=True, `cantidad` representa la
+    existencia final objetivo que debe quedar en HybridLite."""
+    global _AVISO_SIN_COL_ES_AJUSTE
+    select_full = "codigo_producto,descripcion,referencia,es_nuevo,es_ajuste,cantidad,costo,precio"
+    select_legacy = "codigo_producto,descripcion,referencia,es_nuevo,cantidad,costo,precio"
     try:
         path = (f"{TABLE_ITEMS}?compra_id=eq.{compra_id}"
-                f"&select=codigo_producto,descripcion,referencia,es_nuevo,cantidad,costo,precio"
+                f"&select={select_full}"
                 f"&order=id.asc")
         filas = lb.rest("GET", path) or []
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="ignore") if e.fp else ""
-        log.error("HTTP %s buscando items de compra %s: %s", e.code, compra_id, body[:200])
-        return []
+        if e.code == 400 and ("es_ajuste" in body or "42703" in body):
+            if not _AVISO_SIN_COL_ES_AJUSTE:
+                log.warning("Columna es_ajuste aún no existe en Supabase (migración 052 pendiente); "
+                            "consultando items sin es_ajuste.")
+                _AVISO_SIN_COL_ES_AJUSTE = True
+            try:
+                path_legacy = (f"{TABLE_ITEMS}?compra_id=eq.{compra_id}"
+                               f"&select={select_legacy}"
+                               f"&order=id.asc")
+                filas = lb.rest("GET", path_legacy) or []
+            except urllib.error.HTTPError as e2:
+                body2 = e2.read().decode(errors="ignore") if e2.fp else ""
+                log.error("HTTP %s buscando items de compra %s (fallback sin es_ajuste): %s",
+                          e2.code, compra_id, body2[:200])
+                return []
+            except Exception as e2:
+                log.error("Error buscando items de compra %s (fallback sin es_ajuste): %r",
+                          compra_id, e2)
+                return []
+        else:
+            log.error("HTTP %s buscando items de compra %s: %s", e.code, compra_id, body[:200])
+            return []
     except Exception as e:
         log.error("Error buscando items de compra %s: %r", compra_id, e)
         return []
@@ -160,6 +186,7 @@ def get_items(compra_id):
             "costo": float(fila["costo"]),
             "precio": float(fila["precio"]),
             "es_nuevo": bool(fila.get("es_nuevo")),
+            "es_ajuste": bool(fila.get("es_ajuste")),
             "referencia": fila.get("referencia"),
             "descripcion": fila.get("descripcion"),
         }
@@ -219,6 +246,12 @@ def _politica_resultado(res, intentos):
         return final, res["detalle"]
     if etapa in ETAPAS_VERIFICACION_ILEGIBLE:
         return "error", res["detalle"]
+    if isinstance(etapa, str) and etapa.startswith("ajuste_inventario:"):
+        resultado = (f"{res['detalle']} | ATENCIÓN: la COMPRA YA FUE TOTALIZADA en "
+                     f"HybridLite, pero falló el ajuste fijo de existencia (es_ajuste); "
+                     f"NO reencolar la compra (riesgo de compra doble). Verificar y "
+                     f"ajustar la existencia manualmente en HybridLite.")
+        return "error", resultado
     resultado = (f"{res['detalle']} | ATENCIÓN: la compra pudo quedar registrada a "
                  f"medias en HybridLite; verificar ANTES de reencolar (riesgo de "
                  f"compra doble).")
@@ -271,10 +304,11 @@ def procesar_compra(compra, n=1, total=1):
     txt_banner = f"REGISTRANDO COMPRA {n}/{total} — OC-{cid} ({proveedor_nombre or proveedor_codigo})"
     try:
         if control_seguro is not None:
-            with control_seguro(txt_banner, ocultar_scripts=["widget.pyw", "widget_recargo.pyw"]):
+            with control_seguro(txt_banner, ocultar_scripts=["widget.pyw", "widget_recargo.pyw"]) as banner:
                 res = flujo_compra_real.registrar_compra(
                     proveedor_codigo, items, doc_numero,
                     commit=lb.check_hybrid_write_enabled(), proveedor_nombre=proveedor_nombre,
+                    banner=banner,
                 )
         else:
             res = flujo_compra_real.registrar_compra(
@@ -305,6 +339,20 @@ def procesar_pendientes(compras):
     global _AVISO_SIN_SAFETY_CONTROL
     if not compras:
         return
+
+    # ── GUARDRAIL PRE-VUELO: verificar que HybridLite esté libre de bloqueos ────
+    try:
+        import hybrid_health as hh
+        listo, motivo, bloqueos = hh.verificar_hybrid_listo()
+        if not listo:
+            log.warning(
+                "Compras pospuestas: HybridLite no está listo para automatización (%s). "
+                "Se pospone la pasada sin incrementar reintentos ni tomar mouse/teclado.",
+                motivo,
+            )
+            return
+    except Exception as e:
+        log.warning("No pude ejecutar el pre-flight de ventanas en hybrid_health (sigo igual): %r", e)
 
     if control_seguro is None and not _AVISO_SIN_SAFETY_CONTROL:
         log.warning("safety_control no disponible: procesando SIN overlay/F12/BlockInput "
