@@ -98,7 +98,15 @@ MAX_INTENTOS = 3
 # de _politica_resultado por descarte (no matchean ETAPAS_REINTENTABLES).
 ETAPAS_REINTENTABLES = ("abrir_hybrid", "navegacion", "carga_item", "precio_item",
                         "alta_producto:abrir_ficha", "alta_producto:campos",
-                        "alta_producto:costos_precios")
+                        "alta_producto:costos_precios",
+                        # No se pudo confirmar el origen de la compra: se corta ANTES de
+                        # tocar Hybrid, así que reintentar es seguro (ver es_compra_de_factura).
+                        "origen_desconocido")
+
+# Identidad estricta (solo compras de factura): el Guardar del alta ya se pulsó y la
+# relectura fresca no coincidió. El producto pudo quedar creado: no se reintenta, no se
+# recrea y no se sigue con la compra (flujo_compra_real ya cancela antes de comprar).
+ETAPA_ALTA_ESTRICTA_DISCREPANTE = "alta_producto:verificacion_db"
 
 # Etapas donde lo que falló fue LEER la DBISAM para confirmar, no la escritura
 # (flujo_compra_real.VerificacionIndisponible: la unidad H: se cae de a ratos).
@@ -109,6 +117,41 @@ ETAPAS_REINTENTABLES = ("abrir_hybrid", "navegacion", "carga_item", "precio_item
 # 'error' con un aviso alarmante cuando en realidad sus 9 ítems estaban perfectos.
 ETAPAS_VERIFICACION_ILEGIBLE = ("verificacion_indisponible",
                                 "alta_producto:verificacion_indisponible")
+
+
+class OrigenDesconocido(Exception):
+    """No se pudo confirmar si la compra viene de una factura. Nunca equivale a 'manual'."""
+
+
+def es_compra_de_factura(compra_id):
+    """True/False según el RPC de solo servicio public.es_compra_de_factura(p_compra_id),
+    que responde por el vínculo canónico facturas_proveedores_compras (no se lee esa tabla
+    ni se infiere el origen de campos editables como título o nota).
+
+    FAIL-CLOSED: cualquier cosa distinta de un JSON booleano exacto (id inválido, HTTP de
+    error incluyendo 401/403/404/500, 22023/P0002, timeout, red, JSON malformado, null,
+    string o número) lanza OrigenDesconocido; el llamador debe cortar antes de tocar
+    Hybrid y jamás degradar a ejecución manual. El mensaje lleva solo la categoría del
+    fallo (nunca el cuerpo ni el texto crudo del error).
+
+    Usa el transporte existente lb.rest (timeout acotado de 30 s, mismas credenciales de
+    servidor) con expected_status=200: solo HTTP 200 literal más JSON booleano exacto
+    cuentan como respuesta válida (un 201/202/204 con cuerpo true/false se rechaza antes
+    de leer el cuerpo)."""
+    if type(compra_id) is not int or compra_id < 1:
+        raise OrigenDesconocido("id de compra inválido")
+    try:
+        respuesta = lb.rest("POST", "rpc/es_compra_de_factura", body={"p_compra_id": compra_id},
+                            expected_status=200)
+    except urllib.error.HTTPError as e:
+        raise OrigenDesconocido(f"HTTP {e.code}") from None
+    except lb.RestStatusInesperado as e:
+        raise OrigenDesconocido(f"HTTP {e.status} en lugar de 200") from None
+    except Exception as e:
+        raise OrigenDesconocido(f"sin respuesta válida ({type(e).__name__})") from None
+    if type(respuesta) is not bool:
+        raise OrigenDesconocido("la respuesta no es un booleano")
+    return respuesta
 
 
 def get_compras_pendientes():
@@ -201,14 +244,20 @@ def recuperar_huerfanos():
 
 
 # ─── Política de reintentos / traducción resultado -> estado ──────────────────
-def _politica_resultado(res, intentos):
+def _politica_resultado(res, intentos, estricto=False):
     """Traduce un resultado {"ok","etapa","detalle",...} de
     flujo_compra_real.registrar_compra a (backend_status, backend_resultado),
     misma política F5 de listener_writeback: commit real -> 'completado'; ok
     pero sin commit -> preview, sigue 'pendiente'; fallo en etapa reintentable
     -> 'pendiente'/'error' según MAX_INTENTOS; verificación ilegible ->
     'error' con el aviso de que SÍ quedó registrada; fallo en etapa ambigua ->
-    'error' inmediato."""
+    'error' inmediato.
+
+    estricto=True (compra de factura con identidad estricta): un alta guardada cuya
+    relectura fresca no coincide ('alta_producto:verificacion_db') es 'error' inmediato,
+    conserva el detalle original y avisa de NO reintentar ni recrear; no se le pega el
+    aviso de 'compra doble', porque la compra no llegó a cargarse. El resto de las
+    etapas siguen exactamente la política de siempre."""
     if res["ok"] and lb.check_hybrid_write_enabled() and res.get("etapa") == "commit":
         return "completado", res["detalle"]
     if res["ok"]:
@@ -219,7 +268,12 @@ def _politica_resultado(res, intentos):
         return final, res["detalle"]
     if etapa in ETAPAS_VERIFICACION_ILEGIBLE:
         return "error", res["detalle"]
-    resultado = (f"{res['detalle']} | ATENCIÓN: la compra pudo quedar registrada a "
+    if estricto and etapa == ETAPA_ALTA_ESTRICTA_DISCREPANTE:
+        return "error", (f"{res['detalle']} | ATENCIÓN (identidad estricta): el alta del "
+                         f"producto pudo quedar guardada; NO reintentar ni recrear. Verificar "
+                         f"el producto en HybridLite y cerrar la solicitud a mano antes de "
+                         f"reencolar.")
+    resultado =(f"{res['detalle']} | ATENCIÓN: la compra pudo quedar registrada a "
                  f"medias en HybridLite; verificar ANTES de reencolar (riesgo de "
                  f"compra doble).")
     return "error", resultado
@@ -268,23 +322,40 @@ def procesar_compra(compra, n=1, total=1):
     log.info("Procesando compra %s: proveedor=%s (%s) %s item(s), doc_numero=%s (%s)",
              cid, proveedor_codigo, proveedor_nombre, len(items), doc_numero, origen_doc_numero)
 
-    txt_banner = f"REGISTRANDO COMPRA {n}/{total} — OC-{cid} ({proveedor_nombre or proveedor_codigo})"
+    # Origen canónico ANTES de cualquier efecto sobre Hybrid: una compra de factura usa la
+    # identidad estricta (único opt-in de registrar_compra); una manual conserva EXACTAMENTE
+    # la llamada de siempre. Si el origen no se puede confirmar, se corta aquí: nunca se
+    # degrada a manual.
+    es_factura, res = False, None
     try:
-        if control_seguro is not None:
-            with control_seguro(txt_banner, ocultar_scripts=["widget.pyw", "widget_recargo.pyw"]):
+        es_factura = es_compra_de_factura(cid)
+    except OrigenDesconocido as e:
+        log.error("Compra %s: origen no confirmado (%s); no se toca Hybrid.", cid, e)
+        res = {"ok": False, "etapa": "origen_desconocido",
+               "detalle": f"No se pudo confirmar el origen de la compra ({e}); no se tocó "
+                          f"HybridLite (fail-closed, no se ejecuta como manual)."}
+
+    if res is None:
+        kwargs = {"identidad_estricta": True} if es_factura else {}
+        txt_banner = f"REGISTRANDO COMPRA {n}/{total} — OC-{cid} ({proveedor_nombre or proveedor_codigo})"
+        try:
+            if control_seguro is not None:
+                with control_seguro(txt_banner, ocultar_scripts=["widget.pyw", "widget_recargo.pyw"]):
+                    res = flujo_compra_real.registrar_compra(
+                        proveedor_codigo, items, doc_numero,
+                        commit=lb.check_hybrid_write_enabled(), proveedor_nombre=proveedor_nombre,
+                        **kwargs,
+                    )
+            else:
                 res = flujo_compra_real.registrar_compra(
                     proveedor_codigo, items, doc_numero,
                     commit=lb.check_hybrid_write_enabled(), proveedor_nombre=proveedor_nombre,
+                    **kwargs,
                 )
-        else:
-            res = flujo_compra_real.registrar_compra(
-                proveedor_codigo, items, doc_numero,
-                commit=lb.check_hybrid_write_enabled(), proveedor_nombre=proveedor_nombre,
-            )
-    except Exception as e:
-        res = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
+        except Exception as e:
+            res = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
 
-    status_final, resultado_final = _politica_resultado(res, intentos)
+    status_final, resultado_final = _politica_resultado(res, intentos, estricto=es_factura)
     if status_final == "completado":
         update_compra(cid, backend_status="completado", backend_resultado=resultado_final,
                       backend_aplicado_en=datetime.datetime.now(datetime.timezone.utc).isoformat())

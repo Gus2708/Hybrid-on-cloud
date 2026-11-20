@@ -99,6 +99,7 @@ import flujo_stock_real as fsr                # _cerrar_ficha_si_abierta (modelo
 import hybrid_price_writer as hpw             # _db_precio_usd, _db_costo_usd
 import read_db_existencia as dbex             # existencia() de verificación
 import colisiones                             # clave de búsqueda segura (código vs referencia)
+import invoice_product_identity as ipi        # identidad estricta de altas de factura (opt-in)
 import realinput as ri
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -542,12 +543,30 @@ def _guardar_ficha_alta(cerrar_ficha=True):
 
 
 
-def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False, cerrar_ficha=True):
+def _alta_campo_distinto(campo):
+    """Falla de campo del alta ESTRICTA: descarta la Ficha sin guardar. No muestra
+    valores (son datos de la factura), solo el nombre del campo."""
+    _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))
+    return {"ok": False, "etapa": "campos",
+            "detalle": f"Identidad estricta: el campo {campo} no quedó en pantalla igual al "
+                       f"valor esperado de la factura (valores omitidos). Nada se guardó."}
+
+
+def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False, cerrar_ficha=True,
+                   identidad_estricta=False):
     """Da de alta un producto NUEVO en la Ficha de Inventario, para ítems de
     compra con es_nuevo=True. Return: {"ok": bool, "etapa": str, "detalle": str}.
 
     cerrar_ficha: si es False, deja la Ficha de Inventario abierta lista para
     el próximo ítem nuevo (evita reabrir la ventana desde el menú para cada ítem).
+
+    identidad_estricta (opt-in, ver README_invoice_product_identity.md): código,
+    referencia y descripción se validan sin normalizar (invoice_product_identity),
+    la referencia deja de ser solo un aviso (control ausente o texto distinto = no
+    se guarda) y, tras guardar, el catálogo se relee FRESCO con reintentos acotados
+    para comprobar que lo persistido es exactamente lo esperado. Nunca se vuelve a
+    guardar ni a crear ante una lectura incierta. Sin el flag el comportamiento es el
+    de siempre.
 
     Etapas de fallo:
       "abrir_ficha"  -- no se pudo abrir/localizar la Ficha (reintentable, nada tocado)
@@ -560,6 +579,13 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False,
 
     Etapas de éxito: "preview" (verificado en pantalla, NO guardado) | "commit"
     (guardado y VERIFICADO contra DBISAM)."""
+    esperada = None
+    if identidad_estricta:
+        try:
+            esperada = ipi.validar_identidad(codigo, referencia, descripcion)
+        except ipi.IdentidadInvalida as e:
+            return {"ok": False, "etapa": "campos",
+                    "detalle": f"Identidad estricta: valor no soportado ({e}) Nada se tocó."}
     codigo = (codigo or "").strip()
     descripcion = (descripcion or "").strip()
     referencia = (referencia or "").strip() if referencia else ""
@@ -590,12 +616,28 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False,
 
     codigo_ui = _escribir_campo_ficha(campos["codigo"], codigo, lento=True)   # type_code, como la grilla
     if codigo_ui != codigo:
+        if identidad_estricta:
+            return _alta_campo_distinto("codigo")
         _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))
         return {"ok": False, "etapa": "campos",
                 "detalle": f"El código quedó en pantalla como {codigo_ui!r}, no {codigo!r}. "
                            f"Nada se tocó."}
 
-    if referencia and campos["referencia"] is not None:
+    if identidad_estricta:
+        # La referencia es identidad: sin control para escribirla/leerla no se puede
+        # comprobar nada (tampoco que quede vacía), así que no se sigue.
+        if campos["referencia"] is None:
+            _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))
+            return {"ok": False, "etapa": "campos",
+                    "detalle": "Identidad estricta: no pude localizar el campo Referencia de la "
+                               "Ficha, así que no se puede verificar. Nada se guardó."}
+        if referencia:
+            referencia_ui = _escribir_campo_ficha(campos["referencia"], referencia, lento=False)
+        else:
+            referencia_ui = campos["referencia"].window_text()
+        if referencia_ui != referencia:
+            return _alta_campo_distinto("referencia")
+    elif referencia and campos["referencia"] is not None:
         referencia_ui = _escribir_campo_ficha(campos["referencia"], referencia, lento=False)
         if referencia_ui != referencia:
             log.warning("La referencia quedó en pantalla como %r, no %r (no bloqueante).",
@@ -603,6 +645,8 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False,
 
     descripcion_ui = _escribir_campo_ficha(campos["descripcion"], descripcion, lento=False)
     if descripcion_ui != descripcion:
+        if identidad_estricta:
+            return _alta_campo_distinto("descripcion")
         _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))
         return {"ok": False, "etapa": "campos",
                 "detalle": f"La descripción quedó en pantalla como {descripcion_ui!r}, no "
@@ -632,10 +676,13 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False,
         _cancelar_ficha_alta(fp._find_hwnd(fp.FICHA_CLASS))   # descarta la Ficha, SIN guardar
         if cerrar_ficha:
             fsr._cerrar_ficha_si_abierta()
-        return {"ok": True, "etapa": "preview",
-                "detalle": f"Alta de {codigo} ({descripcion}) verificada en pantalla "
+        detalle_preview = (f"Alta de {codigo} ({descripcion}) verificada en pantalla "
                            f"(costo={costo}, precio={precio}) y DESCARTADA (sin --commit; "
-                           f"el producto NO quedó creado, así que este ítem no se compra en preview)."}
+                           f"el producto NO quedó creado, así que este ítem no se compra en preview).")
+        if identidad_estricta:
+            detalle_preview += (" Identidad estricta: código, referencia y descripción "
+                                "verificados solo en pantalla; sin prueba de persistencia en DB.")
+        return {"ok": True, "etapa": "preview", "detalle": detalle_preview}
 
     # COMMIT: Aceptar+Salir de Costos y Precios, Guardar la Ficha, verificar en DBISAM
     if not fpr._click_boton_dialogo("Aceptar"):
@@ -651,9 +698,11 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False,
     try:
         existencia_db, costo_db, precio_db = _leer_item_db(codigo)
     except VerificacionIndisponible as e:
+        aviso = (" La identidad (código/referencia/descripción) no se verificó: identidad "
+                 "no verificada." if identidad_estricta else "")
         return {"ok": False, "etapa": "verificacion_indisponible",
                 "detalle": f"Alta de {codigo}: el Guardar ya se pulsó (el producto pudo quedar "
-                           f"creado) pero no se pudo confirmar contra la DBISAM: {e}."}
+                           f"creado) pero no se pudo confirmar contra la DBISAM: {e}.{aviso}"}
     log.info("Verificación DB del alta de %s: existencia=%s costo=%s precio=%s",
              codigo, existencia_db, costo_db, precio_db)
 
@@ -665,9 +714,38 @@ def crear_producto(codigo, descripcion, referencia, costo, precio, commit=False,
     if precio_db is None or abs(precio_db - float(precio)) > TOL_ALTA:
         fallos.append(f"precio en DB quedó en {precio_db}, esperaba {precio}")
 
+    identidad_ilegible = False
+    if identidad_estricta:
+        # Relectura FRESCA (sin caché) y acotada: solo lee, nunca guarda ni recrea.
+        ver = ipi.verificar_con_reintentos(
+            esperada, colisiones.identidad, REINTENTOS_LECTURA_DB, ESPERA_LECTURA_DB,
+            dormir=lambda s: time.sleep(s),
+            errores_lectura=(OSError, colisiones.CatalogoIlegible))
+        if ver.estado == "ilegible":
+            identidad_ilegible = True
+        elif ver.estado == "ausente":
+            fallos.append(f"identidad: el producto no apareció en el catálogo tras "
+                          f"{ver.lecturas} lectura(s) frescas")
+        elif ver.estado == "discrepa":
+            fallos.append("identidad: no coinciden en el catálogo los campos "
+                          + ", ".join(ver.campos) + " (valores omitidos)")
+
     if fallos:
+        aviso = " Identidad no verificada (catálogo ilegible)." if identidad_ilegible else ""
         return {"ok": False, "etapa": "verificacion_db",
-                "detalle": f"¡ALERTA! Alta de {codigo}: " + "; ".join(fallos)}
+                "detalle": f"¡ALERTA! Alta de {codigo}: " + "; ".join(fallos) + aviso}
+    if identidad_ilegible:
+        return {"ok": False, "etapa": "verificacion_indisponible",
+                "detalle": f"Alta de {codigo}: el Guardar ya se pulsó (el producto pudo quedar "
+                           f"creado) pero el catálogo no se pudo leer para confirmar su identidad "
+                           f"(código/referencia/descripción): identidad no verificada. No se "
+                           f"vuelve a guardar."}
+    if identidad_estricta:
+        return {"ok": True, "etapa": "commit",
+                "detalle": f"Producto {codigo} ({descripcion}) dado de alta y VERIFICADO en DB: "
+                           f"existencia={existencia_db} costo={costo_db} precio={precio_db}. "
+                           f"Identidad (código/referencia/descripción) verificada en el catálogo "
+                           f"con lectura fresca."}
     return {"ok": True, "etapa": "commit",
             "detalle": f"Producto {codigo} ({descripcion}) dado de alta y VERIFICADO en DB: "
                        f"existencia={existencia_db} costo={costo_db} precio={precio_db}."}
@@ -1212,12 +1290,19 @@ def _totalizar_compra(hcom, doc_numero):
 
 
 # ── orquestador ──────────────────────────────────────────────────────────────
-def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedor_nombre=None):
+def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedor_nombre=None,
+                     identidad_estricta=False):
     """items: list[dict] {"codigo": str, "cantidad": float, "costo": float, "precio": float,
     "es_nuevo": bool (opcional), "referencia": str|None (opcional), "descripcion": str
     (opcional, solo requerida si es_nuevo)}.
     proveedor_nombre: opcional; si viene, se verifica contra el campo del header.
     doc_numero: str numérico para los dos campos de Total Operación (relleno).
+    identidad_estricta (opt-in, ver README_invoice_product_identity.md): para los ítems
+    es_nuevo valida código/referencia/descripción sin normalizar, verifica la identidad de
+    un código que YA existe en el maestro ANTES de tratarlo como "ya creado" (si no
+    coincide, falla cerrado y no se sobrescribe nada) y da de alta con lectura fresca
+    de verificación (ver crear_producto). Todo eso corre ANTES de abrir Hybrid. Sin el
+    flag el comportamiento es el de siempre.
     Return: {"ok": bool, "etapa": str, "detalle": str,
              "resultados": dict[str_codigo, {"ok","detalle"}],  # verificación por item (solo commit)
              ...}
@@ -1265,6 +1350,41 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
                     "detalle": f"Ítem {it['codigo']} viene con es_nuevo=True pero sin "
                                f"descripción. Nada se tocó."}
 
+    # IDENTIDAD ESTRICTA (opt-in): validación y verificación de lo que ya existe, todo de
+    # solo lectura y ANTES de abrir Hybrid o crear nada (todo-o-nada: un conflicto en
+    # cualquier ítem nuevo evita todas las altas).
+    estado_nuevos = {}
+    if identidad_estricta:
+        esperadas = {}
+        for it in (i for i in items if i.get("es_nuevo")):
+            try:
+                esperadas[it["codigo"]] = ipi.validar_identidad(
+                    it["codigo"], it.get("referencia"), it.get("descripcion"))
+            except ipi.IdentidadInvalida as e:
+                return {"ok": False, "etapa": "navegacion",
+                        "detalle": f"Identidad estricta: valor no soportado en un ítem nuevo "
+                                   f"({e}) Nada se tocó."}
+        if esperadas:
+            try:
+                catalogo = colisiones.catalogo_fresco()
+            except colisiones.CatalogoIlegible as e:
+                return {"ok": False, "etapa": "navegacion",
+                        "detalle": f"Identidad estricta: no pude leer el catálogo para verificar "
+                                   f"los productos nuevos: {e}. Nada se tocó (fail-closed)."}
+            conflictos = []
+            for codigo, esperada in esperadas.items():
+                estado, campos = ipi.clasificar_existencia(esperada, catalogo)
+                estado_nuevos[codigo] = estado
+                if estado == "discrepa":
+                    conflictos.append(f"{codigo}: ya existe y no coincide en "
+                                      f"{', '.join(campos)}")
+            if conflictos:
+                return {"ok": False, "etapa": "navegacion",
+                        "detalle": f"Identidad estricta: {len(conflictos)} código(s) nuevo(s) ya "
+                                   f"existen con otra identidad (valores omitidos): "
+                                   f"{' | '.join(conflictos)}. Compra CANCELADA. Nada se tocó; "
+                                   f"no se sobrescribe ningún producto."}
+
     # asegurar que Hybrid esté abierto y logueado (lo lanza si está cerrado)
     import abrir_hybrid
     ok, msg = abrir_hybrid.asegurar_hybrid()
@@ -1285,7 +1405,10 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
         # (p.ej. una pasada anterior creó el alta pero falló al totalizar la
         # compra), NO re-crearlo (duplicaría/fallaría) -> se compra como
         # existente. Se detecta por _db_precio_usd (None = no existe).
-        if hpw._db_precio_usd(codigo) is not None:
+        # Estricto: "ya existe" solo cuenta si su identidad se verificó arriba (coincide).
+        ya_existe = (estado_nuevos[codigo] == "coincide" if identidad_estricta
+                     else hpw._db_precio_usd(codigo) is not None)
+        if ya_existe:
             log.info("Ítem %s viene es_nuevo pero YA existe en el maestro; se salta el "
                      "alta y se compra como existente.", codigo)
             it["es_nuevo"] = False
@@ -1295,6 +1418,7 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
             codigo, it.get("descripcion"), it.get("referencia"),
             it["costo"], it["precio"], commit=commit,
             cerrar_ficha=es_ultima,
+            identidad_estricta=identidad_estricta,
         )
         altas_resultado[codigo] = res_alta
         if not res_alta["ok"]:
@@ -1407,11 +1531,14 @@ def registrar_compra(proveedor_codigo, items, doc_numero, commit=False, proveedo
             if it.get("es_nuevo"):
                 continue   # ya está en altas_resultado (etapa "preview")
             resultados[it["codigo"]] = {"ok": True, "detalle": "Verificado en pantalla y descartado."}
-        return {"ok": True, "etapa": "preview",
-                "detalle": f"Preview de {len(items)} ítem(s) verificado(s) en pantalla y "
+        detalle_preview = (f"Preview de {len(items)} ítem(s) verificado(s) en pantalla y "
                            f"DESCARTADO (sin --commit; documento cancelado completo). "
                            f"Los ítems es_nuevo NO se cargaron en la grilla (ver asimetría "
-                           f"preview/commit en el docstring).",
+                           f"preview/commit en el docstring).")
+        if identidad_estricta:
+            detalle_preview += (" Identidad estricta: la identidad de los productos nuevos se "
+                                "verificó solo en pantalla; sin prueba de persistencia en DB.")
+        return {"ok": True, "etapa": "preview", "detalle": detalle_preview,
                 "resultados": resultados}
 
     # COMMIT: Totalizar (etapa AMBIGUA si falla -- no sabemos si el documento

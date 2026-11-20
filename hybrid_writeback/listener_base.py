@@ -144,7 +144,19 @@ if HYBRID_WRITE_WINDOW_RAW:
 
 
 # ─── Helpers REST ─────────────────────────────────────────────────────────────
-def rest(method, path, body=None, extra_headers=None):
+class RestStatusInesperado(Exception):
+    """La respuesta fue 2xx pero no el estado exacto que el llamador exigió
+    (rest(..., expected_status=N)). Lleva solo el código: nunca cuerpo ni credenciales."""
+
+    def __init__(self, status):
+        super().__init__(f"HTTP {status} inesperado")
+        self.status = status
+
+
+def rest(method, path, body=None, extra_headers=None, expected_status=None):
+    """Llamada REST a Supabase. Sin `expected_status` (default) acepta cualquier 2xx, como
+    siempre. Con `expected_status=N` exige ese estado EXACTO y lanza RestStatusInesperado
+    antes de leer o parsear el cuerpo (un 201/202/204 con cuerpo válido no cuenta)."""
     url = f"{SUPABASE_REST_URL.rstrip('/')}/rest/v1/{path}"
     headers = dict(HEADERS)
     if extra_headers:
@@ -152,6 +164,8 @@ def rest(method, path, body=None, extra_headers=None):
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     with urllib.request.urlopen(req, timeout=30) as resp:
+        if expected_status is not None and resp.getcode() != expected_status:
+            raise RestStatusInesperado(resp.getcode())
         raw = resp.read().decode("utf-8")
         return json.loads(raw) if raw else None
 

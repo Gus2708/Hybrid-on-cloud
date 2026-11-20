@@ -68,9 +68,12 @@ class CatalogoIlegible(Exception):
     tratarlo como fail-closed: abortar sin teclear."""
 
 
-def _catalogo():
+def _catalogo(fresco=False, referencias_literales=False):
     """{"por_ref": {referencia: [codigos]}, "ref_de": {codigo: referencia},
     "desc_de": {codigo: descripcion}} desde TInventario.dat, cacheado por mtime.
+
+    `fresco=True` ignora el caché y vuelve a leer el archivo (prueba de lo recién
+    guardado: un mtime sin cambios no demuestra que el catálogo sea el actual).
 
     Lanza CatalogoIlegible si no se puede leer: es FAIL-CLOSED a propósito —
     devolver "no hay colisión" cuando en realidad no pudimos mirar es
@@ -80,7 +83,7 @@ def _catalogo():
     except OSError as e:
         raise CatalogoIlegible(f"No pude acceder a TInventario.dat: {e}") from e
 
-    if _CACHE["mtime"] == mtime and _CACHE["datos"] is not None:
+    if not fresco and not referencias_literales and _CACHE["mtime"] == mtime and _CACHE["datos"] is not None:
         return _CACHE["datos"]
 
     try:
@@ -97,7 +100,10 @@ def _catalogo():
             if not codigo or codigo == "Fail":
                 continue
             crudo = row[i_ref]
-            referencia = str(crudo).strip() if crudo and str(crudo).strip() != "Fail" else ""
+            if referencias_literales:
+                referencia = crudo if isinstance(crudo, str) else None
+            else:
+                referencia = str(crudo).strip() if crudo and str(crudo).strip() != "Fail" else ""
             ref_de[codigo] = referencia
             desc_de[codigo] = str(row[i_desc]).strip()
             if referencia:
@@ -109,10 +115,29 @@ def _catalogo():
         raise CatalogoIlegible("TInventario.dat se leyó vacío (0 productos).")
 
     datos = {"por_ref": dict(por_ref), "ref_de": ref_de, "desc_de": desc_de}
-    _CACHE.update(mtime=mtime, datos=datos)
+    if not referencias_literales:
+        _CACHE.update(mtime=mtime, datos=datos)
     log.info("Catálogo leído para colisiones: %d productos, %d referencias.",
              len(ref_de), len(por_ref))
     return datos
+
+
+def catalogo_fresco():
+    """Catálogo releído del disco, sin caché (ver _catalogo(fresco=True))."""
+    # Strict comparisons must not turn an unreadable reference into a verified empty value.
+    return _catalogo(fresco=True, referencias_literales=True)
+
+
+def identidad(codigo, fresco=True):
+    """{"codigo", "referencia", "descripcion"} de `codigo` tal como lo lee el catálogo,
+    o None si no existe. Por defecto lee fresco: es la lectura de verificación del
+    alta estricta de productos de factura. Lanza CatalogoIlegible si no se puede leer."""
+    cat = catalogo_fresco() if fresco else _catalogo()
+    codigo = str(codigo).strip()
+    if codigo not in cat["ref_de"]:
+        return None
+    return {"codigo": codigo, "referencia": cat["ref_de"][codigo],
+            "descripcion": cat["desc_de"][codigo]}
 
 
 def interceptores(codigo, cat=None):
