@@ -33,6 +33,7 @@ Uso:
     python listener_directorio.py            # bucle continuo
     python listener_directorio.py --once     # una sola pasada (para pruebas)
 """
+from contextlib import nullcontext
 import sys
 import datetime
 import urllib.error
@@ -40,6 +41,11 @@ import urllib.error
 import listener_base as lb
 
 import flujo_directorio_real
+
+try:
+    import abrir_hybrid
+except Exception:  # pragma: no cover
+    abrir_hybrid = None
 
 try:
     from safety_control import control_seguro
@@ -70,7 +76,7 @@ def _get_tabla(tipo):
         path = (f"{tabla}?backend_status=eq.pendiente"
                 f"&status=eq.emitido"
                 f"&creado_por=not.is.null"
-                f"&select=id,nombre,rif,backend_intentos"
+                f"&select=id,creado_por,nombre,rif,backend_intentos"
                 f"&order=id.asc&limit=10")
         filas = lb.rest("GET", path) or []
     except urllib.error.HTTPError as e:
@@ -151,9 +157,11 @@ def procesar_registro(item):
         return
 
     log.info("Procesando %s %s: nombre=%r rif=%r", tipo, rid, nombre, rif)
+    sesion_ctx = abrir_hybrid.sesion_para(item.get("creado_por")) if abrir_hybrid is not None else nullcontext()
     try:
-        res = flujo_directorio_real.registrar(
-            tipo, nombre, rif, commit=lb.check_hybrid_write_enabled())
+        with sesion_ctx:
+            res = flujo_directorio_real.registrar(
+                tipo, nombre, rif, commit=lb.check_hybrid_write_enabled())
     except Exception as e:
         res = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}", "codigo": None}
 

@@ -8,6 +8,11 @@ import urllib.parse
 from datetime import date, datetime
 
 try:
+    import bot_writeback_registry as bwr
+except Exception:  # pragma: no cover
+    bwr = None
+
+try:
     from config import SUPABASE_REST_URL, SUPABASE_ANON_KEY
 except ImportError:
     SUPABASE_REST_URL = ""
@@ -152,6 +157,19 @@ def insert_child_items(items) -> bool:
         print(f"[SYNC AJUSTES] Error insertando items: {e}")
         return False
 
+def _clean_machine(row, idx_machine: int) -> str:
+    """Normaliza THT_MACHINENAME descartando None, vacíos y el marcador DBISAM 'Fail'."""
+    if idx_machine == -1 or idx_machine >= len(row):
+        return ""
+    val = row[idx_machine]
+    if val is None:
+        return ""
+    text = str(val).strip()
+    if not text or text.lower() == "fail":
+        return ""
+    return text
+
+
 def sync_manual_adjustments(base_db_dir, synced_ids, desc_mapping):
     """Extrae ajustes manuales locales de DBISAM y los sincroniza a Supabase."""
     import pydbisam
@@ -201,6 +219,7 @@ def sync_manual_adjustments(base_db_dir, synced_ids, desc_mapping):
     idx_hdr_fecha = col_names_hdr.index('THT_FECHAEMISION')
     idx_hdr_classify = col_names_hdr.index('THT_DESCRIPCLASIFY')
     idx_hdr_hora = col_names_hdr.index('THT_HORA')
+    idx_hdr_machine = col_names_hdr.index('THT_MACHINENAME') if 'THT_MACHINENAME' in col_names_hdr else -1
 
     count_synced = 0
     total_rows = db_hdr._total_rows + db_hdr._deleted_rows
@@ -219,6 +238,12 @@ def sync_manual_adjustments(base_db_dir, synced_ids, desc_mapping):
         if not details:
             continue # Sin items a ajustar
 
+        machine_val = _clean_machine(row, idx_hdr_machine)
+        if bwr is not None and bwr.es_ajuste_del_bot(local_id, machine_val, details):
+            print(f"  -> Omitiendo ajuste local ID {local_id}: ya aplicado desde la app (write-back).")
+            synced_ids.add(("Inv", local_id))
+            continue
+
         # Extraer hora precisa desde milisegundos binarios de DBISAM
         col_obj = db_hdr._columns[idx_hdr_hora]
         row_offset = db_hdr._data_offset + (i * db_hdr._row_size)
@@ -232,8 +257,9 @@ def sync_manual_adjustments(base_db_dir, synced_ids, desc_mapping):
 
         classify_val = str(row[idx_hdr_classify]).strip()
         doc_num = str(row[idx_hdr_doc]).strip().zfill(8)
+        pc_tag = f" - [PC: {machine_val}]" if machine_val else ""
 
-        nota = f"[Local Inv ID: {local_id}] - Ajuste #{doc_num}: {classify_val}"
+        nota = f"[Local Inv ID: {local_id}]{pc_tag} - Ajuste #{doc_num}: {classify_val}"
 
         parent_payload = {
             "nota": nota,
@@ -315,6 +341,7 @@ def sync_purchases(base_db_dir, synced_ids, desc_mapping):
     idx_hdr_rif = col_names_hdr.index('THT_RIFCLIENTE')
     idx_hdr_prov_name = col_names_hdr.index('THT_PERSONACONTACTO')
     idx_hdr_hora = col_names_hdr.index('THT_HORA')
+    idx_hdr_machine = col_names_hdr.index('THT_MACHINENAME') if 'THT_MACHINENAME' in col_names_hdr else -1
 
     count_synced = 0
     total_rows = db_hdr._total_rows + db_hdr._deleted_rows
@@ -347,8 +374,10 @@ def sync_purchases(base_db_dir, synced_ids, desc_mapping):
         doc_num = str(row[idx_hdr_doc]).strip().zfill(8)
         prov_rif = str(row[idx_hdr_rif]).strip()
         prov_name = str(row[idx_hdr_prov_name]).strip()
+        machine_val = _clean_machine(row, idx_hdr_machine)
+        pc_tag = f" - [PC: {machine_val}]" if machine_val else ""
 
-        nota = f"[Local Com ID: {local_id}] - Compra #{doc_num}: {prov_name}"
+        nota = f"[Local Com ID: {local_id}]{pc_tag} - Compra #{doc_num}: {prov_name}"
         if prov_rif:
             nota += f" (RIF: {prov_rif})"
 

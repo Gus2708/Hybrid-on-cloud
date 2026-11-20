@@ -65,6 +65,7 @@ Uso:
     python listener_compras.py            # bucle continuo
     python listener_compras.py --once     # una sola pasada (para pruebas)
 """
+from contextlib import nullcontext
 import sys
 import datetime
 import urllib.error
@@ -72,6 +73,11 @@ import urllib.error
 import listener_base as lb
 
 import flujo_compra_real
+
+try:
+    import abrir_hybrid
+except Exception:  # pragma: no cover
+    abrir_hybrid = None
 
 try:
     from safety_control import control_seguro
@@ -121,7 +127,7 @@ def get_compras_pendientes():
         path = (f"{TABLE_CAB}?backend_status=eq.pendiente"
                 f"&status=eq.emitido"
                 f"&creado_por=not.is.null"
-                f"&select=id,proveedor_codigo,proveedor_nombre,nota,backend_intentos,numero_documento"
+                f"&select=id,creado_por,proveedor_codigo,proveedor_nombre,nota,backend_intentos,numero_documento"
                 f"&order=id.asc&limit=10")
         return lb.rest("GET", path) or []
     except urllib.error.HTTPError as e:
@@ -302,19 +308,21 @@ def procesar_compra(compra, n=1, total=1):
              cid, proveedor_codigo, proveedor_nombre, len(items), doc_numero, origen_doc_numero)
 
     txt_banner = f"REGISTRANDO COMPRA {n}/{total} — OC-{cid} ({proveedor_nombre or proveedor_codigo})"
+    sesion_ctx = abrir_hybrid.sesion_para(compra.get("creado_por")) if abrir_hybrid is not None else nullcontext()
     try:
-        if control_seguro is not None:
-            with control_seguro(txt_banner, ocultar_scripts=["widget.pyw", "widget_recargo.pyw"]) as banner:
+        with sesion_ctx:
+            if control_seguro is not None:
+                with control_seguro(txt_banner, ocultar_scripts=["widget.pyw", "widget_recargo.pyw"]) as banner:
+                    res = flujo_compra_real.registrar_compra(
+                        proveedor_codigo, items, doc_numero,
+                        commit=lb.check_hybrid_write_enabled(), proveedor_nombre=proveedor_nombre,
+                        banner=banner,
+                    )
+            else:
                 res = flujo_compra_real.registrar_compra(
                     proveedor_codigo, items, doc_numero,
                     commit=lb.check_hybrid_write_enabled(), proveedor_nombre=proveedor_nombre,
-                    banner=banner,
                 )
-        else:
-            res = flujo_compra_real.registrar_compra(
-                proveedor_codigo, items, doc_numero,
-                commit=lb.check_hybrid_write_enabled(), proveedor_nombre=proveedor_nombre,
-            )
     except Exception as e:
         res = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
 

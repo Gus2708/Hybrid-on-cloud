@@ -99,6 +99,7 @@ Uso:
     python listener_writeback.py            # bucle continuo
     python listener_writeback.py --once     # una sola pasada (para pruebas)
 """
+from contextlib import nullcontext
 import sys
 import datetime
 import urllib.error
@@ -113,6 +114,11 @@ try:
     from safety_control import control_seguro
 except Exception:  # pragma: no cover
     control_seguro = None
+
+try:
+    import bot_writeback_registry as bwr
+except Exception:  # pragma: no cover
+    bwr = None
 
 log = lb.setup_logging("writeback", "writeback.log")
 if lb.AVISO_SIN_SERVICE_KEY:
@@ -330,12 +336,53 @@ _LOCK_FALLIDO = {"ok": False, "etapa": "carga/conteo",
                              "no se tocó HybridLite para este item, reintentable."}
 
 
-def _fase_stock_orden(items_con_stock):
+def _registrar_stock_inflight(orden_id, expected_items, commit):
+    if not commit or bwr is None or not expected_items:
+        return None
+    try:
+        max_id_before = bwr.obtener_max_inv_id()
+        expected = [{"codigo": e["codigo"], "delta": e["delta"]} for e in expected_items]
+        return bwr.registrar_inflight(
+            orden_id=orden_id,
+            items=expected,
+            max_inv_id_before=max_id_before,
+        )
+    except Exception as e:
+        log.warning("No pude registrar inflight en bot_writeback_registry (sigo igual): %r", e)
+        return None
+
+
+def _cerrar_stock_inflight(reg_token, orden_id, resultados_intentados):
+    if not reg_token or bwr is None:
+        return
+    todo_precommit = bool(resultados_intentados) and all(
+        (not r.get("ok")) and r.get("etapa") in ("abrir_hybrid", "carga/conteo")
+        for r in resultados_intentados.values()
+    )
+    try:
+        if todo_precommit:
+            bwr.cancelar_inflight(reg_token)
+        else:
+            matched = bwr.confirmar_desde_dbisam(reg_token)
+            if matched:
+                log.info(
+                    "Registrados Local Inv ID(s) %s para OC-%s (sin espejo duplicado).",
+                    matched,
+                    orden_id,
+                )
+    except Exception as e:
+        log.warning("No pude cerrar inflight en bot_writeback_registry (sigo igual): %r", e)
+
+
+def _fase_stock_orden(items_con_stock, orden_id=None):
     """Aplica la parte de stock de una orden. Devuelve dict[item_id -> dict con
     resultado de flujo_stock_real] SOLO para los items con cambio de stock."""
     resultados = {}
     if not items_con_stock:
         return resultados
+    if orden_id is None:
+        orden_id = items_con_stock[0].get("orden_id")
+    commit = lb.check_hybrid_write_enabled()
 
     if len(items_con_stock) >= 2:
         lote = []
@@ -350,12 +397,14 @@ def _fase_stock_orden(items_con_stock):
             lote.append({"item_id": iid, "codigo": item.get("codigo_producto"),
                          "delta": float(item["delta"])})
         if lote:
+            reg_token = _registrar_stock_inflight(orden_id, lote, commit)
             log.info("Fase stock en LOTE: %s item(s) -> ajustar_stock_lote", len(lote))
             try:
-                res_lote = flujo_stock_real.ajustar_stock_lote(lote, commit=lb.check_hybrid_write_enabled())
+                res_lote = flujo_stock_real.ajustar_stock_lote(lote, commit=commit)
             except Exception as e:
                 res_lote = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}", "resultados": {}}
             resultados_por_id = res_lote.get("resultados") or {}
+            resultados_intentados = {}
             for entrada in lote:
                 iid = entrada["item_id"]
                 if iid in resultados_por_id:
@@ -366,6 +415,8 @@ def _fase_stock_orden(items_con_stock):
                     # el resultado global del lote.
                     resultados[iid] = {"ok": res_lote["ok"], "etapa": res_lote["etapa"],
                                         "detalle": res_lote["detalle"]}
+                resultados_intentados[iid] = resultados[iid]
+            _cerrar_stock_inflight(reg_token, orden_id, resultados_intentados)
     else:
         item = items_con_stock[0]
         iid = item["id"]
@@ -375,12 +426,16 @@ def _fase_stock_orden(items_con_stock):
             return resultados
         codigo = item.get("codigo_producto")
         delta = float(item["delta"])
+        reg_token = _registrar_stock_inflight(
+            orden_id, [{"codigo": codigo, "delta": delta}], commit
+        )
         log.info("Fase stock INDIVIDUAL: item %s codigo=%s delta=%s", iid, codigo, delta)
         try:
             resultados[iid] = flujo_stock_real.ajustar_stock(codigo, delta,
-                                                              commit=lb.check_hybrid_write_enabled(), delta=True)
+                                                              commit=commit, delta=True)
         except Exception as e:
             resultados[iid] = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
+        _cerrar_stock_inflight(reg_token, orden_id, {iid: resultados[iid]})
 
     return resultados
 
@@ -491,46 +546,18 @@ def _texto_item(item):
     return f"{desc} ({codigo})" if desc else codigo
 
 
-def _procesar_pendientes_impl(items, banner=None):
-    """TRES FASES GLOBALES sobre todas las órdenes de la pasada (pedido del
-    dueño): primero TODAS las cantidades (un documento de ajuste por orden),
-    después TODOS los precios/costos, y por último TODOS los cambios de
-    descripción/referencia. Además de respetar el orden natural del trabajo,
-    evita intercalar ventanas: la Ficha se reutiliza entre todos los items de
-    las fases 2 y 3 sin que un ajuste de stock intermedio obligue a cerrarla y
-    reabrirla."""
+def _creado_por_item(item):
+    cab = item.get("ordenes_cambio")
+    if isinstance(cab, dict):
+        return cab.get("creado_por")
+    return None
 
-    def _avisar(texto):
-        # actualiza la línea principal del banner de seguridad (si existe)
-        if banner is None:
-            return
-        try:
-            banner.set_texto(texto)
-        except Exception:
-            pass
 
-    # panel lateral: lista completa de items de la pasada, tachando los que
-    # ya quedaron 'completado' (a medida que se van resolviendo). El orden
-    # de aparición es el de `items` (ya viene por id asc de get_pendientes).
-    orden_lista = [item["id"] for item in items]
-    textos_por_id = {item["id"]: _texto_item(item) for item in items}
-    hecho_por_id = {item["id"]: False for item in items}
-
-    def _refrescar_lista():
-        if banner is None:
-            return
-        try:
-            banner.set_lista([(textos_por_id[iid], hecho_por_id[iid]) for iid in orden_lista])
-        except Exception:
-            pass
-
-    _refrescar_lista()
-
+def _ejecutar_grupo_usuario(grupo_items, cache_costo_db, _avisar, hecho_por_id, _refrescar_lista):
     ordenes = {}
-    for item in items:
+    for item in grupo_items:
         ordenes.setdefault(item.get("orden_id"), []).append(item)
 
-    cache_costo_db = {}
     items_por_id = {}
     partes_por_item = {}
     stock_por_orden = []        # [(orden_id, [items_con_stock])] en orden de llegada
@@ -571,7 +598,7 @@ def _procesar_pendientes_impl(items, banner=None):
     for orden_id, items_con_stock in stock_por_orden:
         _avisar(f"AJUSTANDO STOCK — ORDEN OC-{orden_id} ({len(items_con_stock)} PRODUCTO/S)")
         try:
-            res_orden = _fase_stock_orden(items_con_stock)
+            res_orden = _fase_stock_orden(items_con_stock, orden_id=orden_id)
         except Exception as e:
             res_orden = {item["id"]: {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
                          for item in items_con_stock}
@@ -627,21 +654,92 @@ def _procesar_pendientes_impl(items, banner=None):
     # Higiene de cierre: el flujo de precio/costo deja la Ficha abierta a
     # propósito (la reutiliza entre items de la misma pasada), pero no debe
     # quedar abierta en el POS al terminar — un empleado podría encontrarla
-    # y guardar algo sin querer.
+    # y guardar algo sin querer (o cambiar de usuario entre grupos).
     try:
         flujo_stock_real._cerrar_ficha_si_abierta()
     except Exception as e:
-        log.warning("No pude cerrar la Ficha al final de la pasada: %r", e)
+        log.warning("No pude cerrar la Ficha al final del grupo: %r", e)
+
+
+def _procesar_pendientes_impl(items, banner=None):
+    """TRES FASES GLOBALES sobre todas las órdenes de la pasada (pedido del
+    dueño): primero TODAS las cantidades (un documento de ajuste por orden),
+    después TODOS los precios/costos, y por último TODOS los cambios de
+    descripción/referencia. Cuando hay items de distintos usuarios HybridLite
+    (p.ej. Gustavo -> GUS vs otros -> SU), se agrupan por sesión para no
+    mezclar sesiones en la misma instancia aislada."""
+
+    def _avisar(texto):
+        # actualiza la línea principal del banner de seguridad (si existe)
+        if banner is None:
+            return
+        try:
+            banner.set_texto(texto)
+        except Exception:
+            pass
+
+    # panel lateral: lista completa de items de la pasada, tachando los que
+    # ya quedaron 'completado' (a medida que se van resolviendo). El orden
+    # de aparición es el de `items` (ya viene por id asc de get_pendientes).
+    orden_lista = [item["id"] for item in items]
+    textos_por_id = {item["id"]: _texto_item(item) for item in items}
+    hecho_por_id = {item["id"]: False for item in items}
+
+    def _refrescar_lista():
+        if banner is None:
+            return
+        try:
+            banner.set_lista([(textos_por_id[iid], hecho_por_id[iid]) for iid in orden_lista])
+        except Exception:
+            pass
+
+    _refrescar_lista()
+
+    try:
+        import abrir_hybrid
+    except Exception:
+        abrir_hybrid = None
+
+    grupos = {}
+    for item in items:
+        cid = _creado_por_item(item)
+        if abrir_hybrid is not None:
+            try:
+                user_key = abrir_hybrid.usuario_hybrid_para(cid)
+            except Exception:
+                user_key = "DEFAULT"
+        else:
+            user_key = "DEFAULT"
+        if user_key not in grupos:
+            grupos[user_key] = {"creado_por": cid, "items": []}
+        grupos[user_key]["items"].append(item)
+
+    cache_costo_db = {}
+    for usuario_hybrid, grupo in grupos.items():
+        log.info(
+            "Procesando %s item(s) bajo sesión HybridLite=%s",
+            len(grupo["items"]),
+            usuario_hybrid,
+        )
+        ctx = abrir_hybrid.sesion_para(grupo["creado_por"]) if abrir_hybrid is not None else nullcontext()
+        with ctx:
+            _ejecutar_grupo_usuario(
+                grupo["items"],
+                cache_costo_db,
+                _avisar,
+                hecho_por_id,
+                _refrescar_lista,
+            )
 
     # La instancia de Hybrid usada es una AISLADA (ver abrir_hybrid.py), nunca
     # la del empleado: minimizarla (no cerrarla) evita dejar una segunda
     # ventana de Hybrid tapando la pantalla; se restaura sola en la próxima
     # pasada que tenga trabajo pendiente.
-    try:
-        import abrir_hybrid
-        abrir_hybrid.minimizar_aislada()
-    except Exception as e:
-        log.warning("No pude minimizar la instancia aislada de Hybrid: %r", e)
+    if abrir_hybrid is not None:
+        try:
+            abrir_hybrid.minimizar_aislada()
+        except Exception as e:
+            log.warning("No pude minimizar la instancia aislada de Hybrid: %r", e)
 
 
 if __name__ == "__main__":

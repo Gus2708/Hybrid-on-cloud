@@ -36,6 +36,7 @@ Uso:
     python abrir_hybrid.py            # asegura una instancia aislada abierta+logueada
     from abrir_hybrid import asegurar_hybrid; asegurar_hybrid()
 """
+from contextlib import contextmanager
 import os
 import sys
 import json
@@ -68,6 +69,7 @@ EXE_DIR = r"C:\HybridLiteEstacion"
 MAIN = "TF_MainHybridCashMG"
 LOGIN = "TFUserPassMainForm"
 CONF = os.path.join(DIR, "hybrid_login.json")
+SESIONES_FILE = os.path.join(DIR, "hybrid_sesiones.json")
 
 # Credenciales de la instancia local de HybridLite. Se leen de hybrid_login.json
 # (fuera de git) o del entorno; el respaldo "SU/SU" es la credencial de fábrica
@@ -75,16 +77,127 @@ CONF = os.path.join(DIR, "hybrid_login.json")
 DEFAULTS = {"usuario": os.environ.get("HYBRID_USER", "SU"),
             "clave": os.environ.get("HYBRID_PASS", "SU")}
 
+_CREADO_POR_ACTIVO = None
 
-def _creds():
+
+@contextmanager
+def sesion_para(creado_por=None):
+    """Define temporalmente el usuario de la app (`creado_por` UUID) para las
+    llamadas a `asegurar_hybrid()` / `hacer_login()` dentro del bloque."""
+    global _CREADO_POR_ACTIVO
+    prev = _CREADO_POR_ACTIVO
+    _CREADO_POR_ACTIVO = creado_por
+    try:
+        yield
+    finally:
+        _CREADO_POR_ACTIVO = prev
+
+
+def _resolver_credenciales(creado_por=None):
+    """Devuelve `(usuario, clave, es_dedicado)` para `creado_por` (o default)."""
+    default_user = DEFAULTS["usuario"]
+    default_pass = DEFAULTS["clave"]
+    usuarios_app = None
     if os.path.exists(CONF):
         try:
             with open(CONF, encoding="utf-8") as f:
                 d = json.load(f)
-            return d.get("usuario", DEFAULTS["usuario"]), d.get("clave", DEFAULTS["clave"])
+            if isinstance(d, dict):
+                default_user = d.get("usuario") or default_user
+                default_pass = d.get("clave") or default_pass
+                usuarios_app = d.get("usuarios_app")
         except Exception:
             pass
-    return DEFAULTS["usuario"], DEFAULTS["clave"]
+
+    if creado_por and isinstance(usuarios_app, dict):
+        cid = str(creado_por).strip().lower()
+        for k, entry in usuarios_app.items():
+            if str(k).strip().lower() == cid and isinstance(entry, dict):
+                u = str(entry.get("usuario") or "").strip()
+                c = entry.get("clave")
+                if u and c is not None and str(c).strip():
+                    return u, str(c), True
+
+    return str(default_user).strip(), str(default_pass), False
+
+
+def _creds(creado_por=None):
+    usuario, clave, _ = _resolver_credenciales(creado_por)
+    return usuario, clave
+
+
+def usuario_hybrid_para(creado_por=None):
+    """Nombre en mayúsculas del usuario de HybridLite que corresponde a `creado_por`."""
+    usuario, _, _ = _resolver_credenciales(creado_por)
+    return usuario.strip().upper()
+
+
+def _cargar_sesiones():
+    if not os.path.exists(SESIONES_FILE):
+        return {}
+    try:
+        with open(SESIONES_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return {}
+        out = {}
+        for k, v in raw.items():
+            try:
+                pid = int(k)
+            except (TypeError, ValueError):
+                continue
+            user = str(v or "").strip().upper()
+            if pid > 0 and user:
+                out[pid] = user
+        return out
+    except Exception:
+        return {}
+
+
+def _guardar_sesiones(mapa):
+    tmp_path = f"{SESIONES_FILE}.{os.getpid()}.tmp"
+    try:
+        payload = {str(int(k)): str(v).strip().upper() for k, v in mapa.items()}
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, SESIONES_FILE)
+    except OSError:
+        pass
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _registrar_sesion_pid(pid, usuario):
+    if pid is None:
+        return
+    pid_int = int(pid)
+    user_norm = str(usuario).strip().upper()
+    if not user_norm:
+        return
+    mapa = _cargar_sesiones()
+    vivos = {p: u for p, u in mapa.items() if p == pid_int or _pid_es_hybrid(p)}
+    vivos[pid_int] = user_norm
+    _guardar_sesiones(vivos)
+
+
+def _eliminar_sesion_pid(pid):
+    if pid is None:
+        return
+    pid_int = int(pid)
+    mapa = _cargar_sesiones()
+    if pid_int in mapa:
+        mapa.pop(pid_int, None)
+        _guardar_sesiones(mapa)
+
+
+def _usuario_de_pid(pid):
+    if pid is None:
+        return None
+    return _cargar_sesiones().get(int(pid))
 
 
 def _focus(hwnd):
@@ -153,7 +266,7 @@ def _llenar_campo_login(edit, valor):
     return (edit.window_text() or "").strip()
 
 
-def hacer_login(hlogin=None, timeout_main=60, antes_main=None):
+def hacer_login(hlogin=None, timeout_main=60, antes_main=None, usuario=None, clave=None):
     """Inicia sesión en la ventana de login `hlogin`.
 
     `antes_main` (opcional): set de hwnds de MAIN existentes ANTES de lanzar la
@@ -162,8 +275,10 @@ def hacer_login(hlogin=None, timeout_main=60, antes_main=None):
     ventana — robusto al caso en que el login y el módulo principal corran en
     procesos distintos (login como stub lanzador). Si es None (p.ej. reuso de
     una instancia aislada trabada en login), se usa la espera clásica por PID."""
-    global _AISLADO_PID
-    usuario, clave = _creds()
+    global _AISLADO_PID, _AISLADO_USUARIO
+    if usuario is None or clave is None:
+        usuario, clave = _creds(_CREADO_POR_ACTIVO)
+    usuario_norm = str(usuario).strip().upper()
     hlogin = hlogin or fp._find_hwnd(LOGIN)
     if not hlogin:
         return False, "No hay pantalla de login."
@@ -222,25 +337,34 @@ def hacer_login(hlogin=None, timeout_main=60, antes_main=None):
         # de esa ventana (puede diferir del PID del login).
         hmain = fp._esperar_ventana_nueva(MAIN, antes_main, timeout=timeout_main)
         if hmain:
-            pid = _pid_de(hmain)
+            pid = _pid_de(hmain) or _AISLADO_PID
             if pid is not None:
                 _AISLADO_PID = pid
                 fp.set_target_pid(pid)
-            return True, "Sesión iniciada; módulo principal (instancia aislada) listo."
+                _AISLADO_USUARIO = usuario_norm
+                _registrar_sesion_pid(pid, usuario_norm)
+            return True, f"Sesión iniciada ({usuario_norm}); módulo principal (instancia aislada) listo."
     else:
         hmain = _wait(MAIN, timeout=timeout_main)
         if hmain:
-            return True, "Sesión iniciada; módulo principal listo."
+            pid = _pid_de(hmain) or _AISLADO_PID
+            if pid is not None:
+                _AISLADO_PID = pid
+                fp.set_target_pid(pid)
+                _AISLADO_USUARIO = usuario_norm
+                _registrar_sesion_pid(pid, usuario_norm)
+            return True, f"Sesión iniciada ({usuario_norm}); módulo principal listo."
     if fp._find_hwnd(LOGIN):
         return False, "Sigue en la pantalla de login (¿credenciales incorrectas?)."
     return False, "No apareció el módulo principal tras el login."
 
 
-# PID de la instancia AISLADA que este proceso ya abrió (si alguna). Se
-# reutiliza entre pasadas consecutivas del listener para no relanzar+loguear
-# HybridLite cada vez; si esa ventana ya no existe (se cerró, crasheó) se
-# detecta y se lanza una instancia nueva.
+# PID y usuario HybridLite de la instancia AISLADA que este proceso ya abrió
+# (si alguna). Se reutiliza entre pasadas consecutivas del listener para no
+# relanzar+loguear HybridLite cada vez; si cambia el usuario objetivo o la
+# ventana ya no existe, se cierra/desacopla y se abre una con el usuario correcto.
 _AISLADO_PID = None
+_AISLADO_USUARIO = None
 _LANZADA_POR_NOSOTROS = False
 
 
@@ -274,20 +398,32 @@ def _instancia_aislada_viva():
     return None, None
 
 
-def asegurar_hybrid(timeout_login=60, timeout_main=60):
+def asegurar_hybrid(timeout_login=60, timeout_main=60, creado_por=None):
     """Asegura una instancia AISLADA de HybridLite abierta+logueada, sin
     tocar la ventana que un empleado pueda tener abierta (ver docstring del
     módulo). Deja flujo_precio.set_target_pid() apuntando a esa instancia."""
-    global _AISLADO_PID, _LANZADA_POR_NOSOTROS
+    global _AISLADO_PID, _AISLADO_USUARIO, _LANZADA_POR_NOSOTROS
 
-    # Fast path: si la Ficha ya está abierta y respondiendo, retorno instantáneo sin chequeos pesados
+    cid = creado_por if creado_por is not None else _CREADO_POR_ACTIVO
+    usuario_raw, clave, es_dedicado = _resolver_credenciales(cid)
+    usuario_obj = usuario_raw.strip().upper()
+
+    def _es_pid_compatible(u_pid):
+        if u_pid is not None:
+            return str(u_pid).strip().upper() == usuario_obj
+        return not es_dedicado
+
+    # Fast path: si la Ficha ya está abierta y respondiendo, retorno instantáneo
+    # solo si pertenece al mismo usuario HybridLite objetivo.
     hf = fp._find_hwnd(fp.FICHA_CLASS)
     if hf and hh.responde(hf, timeout_ms=100):
         pid = _pid_de(hf)
-        if pid:
+        u_pid = _AISLADO_USUARIO if (pid and pid == _AISLADO_PID) else _usuario_de_pid(pid)
+        if pid and _es_pid_compatible(u_pid):
             _AISLADO_PID = pid
+            _AISLADO_USUARIO = u_pid
             fp.set_target_pid(pid)
-        return True, "Ficha de inventario ya abierta y lista."
+            return True, "Ficha de inventario ya abierta y lista."
 
     # 0) ¿HybridLite está COLGADO? Antes de cualquier otra cosa: si la app no
     #    responde (o quedó un proceso fantasma sin ventana), reutilizarla o
@@ -300,41 +436,82 @@ def asegurar_hybrid(timeout_login=60, timeout_main=60):
     if accion == "recuperado":
         print(f"Hybrid estaba colgado ({detalle}); arranco de cero.")
         _AISLADO_PID = None
+        _AISLADO_USUARIO = None
+        _LANZADA_POR_NOSOTROS = False
         fp.clear_target_pid()
 
-    # 1) ¿la instancia aislada de una pasada anterior sigue viva? -> reusarla
+    # 1) ¿la instancia aislada de una pasada anterior sigue viva? -> reusarla solo
+    #    si coincide con el usuario HybridLite objetivo; si no, cerrarla/desacoplar.
     cls_viva, h_viva = _instancia_aislada_viva()
     if h_viva:
-        fp.set_target_pid(_AISLADO_PID)
-        if cls_viva == MAIN:
-            # pudo quedar minimizada por minimizar_aislada() al final de la
-            # pasada anterior: SetForegroundWindow solo no la restaura de
-            # forma confiable, hay que pedir SW_RESTORE primero.
-            try:
-                import win32con
-                win32gui.ShowWindow(h_viva, win32con.SW_RESTORE)
-                win32gui.SetForegroundWindow(h_viva)
-            except Exception:
-                pass
-            return True, "Reutilizando la instancia aislada de Hybrid ya abierta."
-        return hacer_login(h_viva, timeout_main=timeout_main)
-    _AISLADO_PID = None
-    fp.clear_target_pid()
+        u_actual = _AISLADO_USUARIO or _usuario_de_pid(_AISLADO_PID)
+        if _es_pid_compatible(u_actual):
+            fp.set_target_pid(_AISLADO_PID)
+            if cls_viva == MAIN:
+                # pudo quedar minimizada por minimizar_aislada() al final de la
+                # pasada anterior: SetForegroundWindow solo no la restaura de
+                # forma confiable, hay que pedir SW_RESTORE primero.
+                try:
+                    import win32con
+                    win32gui.ShowWindow(h_viva, win32con.SW_RESTORE)
+                    win32gui.SetForegroundWindow(h_viva)
+                except Exception:
+                    pass
+                return True, f"Reutilizando instancia aislada de Hybrid ({u_actual or usuario_obj})."
+            return hacer_login(
+                h_viva, timeout_main=timeout_main, usuario=usuario_raw, clave=clave
+            )
+        if _LANZADA_POR_NOSOTROS:
+            cerrar_aislada()
+        else:
+            _AISLADO_PID = None
+            _AISLADO_USUARIO = None
+            fp.clear_target_pid()
+    else:
+        _AISLADO_PID = None
+        _AISLADO_USUARIO = None
+        _LANZADA_POR_NOSOTROS = False
+        fp.clear_target_pid()
 
-    # 1.5) Si ya hay una ventana de MAIN abierta en el sistema, la adoptamos solo si está limpia y habilitada
-    h_existente = fp._find_hwnd(MAIN)
-    if h_existente:
+    # 1.5) Si ya hay una ventana de MAIN abierta en el sistema, adoptarla solo si
+    #      su sesión HybridLite es compatible con el usuario objetivo y está limpia.
+    sesiones = _cargar_sesiones()
+    candidatos = []
+    h_first = fp._find_hwnd(MAIN)
+    if h_first:
+        candidatos.append(h_first)
+    if sesiones:
+        try:
+            for h_extra in sorted(fp._hwnds_de_clase(MAIN)):
+                if h_extra not in candidatos:
+                    candidatos.append(h_extra)
+        except Exception:
+            pass
+
+    for h_existente in candidatos:
         pid = _pid_de(h_existente)
-        if pid:
-            listo, motivo, _ = hh.verificar_hybrid_listo(target_pid=pid)
-            if not listo:
-                print(f"Instancia de Hybrid existente (PID {pid}) no está lista: {motivo}. No se adopta.")
-            else:
-                _AISLADO_PID = pid
-                fp.set_target_pid(pid)
-                return True, "Reutilizando instancia principal de Hybrid ya abierta."
+        if not pid:
+            continue
+        u_pid = sesiones.get(pid)
+        if not _es_pid_compatible(u_pid):
+            continue
+        listo, motivo, _ = hh.verificar_hybrid_listo(target_pid=pid)
+        if not listo:
+            print(f"Instancia de Hybrid existente (PID {pid}) no está lista: {motivo}. No se adopta.")
+            continue
+        _AISLADO_PID = pid
+        _AISLADO_USUARIO = u_pid
+        _LANZADA_POR_NOSOTROS = False
+        fp.set_target_pid(pid)
+        try:
+            import win32con
+            win32gui.ShowWindow(h_existente, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(h_existente)
+        except Exception:
+            pass
+        return True, f"Reutilizando instancia principal de Hybrid ({u_pid or usuario_obj})."
 
-    # 2) no hay instancia aislada viva -> lanzar SIEMPRE una instancia NUEVA.
+    # 2) no hay instancia compatible viva -> lanzar SIEMPRE una instancia NUEVA.
     #    NUNCA se reutiliza el módulo principal/login que ya esté visible:
     #    esa ventana puede ser la de un empleado trabajando ahora mismo.
     if not os.path.exists(EXE):
@@ -356,7 +533,13 @@ def asegurar_hybrid(timeout_login=60, timeout_main=60):
         # re-homologa el target al PID del módulo principal (puede diferir).
         _AISLADO_PID = pid
         fp.set_target_pid(pid)
-        return hacer_login(hlogin, timeout_main=timeout_main, antes_main=antes_main)
+        return hacer_login(
+            hlogin,
+            timeout_main=timeout_main,
+            antes_main=antes_main,
+            usuario=usuario_raw,
+            clave=clave,
+        )
 
     # algunas configs entran directo al módulo principal, sin login
     hmain = fp._esperar_ventana_nueva(MAIN, antes_main, timeout=10)
@@ -365,6 +548,7 @@ def asegurar_hybrid(timeout_login=60, timeout_main=60):
         if pid is None:
             return False, "Abrió el módulo principal pero no pude leer su PID."
         _AISLADO_PID = pid
+        _AISLADO_USUARIO = None
         fp.set_target_pid(pid)
         return True, "Hybrid abrió una instancia nueva y aislada, directo al módulo principal (sin login)."
 
@@ -421,16 +605,19 @@ def cerrar_aislada():
     instancias: eso mataría también la del empleado. El cierre SIEMPRE es por
     este PID puntual. (Única excepción en todo el proyecto:
     hybrid_health.matar_todo, y solo con un cuelgue confirmado.)"""
-    global _AISLADO_PID, _LANZADA_POR_NOSOTROS
-    import win32con
+    global _AISLADO_PID, _AISLADO_USUARIO, _LANZADA_POR_NOSOTROS
     pid = _AISLADO_PID
     if pid is None or not _LANZADA_POR_NOSOTROS:
         _AISLADO_PID = None
+        _AISLADO_USUARIO = None
         fp.clear_target_pid()
         return
     if not _pid_es_hybrid(pid):
         print(f"PID aislado {pid} ya no es HybridLiteOS (cerrado o reciclado); no se toca nada.")
+        _eliminar_sesion_pid(pid)
         _AISLADO_PID = None
+        _AISLADO_USUARIO = None
+        _LANZADA_POR_NOSOTROS = False
         fp.clear_target_pid()
         return
     try:
@@ -438,7 +625,9 @@ def cerrar_aislada():
         print(f"Instancia aislada de Hybrid (PID {pid}) cerrada.")
     except Exception as e:
         print(f"No pude cerrar la instancia aislada (PID {pid}): {e}")
+    _eliminar_sesion_pid(pid)
     _AISLADO_PID = None
+    _AISLADO_USUARIO = None
     _LANZADA_POR_NOSOTROS = False
     fp.clear_target_pid()
 

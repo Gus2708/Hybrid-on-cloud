@@ -122,3 +122,137 @@ class TestPreflightGuardrail:
         assert len(control_seguro_llamado) == 1
 
 
+class TestFaseStockRegistry:
+    def test_single_item_commit_registers_and_confirms(self, monkeypatch):
+        events = []
+        monkeypatch.setattr(lb, "check_hybrid_write_enabled", lambda: True)
+        monkeypatch.setattr(lw, "update_item", lambda iid, **kwargs: True)
+        monkeypatch.setattr(lw.bwr, "obtener_max_inv_id", lambda: (events.append("max_id"), 634)[1])
+        monkeypatch.setattr(
+            lw.bwr,
+            "registrar_inflight",
+            lambda **kwargs: (events.append(("register", kwargs)), "tok-1")[1],
+        )
+        monkeypatch.setattr(
+            lw.bwr,
+            "confirmar_desde_dbisam",
+            lambda tok: (events.append(("confirm", tok)), [635])[1],
+        )
+        monkeypatch.setattr(lw.bwr, "cancelar_inflight", lambda tok: events.append(("cancel", tok)))
+        monkeypatch.setattr(
+            lw.flujo_stock_real,
+            "ajustar_stock",
+            lambda codigo, cantidad, commit=False, delta=False: (
+                events.append(("ajustar", codigo, cantidad, commit)),
+                {"ok": True, "etapa": "commit", "detalle": "Stock ajustado"},
+            )[1],
+        )
+
+        items = [{"id": 10, "orden_id": 35975, "codigo_producto": "01567", "delta": 75.0, "backend_intentos": 0}]
+        res = lw._fase_stock_orden(items, orden_id=35975)
+
+        assert res[10]["ok"] is True
+        assert events == [
+            "max_id",
+            ("register", {"orden_id": 35975, "items": [{"codigo": "01567", "delta": 75.0}], "max_inv_id_before": 634}),
+            ("ajustar", "01567", 75.0, True),
+            ("confirm", "tok-1"),
+        ]
+
+    def test_single_item_precommit_failure_cancels_inflight(self, monkeypatch):
+        events = []
+        monkeypatch.setattr(lb, "check_hybrid_write_enabled", lambda: True)
+        monkeypatch.setattr(lw, "update_item", lambda iid, **kwargs: True)
+        monkeypatch.setattr(lw.bwr, "obtener_max_inv_id", lambda: 634)
+        monkeypatch.setattr(lw.bwr, "registrar_inflight", lambda **kwargs: "tok-fail")
+        monkeypatch.setattr(lw.bwr, "confirmar_desde_dbisam", lambda tok: events.append(("confirm", tok)))
+        monkeypatch.setattr(lw.bwr, "cancelar_inflight", lambda tok: events.append(("cancel", tok)))
+        monkeypatch.setattr(
+            lw.flujo_stock_real,
+            "ajustar_stock",
+            lambda codigo, cantidad, commit=False, delta=False: {
+                "ok": False,
+                "etapa": "carga/conteo",
+                "detalle": "No se encontro",
+            },
+        )
+
+        items = [{"id": 11, "orden_id": 35976, "codigo_producto": "01567", "delta": 5.0, "backend_intentos": 0}]
+        res = lw._fase_stock_orden(items, orden_id=35976)
+
+        assert res[11]["ok"] is False
+        assert events == [("cancel", "tok-fail")]
+
+    def test_preview_mode_does_not_register_inflight(self, monkeypatch):
+        events = []
+        monkeypatch.setattr(lb, "check_hybrid_write_enabled", lambda: False)
+        monkeypatch.setattr(lw, "update_item", lambda iid, **kwargs: True)
+        monkeypatch.setattr(lw.bwr, "registrar_inflight", lambda **kwargs: events.append("register"))
+        monkeypatch.setattr(lw.bwr, "confirmar_desde_dbisam", lambda tok: events.append("confirm"))
+        monkeypatch.setattr(
+            lw.flujo_stock_real,
+            "ajustar_stock",
+            lambda codigo, cantidad, commit=False, delta=False: {
+                "ok": True,
+                "etapa": "preview",
+                "detalle": "Descartado",
+            },
+        )
+
+        items = [{"id": 12, "orden_id": 35977, "codigo_producto": "01567", "delta": 5.0, "backend_intentos": 0}]
+        res = lw._fase_stock_orden(items, orden_id=35977)
+
+        assert res[12]["etapa"] == "preview"
+        assert events == []
+
+    def test_batch_commit_registers_locked_items_and_confirms(self, monkeypatch):
+        events = []
+        monkeypatch.setattr(lb, "check_hybrid_write_enabled", lambda: True)
+        monkeypatch.setattr(lw, "update_item", lambda iid, **kwargs: iid != 2)
+        monkeypatch.setattr(lw.bwr, "obtener_max_inv_id", lambda: 700)
+        monkeypatch.setattr(
+            lw.bwr,
+            "registrar_inflight",
+            lambda **kwargs: (events.append(("register", kwargs)), "tok-batch")[1],
+        )
+        monkeypatch.setattr(
+            lw.bwr,
+            "confirmar_desde_dbisam",
+            lambda tok: (events.append(("confirm", tok)), [701])[1],
+        )
+        monkeypatch.setattr(lw.bwr, "cancelar_inflight", lambda tok: events.append(("cancel", tok)))
+        monkeypatch.setattr(
+            lw.flujo_stock_real,
+            "ajustar_stock_lote",
+            lambda lote, commit=False: {
+                "ok": True,
+                "etapa": "commit",
+                "detalle": "Lote OK",
+                "resultados": {
+                    entry["item_id"]: {"ok": True, "etapa": "commit", "detalle": "OK"}
+                    for entry in lote
+                },
+            },
+        )
+
+        items = [
+            {"id": 1, "orden_id": 36000, "codigo_producto": "A", "delta": 10.0, "backend_intentos": 0},
+            {"id": 2, "orden_id": 36000, "codigo_producto": "B", "delta": -2.0, "backend_intentos": 0},
+            {"id": 3, "orden_id": 36000, "codigo_producto": "C", "delta": 4.0, "backend_intentos": 0},
+        ]
+        res = lw._fase_stock_orden(items, orden_id=36000)
+
+        assert res[1]["ok"] is True
+        assert res[2]["ok"] is False
+        assert res[3]["ok"] is True
+        assert events == [
+            ("register", {
+                "orden_id": 36000,
+                "items": [{"codigo": "A", "delta": 10.0}, {"codigo": "C", "delta": 4.0}],
+                "max_inv_id_before": 700,
+            }),
+            ("confirm", "tok-batch"),
+        ]
+
+
+

@@ -42,6 +42,7 @@ Uso:
     python listener_pedidos.py            # bucle continuo
     python listener_pedidos.py --once     # una sola pasada (para pruebas)
 """
+from contextlib import nullcontext
 import sys
 import datetime
 import urllib.error
@@ -49,6 +50,11 @@ import urllib.error
 import listener_base as lb
 import alias_manager as am
 import flujo_pedido_real
+
+try:
+    import abrir_hybrid
+except Exception:  # pragma: no cover
+    abrir_hybrid = None
 
 try:
     from safety_control import control_seguro
@@ -78,7 +84,7 @@ def get_pedidos_pendientes():
         path = (f"{TABLE_CAB}?backend_status=eq.pendiente"
                 f"&status=eq.emitido"
                 f"&creado_por=not.is.null"
-                f"&select=id,cliente_codigo,cliente_nombre,nota,backend_intentos"
+                f"&select=id,creado_por,cliente_codigo,cliente_nombre,nota,backend_intentos"
                 f"&order=id.asc&limit=10")
         return lb.rest("GET", path) or []
     except urllib.error.HTTPError as e:
@@ -205,18 +211,20 @@ def procesar_pedido(pedido, n=1, total=1):
     # El banner y el bloqueo de mouse sólo deben durar mientras el bot interactúa con la UI.
     # Al cerrar la forma en HybridLite, el banner se cierra INMEDIATAMENTE y libera el mouse.
     txt_banner = f"REGISTRANDO PEDIDO {n}/{total} — PED-{pid} ({cliente_nombre or cliente_codigo})"
+    sesion_ctx = abrir_hybrid.sesion_para(pedido.get("creado_por")) if abrir_hybrid is not None else nullcontext()
     try:
-        if control_seguro is not None:
-            with control_seguro(txt_banner, ocultar_scripts=["widget.pyw", "widget_recargo.pyw"]):
+        with sesion_ctx:
+            if control_seguro is not None:
+                with control_seguro(txt_banner, ocultar_scripts=["widget.pyw", "widget_recargo.pyw"]):
+                    res = flujo_pedido_real.registrar_pedido(
+                        cliente_codigo, items,
+                        commit=lb.check_hybrid_write_enabled(), cliente_nombre=cliente_nombre,
+                    )
+            else:
                 res = flujo_pedido_real.registrar_pedido(
                     cliente_codigo, items,
                     commit=lb.check_hybrid_write_enabled(), cliente_nombre=cliente_nombre,
                 )
-        else:
-            res = flujo_pedido_real.registrar_pedido(
-                cliente_codigo, items,
-                commit=lb.check_hybrid_write_enabled(), cliente_nombre=cliente_nombre,
-            )
     except Exception as e:
         res = {"ok": False, "etapa": "excepcion", "detalle": f"excepción: {e!r}"}
 
