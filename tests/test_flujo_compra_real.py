@@ -648,3 +648,167 @@ class TestListenerComprasEsAjuste:
         assert llamados == []
 
 
+class TestEscribirCampoFicha:
+    """Regresión para _escribir_campo_ficha / _limpiar_campo_ficha (OC-35974)."""
+
+    @staticmethod
+    def _setup_fake_edit(monkeypatch, initial_text="", *, read_only=False,
+                         vcl_select_all_works=True, ctrl_a_works=True):
+        class FakeRect:
+            left, top, right, bottom = 100, 200, 500, 225
+
+        class FakeControl:
+            def __init__(self, text):
+                self.text = text
+                self.cursor = len(text)
+                self.selected = False
+                self.focus_calls = 0
+
+            def rectangle(self):
+                return FakeRect()
+
+            def set_focus(self):
+                self.focus_calls += 1
+
+            def window_text(self):
+                return self.text
+
+        ctrl = FakeControl(initial_text)
+        calls = []
+
+        monkeypatch.setattr("time.sleep", lambda s: None)
+        monkeypatch.setattr(fcr.ri, "click", lambda x, y: calls.append(("click", x, y)))
+
+        def fake_select_all():
+            calls.append(("select_all_field",))
+            if vcl_select_all_works:
+                ctrl.selected = True
+
+        def fake_press(name, hold=0.02):
+            calls.append(("press", name))
+            if name == "BACKSPACE" and not read_only:
+                if ctrl.selected:
+                    ctrl.text = ""
+                    ctrl.cursor = 0
+                    ctrl.selected = False
+                elif ctrl.cursor > 0:
+                    ctrl.text = ctrl.text[:ctrl.cursor - 1] + ctrl.text[ctrl.cursor:]
+                    ctrl.cursor -= 1
+
+        def fake_clear_field():
+            calls.append(("clear_field",))
+            if not read_only and ctrl_a_works:
+                ctrl.text = ""
+                ctrl.cursor = 0
+                ctrl.selected = False
+
+        def fake_clear_hard(n=8):
+            calls.append(("clear_hard", n))
+            if not read_only:
+                # Simula END + n*BACKSPACE + HOME + n*DELETE
+                ctrl.text = ctrl.text[:-n] if n < len(ctrl.text) else ""
+                ctrl.text = ctrl.text[n:] if n < len(ctrl.text) else ""
+                ctrl.cursor = 0
+                ctrl.selected = False
+
+        def fake_type(kind, valor):
+            calls.append((kind, valor, ctrl.text))
+            if not read_only:
+                if ctrl.selected:
+                    ctrl.text = valor
+                    ctrl.cursor = len(valor)
+                    ctrl.selected = False
+                else:
+                    ctrl.text = ctrl.text[:ctrl.cursor] + valor + ctrl.text[ctrl.cursor:]
+                    ctrl.cursor += len(valor)
+
+        monkeypatch.setattr(fcr.ri, "select_all_field", fake_select_all)
+        monkeypatch.setattr(fcr.ri, "press", fake_press)
+        monkeypatch.setattr(fcr.ri, "clear_field", fake_clear_field)
+        monkeypatch.setattr(fcr.ri, "clear_hard", fake_clear_hard)
+        monkeypatch.setattr(fcr.ri, "type_text", lambda v, **kw: fake_type("type_text", v))
+        monkeypatch.setattr(fcr.ri, "type_code", lambda v, **kw: fake_type("type_code", v))
+        return ctrl, calls
+
+    def test_oc35974_regression_clears_full_existing_description_via_clear_hard(self, monkeypatch):
+        """Caso exacto OC-35974: si select_all y Ctrl+A no limpian, clear_hard(n)
+        debe dimensionarse al largo actual (n >= 13) y vaciar todo antes de teclear."""
+        viejo = "CURVA 90GR PVC CONDUIT 3/4"
+        nuevo = "CURVA 90GR PVC CONDUIT 3/4 PAVCO"
+        ctrl, calls = self._setup_fake_edit(
+            monkeypatch, viejo, vcl_select_all_works=False, ctrl_a_works=False
+        )
+
+        resultado = fcr._escribir_campo_ficha(ctrl, nuevo, lento=False)
+
+        assert resultado == nuevo
+        hard_calls = [c for c in calls if c[0] == "clear_hard"]
+        assert len(hard_calls) == 1
+        assert hard_calls[0][1] >= 13
+        type_calls = [c for c in calls if c[0] == "type_text"]
+        assert type_calls == [("type_text", nuevo, "")]
+
+    def test_fast_path_vcl_select_all_clears_long_text_without_clear_hard(self, monkeypatch):
+        """Si Home+Shift+End + Backspace vacía el campo de 60 chars, no llama clear_field ni clear_hard."""
+        ctrl, calls = self._setup_fake_edit(monkeypatch, "A" * 60)
+
+        resultado = fcr._escribir_campo_ficha(ctrl, "DESCRIPCION NUEVA", lento=False)
+
+        assert resultado == "DESCRIPCION NUEVA"
+        assert ("select_all_field",) in calls
+        assert ("clear_field",) not in calls
+        assert all(c[0] != "clear_hard" for c in calls)
+
+    def test_second_fast_path_ctrl_a_clears_without_clear_hard(self, monkeypatch):
+        """Si Home+Shift+End falla pero Ctrl+A limpia, no cae a clear_hard."""
+        ctrl, calls = self._setup_fake_edit(
+            monkeypatch, "TEXTO PREVIO LARGO", vcl_select_all_works=False, ctrl_a_works=True
+        )
+
+        resultado = fcr._escribir_campo_ficha(ctrl, "NUEVO TEXTO", lento=False)
+
+        assert resultado == "NUEVO TEXTO"
+        assert ("select_all_field",) in calls
+        assert ("clear_field",) in calls
+        assert all(c[0] != "clear_hard" for c in calls)
+
+    def test_already_empty_field_skips_clearing_and_types_directly(self, monkeypatch):
+        """En modo alta (campo vacío), no envía ninguna tecla de borrado."""
+        ctrl, calls = self._setup_fake_edit(monkeypatch, "")
+
+        resultado = fcr._escribir_campo_ficha(ctrl, "01567", lento=True)
+
+        assert resultado == "01567"
+        assert [c[0] for c in calls] == ["click", "type_code"]
+
+    def test_very_long_and_whitespace_only_fields_clear_completely(self, monkeypatch):
+        """Textos de 120 chars y solo espacios se vacían por completo antes de escribir."""
+        ctrl_long, calls_long = self._setup_fake_edit(
+            monkeypatch, "X" * 120, vcl_select_all_works=False, ctrl_a_works=False
+        )
+        assert fcr._escribir_campo_ficha(ctrl_long, "CORTO") == "CORTO"
+        assert [c for c in calls_long if c[0] == "type_text"] == [("type_text", "CORTO", "")]
+
+        ctrl_ws, calls_ws = self._setup_fake_edit(
+            monkeypatch, "   ", vcl_select_all_works=False, ctrl_a_works=False
+        )
+        assert fcr._escribir_campo_ficha(ctrl_ws, "LIMPIO") == "LIMPIO"
+        assert [c for c in calls_ws if c[0] == "type_text"] == [("type_text", "LIMPIO", "")]
+
+    def test_unclearable_field_aborts_without_typing(self, monkeypatch):
+        """Si el campo no puede vaciarse (p.ej. solo lectura), reenfoca 1 vez,
+        no teclea el valor nuevo y retorna el texto que quedó en pantalla."""
+        viejo = "TEXTO BLOQUEADO"
+        ctrl, calls = self._setup_fake_edit(
+            monkeypatch, viejo, read_only=True, vcl_select_all_works=False, ctrl_a_works=False
+        )
+
+        resultado = fcr._escribir_campo_ficha(ctrl, "TEXTO NUEVO", lento=False)
+
+        assert resultado == viejo
+        assert ctrl.focus_calls == 2  # foco inicial + 1 reintento de foco
+        assert all(c[0] not in ("type_text", "type_code") for c in calls)
+        assert len([c for c in calls if c[0] == "clear_hard"]) == 2
+
+
+

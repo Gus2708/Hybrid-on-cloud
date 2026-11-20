@@ -349,11 +349,16 @@ def _campos_ficha(hf):
     return res
 
 
-def _escribir_campo_ficha(campo, valor, lento=False):
-    """Clic real en el centro del campo + borrado duro + teclear (type_code si
-    `lento`, igual que la grilla de Compras; type_text en caso contrario).
-    Devuelve el texto leído tras teclear (window_text), para que el llamador
-    verifique."""
+def _leer_texto_campo(campo):
+    """Lee el texto actual de un control de entrada sin recortar espacios."""
+    try:
+        return campo.window_text() or ""
+    except Exception:
+        return None
+
+
+def _enfocar_campo_ficha(campo):
+    """Hace clic real en el centro del campo y refuerza el foco del control."""
     r = campo.rectangle()
     ri.click((r.left + r.right) // 2, (r.top + r.bottom) // 2)
     time.sleep(0.1)
@@ -362,13 +367,79 @@ def _escribir_campo_ficha(campo, valor, lento=False):
     except Exception:
         pass
     time.sleep(0.08)
-    ri.clear_hard()
+
+
+def _limpiar_campo_ficha(campo):
+    """Vacía de forma verificada un THybridEdit de la Ficha antes de escribir.
+
+    En modo alta (`Incluir`) el campo suele llegar vacío y retorna de inmediato.
+    En modo modificación (`set_ficha`) un texto largo no cabe en `clear_hard(8)`
+    (solo borra 16 caracteres entre los extremos y deja el centro pegado). Por
+    eso se intenta primero selección total VCL/Ctrl+A y, si queda texto,
+    `clear_hard(n)` dimensionado a la longitud actual con verificación."""
+    texto = _leer_texto_campo(campo)
+    if texto == "":
+        return True
+    if texto is None:
+        ri.select_all_field()
+        ri.press("BACKSPACE")
+        time.sleep(0.04)
+        ri.clear_field()
+        time.sleep(0.04)
+        ri.clear_hard(32)
+        time.sleep(0.05)
+        return True
+
+    ri.select_all_field()
+    ri.press("BACKSPACE")
+    time.sleep(0.05)
+    texto = _leer_texto_campo(campo)
+    if texto == "" or texto is None:
+        return True
+
+    ri.clear_field()
+    time.sleep(0.05)
+    texto = _leer_texto_campo(campo)
+    if texto == "" or texto is None:
+        return True
+
+    reenfocado = False
+    for ronda in range(3):
+        if not texto:
+            return True
+        prev_len = len(texto)
+        n = max((prev_len + 1) // 2 + 4, 8) if ronda == 0 else max(prev_len + 4, 8)
+        n = min(n, 120)
+        ri.clear_hard(n)
+        time.sleep(0.05)
+        texto = _leer_texto_campo(campo)
+        if texto == "" or texto is None:
+            return True
+        if len(texto) >= prev_len:
+            if not reenfocado:
+                reenfocado = True
+                _enfocar_campo_ficha(campo)
+                continue
+            break
+
+    log.warning("No se pudo vaciar el campo de la Ficha antes de escribir (quedó %r).", texto)
+    return False
+
+
+def _escribir_campo_ficha(campo, valor, lento=False):
+    """Clic real en el centro del campo + borrado verificado + teclear (type_code
+    si `lento`, igual que la grilla de Compras; type_text en caso contrario).
+    Si el campo no queda vacío antes de escribir, aborta el tecleo y devuelve
+    el texto actual para evitar concatenaciones sobre el valor anterior."""
+    _enfocar_campo_ficha(campo)
+    if not _limpiar_campo_ficha(campo):
+        return (_leer_texto_campo(campo) or "").strip()
     if lento:
         ri.type_code(valor)
     else:
         ri.type_text(valor)
     time.sleep(0.15)
-    return (campo.window_text() or "").strip()
+    return (_leer_texto_campo(campo) or "").strip()
 
 
 def _escribir_costo_alta(nuevo_costo):
